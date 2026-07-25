@@ -74,6 +74,7 @@ export function useCollabRoom<Provider extends CollaborationProvider>(
     providerRef.current = null;
     setProvider(null);
     transportRef.current = null;
+    setProvider(null);
     void provider?.destroy();
     void transport?.disconnect();
     setStatus("disconnected");
