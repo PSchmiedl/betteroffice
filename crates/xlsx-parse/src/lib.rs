@@ -1,13 +1,35 @@
 //! streaming spreadsheetml parser + serializer over `xlsx_model`. parse treats
-//! every byte as attacker-controlled: depth/count caps, no file-sized allocation.
+//! every byte as attacker-controlled with depth and collection caps.
 
+mod package;
 mod read;
 mod styles;
 mod write;
 mod xml;
 
-pub use read::parse_workbook;
-pub use write::serialize_workbook;
+pub use package::PreservedPackage;
+pub use read::{SharedStringCells, parse_workbook};
+pub use write::{serialize_workbook, serialize_workbook_with_package_and_origins_after_edits};
+
+use xlsx_model::Workbook;
+
+/// Parsed workbook with its source package.
+pub struct ParsedWorkbook {
+    pub workbook: Workbook,
+    pub package: PreservedPackage,
+}
+
+/// Parses the model and captures source package state.
+pub fn parse_workbook_with_package(
+    parts: &[(String, Vec<u8>)],
+) -> Result<ParsedWorkbook, ParseError> {
+    let parsed = read::parse_workbook_indexed(parts)?;
+    let package = PreservedPackage::capture(parts, &parsed.workbook, &parsed.shared_string_cells)?;
+    Ok(ParsedWorkbook {
+        workbook: parsed.workbook,
+        package,
+    })
+}
 
 /// hard nesting limit for xml elements; deeper input is rejected as hostile.
 pub const MAX_DEPTH: usize = 64;
@@ -49,6 +71,9 @@ pub enum ParseError {
     TooManyHyperlinks,
     /// a style pool exceeded [`MAX_STYLE_ENTRIES`].
     TooManyStyles,
+    /// saving would have to rewrite source markup that cannot be patched
+    /// safely, so the edit is refused instead of corrupting the package.
+    UnsupportedEdit(String),
 }
 
 impl core::fmt::Display for ParseError {
@@ -63,6 +88,7 @@ impl core::fmt::Display for ParseError {
             ParseError::TooManyDefinedNames => write!(f, "defined name count exceeded cap"),
             ParseError::TooManyHyperlinks => write!(f, "worksheet hyperlink count exceeded cap"),
             ParseError::TooManyStyles => write!(f, "style pool count exceeded cap"),
+            ParseError::UnsupportedEdit(m) => write!(f, "unsupported edit: {m}"),
         }
     }
 }

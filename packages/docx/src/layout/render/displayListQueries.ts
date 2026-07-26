@@ -1,39 +1,4 @@
-/**
- * Synchronous query facade over a built DisplayList, backed by the Rust
- * hit-testing module (`crates/docx-layout/src/hit.rs`).
- *
- * This is the sole pointer/selection geometry source for the canvas
- * renderer (it replaced the deleted painted-DOM resolvers): geometry comes
- * from the immutable display list, never from DOM rects.
- *
- * Perf model: when the embedded wasm carries the session-handle exports, this
- * facade parses the display list into the Rust store exactly ONCE
- * (`openDisplayList` → handle) and routes every hit-test / range-rect query
- * through the by-handle exports — no per-query re-serialization or re-parse.
- * The handle is acquired LAZILY: at the first query that needs it, or when the
- * host calls `prime()` from idle time. Keystroke-driven facade replacement
- * therefore costs no serialization on the input path; superseded generations
- * chain their adoption donor so a deferred pickup still ships one page-delta
- * instead of a full re-open. When the session exports are absent (before the
- * integrator re-embeds the wasm) it falls back to the JSON-arg exports,
- * stringifying the list once and reusing the string for every query. Either
- * way the query RESULTS are byte-identical — the handle path is pure perf.
- *
- * Handle lifecycle: the handle is opened once per facade (per display-list
- * build) and released by `dispose()`. Callers that drop the facade without
- * disposing (e.g. a React `useMemo` replacement) are covered by a
- * `FinalizationRegistry` that closes the handle when the facade is collected;
- * the Rust store additionally caps live handles and evicts the oldest, so a
- * missed finalize can never grow memory unbounded.
- *
- * Queries are synchronous; until the lazily-imported wasm module resolves they
- * return `null`/`[]`. In practice the module is already loaded by the time a
- * queries instance exists, because building the display list itself went
- * through the same module (`loadRustDisplayListQueryEngine` shares the promise
- * with `buildRustDisplayList`).
- *
- * @experimental part of the rust-canvas-engine change; shape may evolve.
- */
+/** Synchronous display-list queries backed by Rust hit testing. */
 
 import type { DisplayList, DisplayPrimitive } from './displayList';
 import { displayPageRevision } from './frameDelta';
@@ -67,7 +32,7 @@ export type DisplayListHitRegion = 'body' | 'header' | 'footer';
 
 /**
  * Region-aware hit result. For `header`/`footer` the position refers to the
- * HF ProseMirror doc identified by `rId`, NOT the body doc — the caller must
+ * HF doc identified by `rId`, NOT the body doc — the caller must
  * route the selection to that HF editor, exactly like the DOM path scopes
  * clicks to `.layout-page-header|footer`.
  */
@@ -82,7 +47,7 @@ export interface DisplayListVerticalMove {
   goalX: number;
 }
 
-/** one highlight rectangle of a PM range, page-local px */
+/** one highlight rectangle of a document range, page-local px */
 export interface DisplayListRect {
   pageIndex: number;
   x: number;
@@ -165,11 +130,11 @@ export interface DisplayListQueries {
     direction: 'up' | 'down',
     goalX?: number
   ): DisplayListVerticalMove | null;
-  /** body PM range → highlight rects */
+  /** body document range → highlight rects */
   rangeRects(from: number, to: number): DisplayListRect[];
   /**
-   * Header/footer PM range → highlight rects for the region's band. `region` is
-   * `'header' | 'footer'`; `rId` identifies the HF ProseMirror doc, and
+   * Header/footer document range → highlight rects for the region's band. `region` is
+   * `'header' | 'footer'`; `rId` identifies the HF doc, and
    * `from`/`to` are positions in THAT doc. The same HF doc paints on every page
    * carrying the part, so this returns one rect-set per such page (each tagged
    * with its `pageIndex`) — the caller picks the page it is editing. Returns
