@@ -122,8 +122,16 @@ pub struct PlotChart<'a> {
     pub title: Option<&'a str>,
     pub legend: Option<PlotLegend<'a>>,
     pub value_axis: Option<PlotAxisRange>,
+    pub axis_titles: PlotAxisTitles<'a>,
     pub series: Vec<PlotSeries<'a>>,
     pub plot_groups: Vec<PlotGroup<'a>>,
+}
+
+/// Axis titles, drawn horizontally because [`PlotOp::Text`] has no rotation.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlotAxisTitles<'a> {
+    pub category: Option<&'a str>,
+    pub value: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -187,6 +195,18 @@ impl<'a> From<&'a ChartSpace> for PlotChart<'a> {
                     min: axis.min,
                     max: axis.max,
                 }),
+            axis_titles: PlotAxisTitles {
+                category: space
+                    .axes
+                    .as_ref()
+                    .and_then(|axes| axes.category.as_ref())
+                    .and_then(|axis| axis.title.as_deref()),
+                value: space
+                    .axes
+                    .as_ref()
+                    .and_then(|axes| axes.value.as_ref())
+                    .and_then(|axis| axis.title.as_deref()),
+            },
             series: space.series.iter().map(plot_series_from_model).collect(),
             plot_groups: space
                 .plot_groups
@@ -306,6 +326,7 @@ pub fn plot_chart_into<S: PlotSink + ?Sized>(chart: &PlotChart<'_>, rect: PlotRe
                 chart_type: chart.chart_type,
                 series: &series,
                 value_axis: chart.value_axis,
+                axis_titles: chart.axis_titles,
             },
             plot,
             x,
@@ -325,6 +346,7 @@ pub fn plot_chart_into<S: PlotSink + ?Sized>(chart: &PlotChart<'_>, rect: PlotRe
                     chart_type: group.chart_type.unwrap_or(chart.chart_type),
                     series: &series,
                     value_axis: chart.value_axis,
+                    axis_titles: chart.axis_titles,
                 },
                 plot,
                 x,
@@ -424,6 +446,7 @@ struct PlotFamily<'a> {
     chart_type: &'a str,
     series: &'a [SeriesView<'a>],
     value_axis: Option<PlotAxisRange>,
+    axis_titles: PlotAxisTitles<'a>,
 }
 
 /// A series plus a first-match index over its points, so a lookup costs a
@@ -554,7 +577,7 @@ fn emit_family<S: PlotSink + ?Sized>(
     height: f64,
 ) {
     match family.chart_type {
-        "pie" | "doughnut" => emit_pie(ops, family, x, y, width, height),
+        "pie" | "doughnut" | "ofPie" => emit_pie(ops, family, x, y, width, height),
         "line" | "scatter" | "radar" => emit_line(ops, family, plot),
         "bar" => emit_bar(ops, family, plot, true),
         _ => emit_bar(ops, family, plot, false),
@@ -743,6 +766,30 @@ fn emit_axes<S: PlotSink + ?Sized>(
         CHART_AXIS_COLOR,
         1.0,
     );
+    if let Some(title) = family.axis_titles.value.filter(|title| !title.is_empty()) {
+        push_text(
+            ops,
+            title,
+            plot.x - 38.0,
+            plot.y - 5.0,
+            plot.w + 38.0,
+            CHART_LABEL_FONT,
+        );
+    }
+    if let Some(title) = family
+        .axis_titles
+        .category
+        .filter(|title| !title.is_empty())
+    {
+        push_text(
+            ops,
+            title,
+            plot.x,
+            plot.y + plot.h + 26.0,
+            plot.w,
+            CHART_LABEL_FONT,
+        );
+    }
 }
 
 fn emit_bar<S: PlotSink + ?Sized>(
@@ -788,6 +835,16 @@ fn emit_bar<S: PlotSink + ?Sized>(
                     bar_h,
                     &series.point_color(cat_idx, ser_idx),
                 );
+                if let Some(label) = series.point(cat_idx).and_then(|point| point.label) {
+                    push_text(
+                        ops,
+                        label,
+                        plot.x + bar_w + 3.0,
+                        y + bar_h,
+                        48.0,
+                        CHART_LABEL_FONT,
+                    );
+                }
             }
         }
     } else {
@@ -819,6 +876,16 @@ fn emit_bar<S: PlotSink + ?Sized>(
                     (y0 - yv).abs().max(1.0),
                     &series.point_color(cat_idx, ser_idx),
                 );
+                if let Some(label) = series.point(cat_idx).and_then(|point| point.label) {
+                    push_text(
+                        ops,
+                        label,
+                        x,
+                        yv.min(y0) - 3.0,
+                        bar_w.max(32.0),
+                        CHART_LABEL_FONT,
+                    );
+                }
             }
         }
     }
@@ -931,6 +998,17 @@ fn emit_pie<S: PlotSink + ?Sized>(
                 width: 1.0,
             }),
         });
+        if let Some(label) = series.point(*index).and_then(|point| point.label) {
+            let middle = angle + sweep / 2.0;
+            push_text(
+                ops,
+                label,
+                cx + r * 0.62 * middle.cos(),
+                cy + r * 0.62 * middle.sin(),
+                48.0,
+                CHART_LABEL_FONT,
+            );
+        }
         angle += sweep;
     }
 }
@@ -1004,12 +1082,13 @@ fn emit_legend<S: PlotSink + ?Sized>(
     } else {
         chart.series.iter().take(MAX_LEGEND_ENTRIES).collect()
     };
-    let pie_legend = chart.chart_type == "pie"
-        || chart.chart_type == "doughnut"
-        || chart
-            .plot_groups
-            .iter()
-            .any(|group| matches!(group.chart_type, Some("pie") | Some("doughnut")));
+    let pie_legend = matches!(chart.chart_type, "pie" | "doughnut" | "ofPie")
+        || chart.plot_groups.iter().any(|group| {
+            matches!(
+                group.chart_type,
+                Some("pie") | Some("doughnut") | Some("ofPie")
+            )
+        });
     let entries: Vec<(String, String)> = if pie_legend {
         series
             .as_slice()
@@ -1060,7 +1139,8 @@ fn emit_legend<S: PlotSink + ?Sized>(
     }
 }
 
-fn format_number(value: f64) -> String {
+/// Axis-tick formatting, shared with hosts that inject value data labels.
+pub fn format_number(value: f64) -> String {
     if value.abs() >= 100.0 || value.fract().abs() < 0.01 {
         format!("{value:.0}")
     } else {
@@ -1107,6 +1187,7 @@ mod tests {
             chart_type: chart.chart_type,
             series,
             value_axis: chart.value_axis,
+            axis_titles: chart.axis_titles,
         }
     }
 
@@ -1169,6 +1250,69 @@ mod tests {
     }
 
     #[test]
+    fn axis_titles_draw_beside_the_axes_they_name() {
+        let north = source(&[10.0, 20.0]);
+        for chart_type in ["column", "bar", "line"] {
+            let chart = PlotChart {
+                chart_type,
+                axis_titles: PlotAxisTitles {
+                    category: Some("Quarter"),
+                    value: Some("Millions"),
+                },
+                series: vec![series("North", &north)],
+                ..PlotChart::default()
+            };
+            let ops = plot_chart(&chart, rect());
+            for title in ["Quarter", "Millions"] {
+                assert!(
+                    ops.iter()
+                        .any(|op| matches!(op, PlotOp::Text { text, .. } if text == title)),
+                    "{chart_type} drops {title}"
+                );
+            }
+        }
+        let pie = PlotChart {
+            chart_type: "pie",
+            axis_titles: PlotAxisTitles {
+                category: Some("Quarter"),
+                value: Some("Millions"),
+            },
+            series: vec![series("North", &north)],
+            ..PlotChart::default()
+        };
+        assert!(
+            !plot_chart(&pie, rect())
+                .iter()
+                .any(|op| matches!(op, PlotOp::Text { text, .. } if text == "Millions"))
+        );
+    }
+
+    #[test]
+    fn an_of_pie_group_draws_wedges_and_a_per_slice_legend() {
+        let share = source(&[3.0, 1.0]);
+        let chart = PlotChart {
+            chart_type: "pie",
+            plot_groups: vec![PlotGroup {
+                chart_type: Some("ofPie"),
+                series: vec![series("Share", &share)],
+                ..PlotGroup::default()
+            }],
+            ..PlotChart::default()
+        };
+        let ops = plot_chart(&chart, rect());
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, PlotOp::Path { .. }))
+                .count(),
+            2
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, PlotOp::Text { text, .. } if text == "Q1"))
+        );
+    }
+
+    #[test]
     fn axis_bounds_override_the_data_range() {
         let north = source(&[1.0]);
         let chart = PlotChart {
@@ -1197,6 +1341,39 @@ mod tests {
         let view = SeriesView::new(&series, &mut ScanBudget::new());
         assert_eq!(view.marker_size(0), 4.0);
         assert_eq!(view.marker_size(1), 9.0);
+    }
+
+    #[test]
+    fn point_labels_draw_on_every_chart_family() {
+        let data = source(&[3.0, 1.0]);
+        for chart_type in ["column", "bar", "line", "pie", "doughnut"] {
+            let mut labelled = series("North", &data);
+            labelled.points = vec![
+                PlotPoint {
+                    index: Some(0),
+                    label: Some("first"),
+                    ..PlotPoint::default()
+                },
+                PlotPoint {
+                    index: Some(1),
+                    label: Some("second"),
+                    ..PlotPoint::default()
+                },
+            ];
+            let chart = PlotChart {
+                chart_type,
+                series: vec![labelled],
+                ..PlotChart::default()
+            };
+            let ops = plot_chart(&chart, rect());
+            for label in ["first", "second"] {
+                assert!(
+                    ops.iter()
+                        .any(|op| matches!(op, PlotOp::Text { text, .. } if text == label)),
+                    "{chart_type} drops {label}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1428,7 +1605,7 @@ mod tests {
                 vary_colors: false,
                 first_slice_angle: None,
                 hole_size: None,
-                show_data_labels: false,
+                data_labels: None,
                 series: vec![crate::chart::ChartSeries {
                     name: None,
                     categories: Vec::new(),
@@ -1442,6 +1619,7 @@ mod tests {
                     grouping: None,
                     marker: None,
                     smooth: None,
+                    data_labels: None,
                     points: Some(
                         [-1.0, 1.5, 1e30, f64::NAN, 2.0]
                             .into_iter()
