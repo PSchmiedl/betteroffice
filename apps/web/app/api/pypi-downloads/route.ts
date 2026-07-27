@@ -1,7 +1,7 @@
 import { getCloudflareContext } from "@opennextjs/cloudflare";
-import { monthlyDownloadsTotal } from "../../../lib/downloads";
+import { monthlyDownloadsTotal } from "../../../lib/pypi-downloads";
 
-const KV_KEY = "npm-downloads";
+const KV_KEY = "pypi-downloads";
 const REFRESH_MS = 24 * 60 * 60 * 1000;
 
 interface CachedCount {
@@ -13,9 +13,9 @@ function payload(downloads: number, cacheSeconds: number): Response {
   return Response.json(
     {
       schemaVersion: 1,
-      label: "npm downloads",
+      label: "PyPI downloads",
       message: `${downloads.toLocaleString("en-US")}/month`,
-      color: "red",
+      color: "blue",
     },
     { headers: { "Cache-Control": `public, max-age=${cacheSeconds}, s-maxage=${cacheSeconds}` } },
   );
@@ -46,7 +46,7 @@ export async function GET() {
   } catch {
     if (cached) return payload(cached.downloads, 3600);
     return Response.json(
-      { schemaVersion: 1, label: "npm downloads", message: "unavailable", color: "lightgrey", isError: true },
+      { schemaVersion: 1, label: "PyPI downloads", message: "unavailable", color: "lightgrey", isError: true },
       { headers: { "Cache-Control": "public, max-age=60" } },
     );
   }
