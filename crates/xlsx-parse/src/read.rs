@@ -55,7 +55,14 @@ pub(crate) fn parse_workbook_indexed(
     for (idx, entry) in meta.sheets.iter().enumerate() {
         let relationship = entry.rid.as_deref().and_then(|rid| rels.get(rid));
         if relationship.is_some_and(|relationship| !relationship.is_worksheet()) {
-            sheets.push(Sheet::new(&entry.name));
+            let mut sheet = Sheet::new(&entry.name);
+            if let Some(path) = relationship
+                .filter(|relationship| !relationship.external)
+                .map(|relationship| resolve_part_path("xl", &relationship.target))
+            {
+                sheet.charts = crate::chart::parse_sheet_charts(parts, &path)?;
+            }
+            sheets.push(sheet);
             shared_string_cells.push(SharedStringCells::new());
             continue;
         }
@@ -66,13 +73,15 @@ pub(crate) fn parse_workbook_indexed(
             .transpose()?
             .unwrap_or_default();
         let mut indices = SharedStringCells::new();
-        sheets.push(parse_worksheet(
+        let mut sheet = parse_worksheet(
             &entry.name,
             bytes,
             &shared_strings,
             &sheet_rels,
             &mut indices,
-        )?);
+        )?;
+        sheet.charts = crate::chart::parse_sheet_charts(parts, &path)?;
+        sheets.push(sheet);
         shared_string_cells.push(indices);
     }
 

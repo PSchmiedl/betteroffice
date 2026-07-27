@@ -28,6 +28,7 @@ pub struct PreservedPackage {
     pub(crate) calc_chains: Vec<PartReference>,
     pub(crate) stylesheet_template: Option<XmlTemplate>,
     pub(crate) original_workbook: Workbook,
+    pub(crate) unmodelled_chart_part: Option<String>,
 }
 
 impl PreservedPackage {
@@ -129,12 +130,19 @@ impl PreservedPackage {
             .map(XmlTemplate::capture)
             .transpose()?;
 
+        let content_types = find_part(parts, "[Content_Types].xml")
+            .map(parse_content_types)
+            .transpose()?
+            .unwrap_or_default();
+        let unmodelled_chart_part = crate::chart::unmodelled_chart_part(
+            parts,
+            &part_content_types(&content_types, parts),
+            workbook,
+        )?;
+
         Ok(Self {
             parts: parts.to_vec(),
-            content_types: find_part(parts, "[Content_Types].xml")
-                .map(parse_content_types)
-                .transpose()?
-                .unwrap_or_default(),
+            content_types,
             root_relationships: find_part(parts, "_rels/.rels")
                 .map(parse_relationships)
                 .transpose()?
@@ -152,6 +160,7 @@ impl PreservedPackage {
             calc_chains,
             stylesheet_template,
             original_workbook: workbook.clone(),
+            unmodelled_chart_part,
         })
     }
 
@@ -165,18 +174,20 @@ impl PreservedPackage {
         self.sheets.len()
     }
 
-    /// A preserved part that names sheets or addresses this crate never
-    /// patches, so a rename, removal or axis edit would strand it.
+    /// Returns a preserved part whose references cannot be patched.
     #[doc(hidden)]
     pub fn unpatchable_reference_part(&self) -> Option<&str> {
-        const REFERENCE_BEARING: [&str; 3] = ["xl/charts/", "xl/pivottables/", "xl/pivotcache/"];
-        self.parts.iter().find_map(|(path, _)| {
-            let normalized = path.trim_start_matches('/').to_ascii_lowercase();
-            REFERENCE_BEARING
-                .iter()
-                .any(|prefix| normalized.starts_with(prefix))
-                .then_some(path.as_str())
-        })
+        const REFERENCE_BEARING: [&str; 2] = ["xl/pivottables/", "xl/pivotcache/"];
+        self.parts
+            .iter()
+            .find_map(|(path, _)| {
+                let normalized = path.trim_start_matches('/').to_ascii_lowercase();
+                REFERENCE_BEARING
+                    .iter()
+                    .any(|prefix| normalized.starts_with(prefix))
+                    .then_some(path.as_str())
+            })
+            .or(self.unmodelled_chart_part.as_deref())
     }
 
     /// The shared-string entries a source sheet's cells were authored against.
@@ -268,6 +279,55 @@ impl ContentTypeEntry {
             .find(|attribute| attribute.local_name() == local_name)
             .map(|attribute| attribute.value.as_str())
     }
+}
+
+pub(crate) struct ResolvedContentType<'a> {
+    pub(crate) value: &'a str,
+    pub(crate) overridden: bool,
+}
+
+/// Resolves a part's effective content type.
+pub(crate) fn effective_content_type<'a>(
+    entries: &'a [ContentTypeEntry],
+    path: &str,
+) -> Option<ResolvedContentType<'a>> {
+    let normalized = normalized_part_name(path);
+    entries
+        .iter()
+        .find_map(|entry| {
+            (entry.element == "Override"
+                && entry
+                    .attribute("PartName")
+                    .is_some_and(|part| normalized_part_name(part) == normalized))
+            .then(|| entry.attribute("ContentType"))
+            .flatten()
+        })
+        .map(|value| ResolvedContentType {
+            value,
+            overridden: true,
+        })
+        .or_else(|| {
+            default_content_type(entries, path).map(|value| ResolvedContentType {
+                value,
+                overridden: false,
+            })
+        })
+}
+
+fn default_content_type<'a>(entries: &'a [ContentTypeEntry], path: &str) -> Option<&'a str> {
+    let extension = path.rsplit_once('.')?.1;
+    entries.iter().find_map(|entry| {
+        (entry.element == "Default"
+            && entry
+                .attribute("Extension")
+                .is_some_and(|value| value.eq_ignore_ascii_case(extension)))
+        .then(|| entry.attribute("ContentType"))
+        .flatten()
+    })
+}
+
+pub(crate) fn normalized_part_name(path: &str) -> String {
+    path.trim_start_matches('/').to_ascii_lowercase()
 }
 
 #[derive(Clone, Debug)]
@@ -921,6 +981,29 @@ fn parse_content_types(data: &[u8]) -> Result<Vec<ContentTypeEntry>, ParseError>
         }
     }
     Ok(entries)
+}
+
+fn part_content_types(
+    entries: &[ContentTypeEntry],
+    parts: &[(String, Vec<u8>)],
+) -> Vec<PartContentType> {
+    parts
+        .iter()
+        .filter_map(|(path, _)| {
+            let resolved = effective_content_type(entries, path)?;
+            Some(PartContentType {
+                path: normalized_part_name(path),
+                content_type: resolved.value.to_owned(),
+                overridden: resolved.overridden,
+            })
+        })
+        .collect()
+}
+
+pub(crate) struct PartContentType {
+    pub(crate) path: String,
+    pub(crate) content_type: String,
+    pub(crate) overridden: bool,
 }
 
 struct SheetEntry {

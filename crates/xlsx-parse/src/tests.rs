@@ -9,7 +9,8 @@ use xlsx_model::{
 
 use crate::write::{serialize_workbook_with_package, serialize_workbook_with_package_and_origins};
 use crate::{
-    ParseError, SharedStringCells, parse_workbook, parse_workbook_with_package, serialize_workbook,
+    ParseError, SaveEdits, SharedStringCells, parse_workbook, parse_workbook_with_package,
+    serialize_workbook,
 };
 
 /// assemble a one-sheet package around a worksheet body and optional shared
@@ -1670,9 +1671,64 @@ fn refuses_an_oversized_relationship_namespace() {
     );
 }
 
-/// A two-sheet package carrying a chart part, whose references name sheets
-/// this crate never rewrites.
+/// A two-sheet package whose first sheet anchors a chart through a drawing,
+/// wired the way Excel writes it: sheet rels -> drawing -> drawing rels ->
+/// chart part.
 fn charted_package() -> Vec<(String, Vec<u8>)> {
+    let mut parts = package(r#"<sheetData/><drawing r:id="rIdDrawing"/>"#, &[], false);
+    parts[0] = (
+        "xl/workbook.xml".to_owned(),
+        br#"<workbook><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Report" sheetId="2" r:id="rId2"/></sheets></workbook>"#.to_vec(),
+    );
+    parts[1] = (
+        "xl/_rels/workbook.xml.rels".to_owned(),
+        br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="worksheets/sheet2.xml"/></Relationships>"#.to_vec(),
+    );
+    parts.extend([
+        (
+            "xl/worksheets/sheet2.xml".to_owned(),
+            br#"<worksheet><sheetData/></worksheet>"#.to_vec(),
+        ),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels".to_owned(),
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#.to_vec(),
+        ),
+        ("xl/drawings/drawing1.xml".to_owned(), DRAWING.to_vec()),
+        (
+            "xl/drawings/_rels/drawing1.xml.rels".to_owned(),
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#.to_vec(),
+        ),
+        ("xl/charts/chart1.xml".to_owned(), CHART.to_vec()),
+    ]);
+    parts
+}
+
+const DRAWING: &[u8] = br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>2</xdr:col><xdr:colOff>12700</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>19</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rIdChart"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
+
+const CHART: &[u8] = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:plotArea><c:barChart><c:ser><c:idx val="0"/><c:tx><c:strRef><c:f>Data!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Series</c:v></c:pt></c:strCache></c:strRef></c:tx><c:spPr><a:solidFill><a:schemeClr val="accent2"/></a:solidFill></c:spPr><c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f><c:strCache><c:pt idx="0"><c:v>Q1</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:f>Data!$B$2:$B$4</c:f><c:numCache><c:pt idx="0"><c:v>3</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+
+fn pivoted_package() -> Vec<(String, Vec<u8>)> {
+    let mut parts = package(r#"<sheetData/>"#, &[], false);
+    parts[0] = (
+        "xl/workbook.xml".to_owned(),
+        br#"<workbook><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Report" sheetId="2" r:id="rId2"/></sheets></workbook>"#.to_vec(),
+    );
+    parts[1] = (
+        "xl/_rels/workbook.xml.rels".to_owned(),
+        br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="worksheets/sheet2.xml"/></Relationships>"#.to_vec(),
+    );
+    parts.push((
+        "xl/worksheets/sheet2.xml".to_owned(),
+        br#"<worksheet><sheetData/></worksheet>"#.to_vec(),
+    ));
+    parts.push((
+        "xl/pivotcache/pivotCacheDefinition1.xml".to_owned(),
+        br#"<pivotCacheDefinition><cacheSource><worksheetSource sheet="Data" ref="A1:B4"/></cacheSource></pivotCacheDefinition>"#.to_vec(),
+    ));
+    parts
+}
+
+fn unclaimed_chart_package() -> Vec<(String, Vec<u8>)> {
     let mut parts = package(r#"<sheetData/>"#, &[], false);
     parts[0] = (
         "xl/workbook.xml".to_owned(),
@@ -1693,11 +1749,9 @@ fn charted_package() -> Vec<(String, Vec<u8>)> {
     parts
 }
 
-/// The facade above refuses these ops, but the serializer is reachable on its
-/// own, so the same refusal has to live at that boundary too.
 #[test]
-fn refuses_to_strand_chart_references_at_the_serialization_boundary() {
-    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+fn refuses_to_strand_pivot_references_at_the_serialization_boundary() {
+    let parsed = parse_workbook_with_package(&pivoted_package()).unwrap();
     let mut workbook = parsed.workbook.clone();
     edit_a1(&mut workbook, 1.0);
 
@@ -1707,7 +1761,81 @@ fn refuses_to_strand_chart_references_at_the_serialization_boundary() {
         &parsed.package,
         &[Some(1), Some(0)],
         &provenance,
-        true,
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&reordered, ParseError::UnsupportedEdit(message) if message.contains("pivotCacheDefinition1.xml")),
+        "{reordered:?}"
+    );
+
+    let removed = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &workbook,
+        &parsed.package,
+        &[Some(0), None],
+        &provenance,
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(removed, ParseError::UnsupportedEdit(_)));
+
+    let mut renamed = workbook.clone();
+    renamed.sheets[0].name = "Renamed".to_owned();
+    let renamed = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &renamed,
+        &parsed.package,
+        &[Some(0), Some(1)],
+        &provenance,
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(renamed, ParseError::UnsupportedEdit(_)));
+
+    let save_in_place = |moved_references| {
+        crate::serialize_workbook_with_package_and_origins_after_edits(
+            &workbook,
+            &parsed.package,
+            &[Some(0), Some(1)],
+            &provenance,
+            SaveEdits {
+                changed: true,
+                moved_references,
+            },
+        )
+    };
+    save_in_place(false).expect("a cell edit strands nothing");
+    let axis_edit = save_in_place(true).unwrap_err();
+    assert!(
+        matches!(&axis_edit, ParseError::UnsupportedEdit(message) if message.contains("pivotCacheDefinition1.xml")),
+        "{axis_edit:?}"
+    );
+}
+
+#[test]
+fn refuses_to_strand_unclaimed_chart_references_at_the_serialization_boundary() {
+    let parsed = parse_workbook_with_package(&unclaimed_chart_package()).unwrap();
+    let mut workbook = parsed.workbook.clone();
+    edit_a1(&mut workbook, 1.0);
+    let provenance = vec![SharedStringCells::new(); 2];
+
+    let reordered = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &workbook,
+        &parsed.package,
+        &[Some(1), Some(0)],
+        &provenance,
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
     )
     .unwrap_err();
     assert!(
@@ -1720,7 +1848,10 @@ fn refuses_to_strand_chart_references_at_the_serialization_boundary() {
         &parsed.package,
         &[Some(0), None],
         &provenance,
-        true,
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
     )
     .unwrap_err();
     assert!(matches!(removed, ParseError::UnsupportedEdit(_)));
@@ -1732,14 +1863,405 @@ fn refuses_to_strand_chart_references_at_the_serialization_boundary() {
         &parsed.package,
         &[Some(0), Some(1)],
         &provenance,
-        true,
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
     )
     .unwrap_err();
     assert!(matches!(renamed, ParseError::UnsupportedEdit(_)));
 }
 
-/// The guard must not fire on the edits a charted workbook can still take:
-/// cell changes, and appending a sheet that moves none of the existing ones.
+/// Charts are modelled now: the anchor, its `editAs` mode and every `c:f` come
+/// through, and the shared parser reads the part with the workbook theme.
+#[test]
+fn reads_the_chart_anchor_and_every_reference() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    let charts = &parsed.workbook.sheets[0].charts;
+    assert_eq!(charts.len(), 1);
+    assert!(parsed.workbook.sheets[1].charts.is_empty());
+    let chart = &charts[0];
+    assert_eq!(chart.part, "xl/charts/chart1.xml");
+    assert_eq!(chart.drawing, "xl/drawings/drawing1.xml");
+    assert_eq!(chart.anchor_index, 0);
+    assert_eq!(
+        chart.anchor,
+        xlsx_model::ChartAnchor::TwoCell {
+            from: xlsx_model::AnchorCell {
+                col: 2,
+                col_off: 12_700,
+                row: 4,
+                row_off: 0,
+            },
+            to: xlsx_model::AnchorCell {
+                col: 8,
+                col_off: 0,
+                row: 19,
+                row_off: 0,
+            },
+            edit_as: xlsx_model::AnchorEditAs::OneCell,
+        }
+    );
+    assert_eq!(
+        chart
+            .refs
+            .iter()
+            .map(|reference| (reference.kind, reference.formula.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (xlsx_model::ChartRefKind::SeriesName, "Data!$B$1"),
+            (xlsx_model::ChartRefKind::Categories, "Data!$A$2:$A$4"),
+            (xlsx_model::ChartRefKind::Values, "Data!$B$2:$B$4"),
+        ]
+    );
+
+    let mut theme = xlsx_model::styles::Theme::default();
+    theme.colors[5] = "#123456".to_owned();
+    let space = crate::chart_space(CHART, &theme).expect("chart parses");
+    assert_eq!(space.chart_type, "column");
+    assert_eq!(space.plot_groups[0].series[0].color, "#123456");
+    assert_eq!(
+        space.plot_groups[0].series[0].value_formula.as_deref(),
+        Some("Data!$B$2:$B$4")
+    );
+}
+
+/// Saving a charted workbook whose references moved patches the chart part in
+/// place: the reference and the cache beside it move together, and every byte
+/// neither owns is left alone.
+#[test]
+fn patches_a_moved_chart_reference_together_with_its_cache() {
+    let source = charted_package();
+    let parsed = parse_workbook_with_package(&source).unwrap();
+    let mut workbook = parsed.workbook.clone();
+    edit_a1(&mut workbook, 1.0);
+    workbook.sheets[0].set_cell(
+        CellRef::parse_a1("B3").unwrap(),
+        Cell {
+            value: CellValue::Number { value: 7.5 },
+            ..Cell::default()
+        },
+    );
+    workbook.sheets[0].charts[0].refs[2].formula = "Data!$B$2:$B$3".to_owned();
+
+    let saved = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &workbook,
+        &parsed.package,
+        &[Some(0), Some(1)],
+        &vec![SharedStringCells::new(); 2],
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap();
+    let patched = String::from_utf8(part_bytes(&saved, "xl/charts/chart1.xml")).unwrap();
+    let original = String::from_utf8(CHART.to_vec()).unwrap();
+    assert_eq!(
+        patched,
+        original
+            .replace("Data!$B$2:$B$4", "Data!$B$2:$B$3")
+            .replace(
+                r#"<c:numCache><c:pt idx="0"><c:v>3</c:v></c:pt></c:numCache>"#,
+                r#"<c:numCache><c:ptCount val="2"/><c:pt idx="1"><c:v>7.5</c:v></c:pt></c:numCache>"#,
+            ),
+        "the moved reference and its cache must both change, and nothing else"
+    );
+    assert_eq!(
+        part_bytes(&saved, "xl/drawings/drawing1.xml"),
+        DRAWING.to_vec()
+    );
+}
+
+/// A cache that cannot be rebuilt correctly refuses the save rather than
+/// leaving a reference pointing at one range while its cache holds another's.
+#[test]
+fn refuses_a_moved_reference_whose_cache_cannot_be_regenerated() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    let mut refs = parsed.workbook.sheets[0].charts[0].refs.clone();
+    for (formula, reason) in [
+        ("Missing!$B$2:$B$4", "sheet this workbook does not hold"),
+        ("Data!$A$2:$B$4", "more than one row and column"),
+        ("(Data!$B$2:$B$4,Data!$D$2:$D$4)", "is not one area"),
+        ("Data!$B$2:$B$1000000", "more points than a chart can carry"),
+    ] {
+        refs[2].formula = formula.to_owned();
+        let error = patch_refs(CHART, &refs).unwrap_err();
+        assert!(
+            matches!(&error, ParseError::UnsupportedEdit(message) if message.contains(reason)),
+            "{formula}: {error:?}"
+        );
+    }
+
+    refs[2].formula = "Data!$B$2:$B$4".to_owned();
+    refs[1].formula = "Data!$B$2:$B$4".to_owned();
+    let mut workbook = parsed.workbook.clone();
+    workbook.sheets[0].set_cell(
+        CellRef::parse_a1("B2").unwrap(),
+        Cell {
+            value: CellValue::Number { value: 3.0 },
+            ..Cell::default()
+        },
+    );
+    let error = crate::chart::patch_chart_refs(CHART, &refs, &workbook, "Data").unwrap_err();
+    assert!(
+        matches!(&error, ParseError::UnsupportedEdit(message)
+            if message.contains("string cache over non-text cells")),
+        "{error:?}"
+    );
+}
+
+/// A cache may legally carry an `extLst` beside its points, or a `formatCode`
+/// on a single point. Neither survives a rebuild, so the save is refused
+/// rather than quietly changing the labels a consumer reads back.
+#[test]
+fn refuses_to_rebuild_a_cache_holding_content_it_does_not_model() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    let mut refs = parsed.workbook.sheets[0].charts[0].refs.clone();
+    refs[2].formula = "Data!$B$2:$B$3".to_owned();
+    let source = String::from_utf8(CHART.to_vec()).unwrap();
+    for (label, cache) in [
+        (
+            "extension list",
+            r#"<c:numCache><c:pt idx="0"><c:v>3</c:v></c:pt><c:extLst><c:ext uri="{9F0C0C0A}"/></c:extLst></c:numCache>"#,
+        ),
+        (
+            "per-point format code",
+            r#"<c:numCache><c:pt idx="0" formatCode="0.00"><c:v>3</c:v></c:pt></c:numCache>"#,
+        ),
+    ] {
+        let part = source.replace(
+            r#"<c:numCache><c:pt idx="0"><c:v>3</c:v></c:pt></c:numCache>"#,
+            cache,
+        );
+        let error = patch_refs(part.as_bytes(), &refs).unwrap_err();
+        assert!(
+            matches!(&error, ParseError::UnsupportedEdit(message)
+                if message.contains("does not model")),
+            "{label}: {error:?}"
+        );
+    }
+}
+
+/// The writer is the last line: a reference carrying a character xml 1.0
+/// cannot express is refused rather than written raw into a part Excel would
+/// then have to repair.
+#[test]
+fn refuses_to_write_a_reference_xml_cannot_carry() {
+    const CACHELESS: &[u8] = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:dLbls><c:f>Data!$C$1</c:f></c:dLbls></c:chart></c:chartSpace>"#;
+    let reference = |formula: &str| {
+        vec![xlsx_model::ChartRef {
+            kind: xlsx_model::ChartRefKind::DataLabels,
+            formula: formula.to_owned(),
+        }]
+    };
+    let error = patch_refs(CACHELESS, &reference("Data!\u{7}$C$1")).unwrap_err();
+    assert!(
+        matches!(&error, ParseError::UnsupportedEdit(message) if message.contains("U+0007")),
+        "{error:?}"
+    );
+
+    let patched =
+        String::from_utf8(patch_refs(CACHELESS, &reference("Data!$C$1\r\n")).unwrap()).unwrap();
+    assert!(patched.contains("<c:f>Data!$C$1&#13;\n</c:f>"), "{patched}");
+}
+
+/// A chart may only be patched through the drawing and anchor it was read
+/// from; a peer that repoints either is refused rather than moving somebody
+/// else's anchor.
+#[test]
+fn refuses_a_chart_that_no_longer_names_its_source_anchor() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    for mutate in [
+        (|chart: &mut xlsx_model::SheetChart| chart.anchor_index = 3) as fn(&mut _),
+        |chart: &mut xlsx_model::SheetChart| chart.drawing = "xl/drawings/drawing9.xml".to_owned(),
+    ] {
+        let mut workbook = parsed.workbook.clone();
+        let chart = &mut workbook.sheets[0].charts[0];
+        chart.refs[2].formula = "Data!$B$2:$B$3".to_owned();
+        mutate(chart);
+        let error = crate::serialize_workbook_with_package_and_origins_after_edits(
+            &workbook,
+            &parsed.package,
+            &[Some(0), Some(1)],
+            &vec![SharedStringCells::new(); 2],
+            SaveEdits {
+                changed: true,
+                moved_references: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, ParseError::UnsupportedEdit(message)
+                if message.contains("drawing and anchor it was read from")),
+            "{error:?}"
+        );
+    }
+}
+
+/// This crate patches chart parts in place, so it can neither create one nor
+/// delete one. A chart that appeared on a sheet, one that vanished from a
+/// retained sheet and one carried onto a sheet with no source are all refused.
+#[test]
+fn refuses_chart_state_with_no_one_to_one_source() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    let save = |workbook: &xlsx_model::Workbook, origins: &[Option<usize>]| {
+        crate::serialize_workbook_with_package_and_origins_after_edits(
+            workbook,
+            &parsed.package,
+            origins,
+            &vec![SharedStringCells::new(); origins.len()],
+            SaveEdits {
+                changed: true,
+                moved_references: false,
+            },
+        )
+    };
+
+    let mut appeared = parsed.workbook.clone();
+    let chart = appeared.sheets[0].charts[0].clone();
+    appeared.sheets[1].charts.push(chart.clone());
+    let error = save(&appeared, &[Some(0), Some(1)]).unwrap_err();
+    assert!(
+        matches!(&error, ParseError::UnsupportedEdit(message)
+            if message.contains("cannot create one")),
+        "{error:?}"
+    );
+
+    let mut dropped = parsed.workbook.clone();
+    dropped.sheets[0].charts.clear();
+    let error = save(&dropped, &[Some(0), Some(1)]).unwrap_err();
+    assert!(
+        matches!(&error, ParseError::UnsupportedEdit(message)
+            if message.contains("cannot delete one")),
+        "{error:?}"
+    );
+
+    let mut added_sheet = parsed.workbook.clone();
+    let mut sheet = xlsx_model::Sheet::new("Added");
+    sheet.charts.push(chart);
+    added_sheet.sheets.push(sheet);
+    let error = save(&added_sheet, &[Some(0), Some(1), None]).unwrap_err();
+    assert!(
+        matches!(&error, ParseError::UnsupportedEdit(message)
+            if message.contains("cannot create one")),
+        "{error:?}"
+    );
+}
+
+/// A save writes an anchor's row and column back and nothing else, so a model
+/// that also moved its mode, offsets, extent or kind is refused rather than
+/// saved with that change dropped.
+#[test]
+fn refuses_an_anchor_change_the_drawing_patcher_would_drop() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    let xlsx_model::ChartAnchor::TwoCell { from, to, .. } =
+        parsed.workbook.sheets[0].charts[0].anchor
+    else {
+        panic!("two-cell anchor");
+    };
+    for (label, anchor) in [
+        (
+            "edit mode",
+            xlsx_model::ChartAnchor::TwoCell {
+                from,
+                to,
+                edit_as: xlsx_model::AnchorEditAs::TwoCell,
+            },
+        ),
+        (
+            "offset",
+            xlsx_model::ChartAnchor::TwoCell {
+                from: xlsx_model::AnchorCell {
+                    col_off: 4_242,
+                    ..from
+                },
+                to,
+                edit_as: xlsx_model::AnchorEditAs::OneCell,
+            },
+        ),
+        (
+            "kind",
+            xlsx_model::ChartAnchor::OneCell {
+                from,
+                extent: xlsx_model::AnchorExtent { cx: 100, cy: 100 },
+            },
+        ),
+    ] {
+        let mut workbook = parsed.workbook.clone();
+        workbook.sheets[0].charts[0].anchor = anchor;
+        let error = crate::serialize_workbook_with_package_and_origins_after_edits(
+            &workbook,
+            &parsed.package,
+            &[Some(0), Some(1)],
+            &vec![SharedStringCells::new(); 2],
+            SaveEdits {
+                changed: true,
+                moved_references: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, ParseError::UnsupportedEdit(message)
+                if message.contains("more than the row and column")),
+            "{label}: {error:?}"
+        );
+    }
+}
+
+/// A reference the edit deletes outright carries an empty cache, not the
+/// values it used to hold.
+#[test]
+fn a_deleted_reference_empties_its_cache() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    let mut refs = parsed.workbook.sheets[0].charts[0].refs.clone();
+    refs[2].formula = "#REF!".to_owned();
+    let patched = String::from_utf8(patch_refs(CHART, &refs).unwrap()).unwrap();
+    assert!(
+        patched.contains(r#"<c:f>#REF!</c:f><c:numCache><c:ptCount val="0"/></c:numCache>"#),
+        "{patched}"
+    );
+}
+
+/// A moved anchor is written back as `col`/`row` alone; offsets and the rest of
+/// the drawing stay as authored.
+#[test]
+fn patches_only_the_moved_anchor_indices() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    let mut workbook = parsed.workbook.clone();
+    edit_a1(&mut workbook, 1.0);
+    let xlsx_model::ChartAnchor::TwoCell { from, to, edit_as } =
+        workbook.sheets[0].charts[0].anchor
+    else {
+        panic!("two-cell anchor");
+    };
+    workbook.sheets[0].charts[0].anchor = xlsx_model::ChartAnchor::TwoCell {
+        from: xlsx_model::AnchorCell { row: 7, ..from },
+        to: xlsx_model::AnchorCell { row: 22, ..to },
+        edit_as,
+    };
+
+    let saved = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &workbook,
+        &parsed.package,
+        &[Some(0), Some(1)],
+        &vec![SharedStringCells::new(); 2],
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap();
+    let patched = String::from_utf8(part_bytes(&saved, "xl/drawings/drawing1.xml")).unwrap();
+    let original = String::from_utf8(DRAWING.to_vec()).unwrap();
+    assert_eq!(
+        patched,
+        original
+            .replace("<xdr:row>4</xdr:row>", "<xdr:row>7</xdr:row>")
+            .replace("<xdr:row>19</xdr:row>", "<xdr:row>22</xdr:row>")
+    );
+}
+
 #[test]
 fn keeps_saving_ordinary_edits_to_a_charted_workbook() {
     let source = charted_package();
@@ -1752,7 +2274,10 @@ fn keeps_saving_ordinary_edits_to_a_charted_workbook() {
         &parsed.package,
         &[Some(0), Some(1)],
         &vec![SharedStringCells::new(); 2],
-        true,
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
     )
     .unwrap();
     assert_eq!(
@@ -1766,8 +2291,530 @@ fn keeps_saving_ordinary_edits_to_a_charted_workbook() {
         &parsed.package,
         &[Some(0), None, Some(1)],
         &vec![SharedStringCells::new(); 3],
-        true,
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
     )
     .unwrap();
     assert_eq!(parse_workbook(&added).unwrap().sheets.len(), 3);
+}
+
+#[test]
+fn keeps_saving_ordinary_edits_with_an_unclaimed_chart_part() {
+    let source = unclaimed_chart_package();
+    let parsed = parse_workbook_with_package(&source).unwrap();
+    let mut workbook = parsed.workbook.clone();
+    edit_a1(&mut workbook, 1.0);
+
+    let edited = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &workbook,
+        &parsed.package,
+        &[Some(0), Some(1)],
+        &vec![SharedStringCells::new(); 2],
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        part_bytes(&edited, "xl/charts/chart1.xml"),
+        part_bytes(&source, "xl/charts/chart1.xml")
+    );
+
+    workbook.sheets.push(xlsx_model::Sheet::new("Added"));
+    let added = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &workbook,
+        &parsed.package,
+        &[Some(0), Some(1), None],
+        &vec![SharedStringCells::new(); 3],
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(parse_workbook(&added).unwrap().sheets.len(), 3);
+}
+
+/// A drawing may bind the relationship namespace to any prefix; discovery
+/// resolves expanded names, so the chart is still found.
+#[test]
+fn discovers_a_chart_through_an_alternate_relationship_prefix() {
+    let mut parts = charted_package();
+    let drawing = String::from_utf8(DRAWING.to_vec())
+        .unwrap()
+        .replace("xmlns:r=", "xmlns:rel=")
+        .replace("r:id=", "rel:id=");
+    set_part(&mut parts, "xl/drawings/drawing1.xml", drawing.as_bytes());
+    let parsed = parse_workbook_with_package(&parts).unwrap();
+    assert_eq!(parsed.workbook.sheets[0].charts.len(), 1);
+    assert_eq!(parsed.package.unpatchable_reference_part(), None);
+}
+
+/// A chartsheet carries a drawing too, and the charts it anchors move with the
+/// cells they name just like a worksheet's.
+#[test]
+fn discovers_the_charts_a_chartsheet_anchors() {
+    let parts = chartsheet_package();
+    let parsed = parse_workbook_with_package(&parts).unwrap();
+    assert_eq!(parsed.workbook.sheets[1].charts.len(), 1);
+    assert_eq!(
+        parsed.workbook.sheets[1].charts[0].part,
+        "xl/charts/chart1.xml"
+    );
+    assert_eq!(parsed.package.unpatchable_reference_part(), None);
+}
+
+/// Every chart part the package holds must be one the model covers. A ChartEx
+/// part, a chart no sheet claims, an externally cached chart, a pivot chart and
+/// a chart carrying `sqref` extension references are all refused instead.
+#[test]
+fn refuses_structural_edits_while_a_chart_part_is_not_covered() {
+    let unreachable = {
+        let mut parts = charted_package();
+        parts.push((
+            "xl/charts/chart2.xml".to_owned(),
+            b"<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"/>"
+                .to_vec(),
+        ));
+        parts
+    };
+    let chart_ex = {
+        let mut parts = charted_package();
+        set_part(
+            &mut parts,
+            "xl/charts/chart1.xml",
+            br#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data><cx:strDim><cx:f>Data!$A$2:$A$4</cx:f></cx:strDim></cx:data></cx:chartData></cx:chartSpace>"#,
+        );
+        parts
+    };
+    let filtered = {
+        let mut parts = charted_package();
+        let chart = String::from_utf8(CHART.to_vec()).unwrap().replace(
+            "<c:f>Data!$A$2:$A$4</c:f>",
+            r#"<c:f>Data!$A$2:$A$4</c:f><c:extLst><c:ext xmlns:c15="http://schemas.microsoft.com/office/drawing/2012/chart" uri="{02D57815-91ED-43cb-92C2-25804820EDAC}"><c15:fullRef><c15:sqref>Data!$A$2:$A$6</c15:sqref></c15:fullRef></c:ext></c:extLst>"#,
+        );
+        set_part(&mut parts, "xl/charts/chart1.xml", chart.as_bytes());
+        parts
+    };
+    let pivoted = {
+        let mut parts = charted_package();
+        let chart = String::from_utf8(CHART.to_vec()).unwrap().replace(
+            "<c:chart>",
+            "<c:pivotSource><c:name>[1]Data!PivotTable1</c:name></c:pivotSource><c:chart>",
+        );
+        set_part(&mut parts, "xl/charts/chart1.xml", chart.as_bytes());
+        parts
+    };
+    let external = {
+        let mut parts = charted_package();
+        let chart = String::from_utf8(CHART.to_vec()).unwrap().replace(
+            "</c:chartSpace>",
+            r#"<c:externalData r:id="rIdData"/></c:chartSpace>"#,
+        );
+        set_part(&mut parts, "xl/charts/chart1.xml", chart.as_bytes());
+        parts
+    };
+
+    for (label, parts) in [
+        ("unreachable", unreachable),
+        ("chartex", chart_ex),
+        ("filtered", filtered),
+        ("pivoted", pivoted),
+        ("external", external),
+    ] {
+        let parsed = parse_workbook_with_package(&parts).unwrap();
+        let refused = parsed
+            .package
+            .unpatchable_reference_part()
+            .unwrap_or_else(|| panic!("{label} chart part must be refused"));
+        assert!(refused.starts_with("xl/charts/"), "{label}: {refused}");
+    }
+}
+
+/// OPC types a part by its `Override` or, failing that, by the `Default` for
+/// its extension. A chart typed the second way, at a path nothing conventional
+/// would find, must still be refused.
+#[test]
+fn refuses_a_chart_typed_by_a_default_extension_mapping() {
+    let mut parts = charted_package();
+    parts.push((
+        "[Content_Types].xml".to_owned(),
+        br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="cxml" ContentType="application/vnd.ms-office.chartex+xml"/><Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/></Types>"#.to_vec(),
+    ));
+    parts.push((
+        "xl/extras/plot1.cxml".to_owned(),
+        br#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"/>"#
+            .to_vec(),
+    ));
+
+    let parsed = parse_workbook_with_package(&parts).unwrap();
+    assert_eq!(
+        parsed.package.unpatchable_reference_part(),
+        Some("xl/extras/plot1.cxml")
+    );
+}
+
+/// Every part of an ordinary package resolves to `application/xml` through a
+/// `Default`, so a chart type must not be the only thing discovery trusts.
+#[test]
+fn still_covers_a_conventional_chart_a_default_types_as_plain_xml() {
+    let mut parts = charted_package();
+    parts.push((
+        "[Content_Types].xml".to_owned(),
+        br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#.to_vec(),
+    ));
+    parts.push((
+        "xl/charts/chart2.xml".to_owned(),
+        b"<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"/>"
+            .to_vec(),
+    ));
+
+    let parsed = parse_workbook_with_package(&parts).unwrap();
+    assert_eq!(
+        parsed.package.unpatchable_reference_part(),
+        Some("xl/charts/chart2.xml")
+    );
+}
+
+/// A cache is only patchable when the reference beside it is one this crate
+/// can resolve. A defined name, a union, an external book and a two-
+/// dimensional area all survive a structural edit unchanged, so their caches
+/// would keep pre-edit values; the package is refused instead.
+#[test]
+fn refuses_a_cache_this_crate_could_not_rebuild() {
+    for (label, formula) in [
+        ("defined name", "SalesRange"),
+        ("union", "(Data!$B$2:$B$4,Data!$D$2:$D$4)"),
+        ("external book", "[1]Data!$B$2:$B$4"),
+        ("two dimensional", "Data!$A$2:$B$4"),
+        ("whole column", "Data!$B:$B"),
+    ] {
+        let mut parts = charted_package();
+        let chart = String::from_utf8(CHART.to_vec())
+            .unwrap()
+            .replace("Data!$B$2:$B$4", formula);
+        set_part(&mut parts, "xl/charts/chart1.xml", chart.as_bytes());
+        let parsed = parse_workbook_with_package(&parts).unwrap();
+        assert_eq!(
+            parsed.package.unpatchable_reference_part(),
+            Some("xl/charts/chart1.xml"),
+            "{label}"
+        );
+    }
+
+    let mut parts = charted_package();
+    let multi_level = String::from_utf8(CHART.to_vec())
+        .unwrap()
+        .replace("strCache>", "multiLvlStrCache>");
+    set_part(&mut parts, "xl/charts/chart1.xml", multi_level.as_bytes());
+    let parsed = parse_workbook_with_package(&parts).unwrap();
+    assert_eq!(
+        parsed.package.unpatchable_reference_part(),
+        Some("xl/charts/chart1.xml")
+    );
+}
+
+/// A reference with no cache beside it carries nothing that could go stale,
+/// so it does not have to be resolvable.
+#[test]
+fn accepts_a_reference_no_cache_depends_on() {
+    let mut parts = charted_package();
+    let chart = String::from_utf8(CHART.to_vec()).unwrap().replace(
+        r#"<c:val><c:numRef><c:f>Data!$B$2:$B$4</c:f><c:numCache><c:pt idx="0"><c:v>3</c:v></c:pt></c:numCache></c:numRef></c:val>"#,
+        r#"<c:val><c:numRef><c:f>SalesRange</c:f></c:numRef></c:val>"#,
+    );
+    set_part(&mut parts, "xl/charts/chart1.xml", chart.as_bytes());
+    let parsed = parse_workbook_with_package(&parts).unwrap();
+    assert_eq!(parsed.package.unpatchable_reference_part(), None);
+}
+
+/// OPC permits utf-8 and utf-16 alike. A utf-16 chart part must parse, and a
+/// rewrite must come back in the encoding it was authored in.
+#[test]
+fn reads_and_rewrites_a_utf16_chart_part() {
+    let text = String::from_utf8(CHART.to_vec()).unwrap();
+    for (label, big_endian, bom) in [
+        ("le+bom", false, true),
+        ("be+bom", true, true),
+        ("le", false, false),
+        ("be", true, false),
+    ] {
+        let encoded = encode_utf16(&text, big_endian, bom);
+        let mut parts = charted_package();
+        set_part(&mut parts, "xl/charts/chart1.xml", &encoded);
+        let parsed = parse_workbook_with_package(&parts).unwrap();
+        let charts = &parsed.workbook.sheets[0].charts;
+        assert_eq!(charts.len(), 1, "{label}");
+        assert_eq!(charts[0].refs.len(), 3, "{label}");
+        assert_eq!(parsed.package.unpatchable_reference_part(), None, "{label}");
+
+        let mut refs = charts[0].refs.clone();
+        refs[1].formula = "Data!$A$2:$A$5".to_owned();
+        let utf8 = patch_refs(CHART, &refs).unwrap();
+        assert_eq!(
+            patch_refs(&encoded, &refs).unwrap(),
+            encode_utf16(std::str::from_utf8(&utf8).unwrap(), big_endian, bom),
+            "{label}"
+        );
+        assert!(
+            crate::chart_space(&encoded, &Default::default()).is_some(),
+            "{label}"
+        );
+    }
+}
+
+/// A part whose declaration names an encoding we cannot write back is refused
+/// rather than reinterpreted as utf-8.
+#[test]
+fn refuses_a_part_declaring_a_foreign_encoding() {
+    let source = br#"<?xml version="1.0" encoding="windows-1252"?><c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>"#;
+    assert!(matches!(
+        patch_refs(source, &[]).unwrap_err(),
+        ParseError::Malformed(message) if message.contains("windows-1252")
+    ));
+}
+
+/// Patch a chart part against a workbook holding the sheet its references name.
+fn patch_refs(part: &[u8], refs: &[xlsx_model::ChartRef]) -> Result<Vec<u8>, ParseError> {
+    let workbook = parse_workbook(&charted_package()).unwrap();
+    crate::chart::patch_chart_refs(part, refs, &workbook, "Data")
+}
+
+fn encode_utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if bom {
+        out.extend_from_slice(if big_endian { b"\xFE\xFF" } else { b"\xFF\xFE" });
+    }
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&if big_endian {
+            unit.to_be_bytes()
+        } else {
+            unit.to_le_bytes()
+        });
+    }
+    out
+}
+
+fn set_part(parts: &mut [(String, Vec<u8>)], path: &str, bytes: &[u8]) {
+    let slot = parts
+        .iter_mut()
+        .find(|(name, _)| name == path)
+        .unwrap_or_else(|| panic!("{path} is not in the package"));
+    slot.1 = bytes.to_vec();
+}
+
+/// A package whose second sheet is a chartsheet anchoring the chart.
+fn chartsheet_package() -> Vec<(String, Vec<u8>)> {
+    let mut parts = package(r#"<sheetData/>"#, &[], false);
+    parts[0] = (
+        "xl/workbook.xml".to_owned(),
+        br#"<workbook><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Chart" sheetId="2" r:id="rId2"/></sheets></workbook>"#.to_vec(),
+    );
+    parts[1] = (
+        "xl/_rels/workbook.xml.rels".to_owned(),
+        br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>"#.to_vec(),
+    );
+    parts.extend([
+        (
+            "xl/chartsheets/sheet1.xml".to_owned(),
+            br#"<chartsheet><drawing r:id="rIdDrawing"/></chartsheet>"#.to_vec(),
+        ),
+        (
+            "xl/chartsheets/_rels/sheet1.xml.rels".to_owned(),
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#.to_vec(),
+        ),
+        ("xl/drawings/drawing1.xml".to_owned(), DRAWING.to_vec()),
+        (
+            "xl/drawings/_rels/drawing1.xml.rels".to_owned(),
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#.to_vec(),
+        ),
+        ("xl/charts/chart1.xml".to_owned(), CHART.to_vec()),
+    ]);
+    parts
+}
+
+/// Dropping a charted sheet must take its whole part graph with it, so deleted
+/// user data is not still recoverable from the saved package.
+#[test]
+fn dropping_a_charted_sheet_prunes_its_unreachable_parts() {
+    let mut parts = charted_package();
+    parts.push((
+        "[Content_Types].xml".to_owned(),
+        br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/></Types>"#.to_vec(),
+    ));
+    parts.push((
+        "_rels/.rels".to_owned(),
+        br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdBook" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.to_vec(),
+    ));
+    parts[1] = (
+        "xl/_rels/workbook.xml.rels".to_owned(),
+        br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#.to_vec(),
+    );
+
+    let parsed = parse_workbook_with_package(&parts).unwrap();
+    assert_eq!(parsed.workbook.sheets[0].charts.len(), 1);
+    let mut dropped = parsed.workbook.clone();
+    dropped.sheets.remove(0);
+
+    let saved = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &dropped,
+        &parsed.package,
+        &[Some(1)],
+        &vec![SharedStringCells::new(); 1],
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap();
+    let names = saved
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect::<Vec<_>>();
+    for orphan in [
+        "xl/worksheets/sheet1.xml",
+        "xl/drawings/drawing1.xml",
+        "xl/drawings/_rels/drawing1.xml.rels",
+        "xl/charts/chart1.xml",
+    ] {
+        assert!(!names.contains(&orphan), "{orphan} is still in {names:?}");
+    }
+    let content_types = String::from_utf8(part_bytes(&saved, "[Content_Types].xml")).unwrap();
+    assert!(!content_types.contains("chart1.xml"), "{content_types}");
+    assert!(names.contains(&"xl/worksheets/sheet2.xml"), "{names:?}");
+}
+
+/// Reordering, dropping and renaming sheets no longer trips the guard now that
+/// chart references are modelled.
+#[test]
+fn saves_sheet_moves_on_a_charted_workbook() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    let mut workbook = parsed.workbook.clone();
+    edit_a1(&mut workbook, 1.0);
+    let provenance = vec![SharedStringCells::new(); 2];
+
+    for origins in [[Some(1), Some(0)], [Some(0), Some(1)]] {
+        let mut moved = workbook.clone();
+        if origins[0] == Some(1) {
+            moved.sheets.swap(0, 1);
+        }
+        crate::serialize_workbook_with_package_and_origins_after_edits(
+            &moved,
+            &parsed.package,
+            &origins,
+            &provenance,
+            SaveEdits {
+                changed: true,
+                moved_references: false,
+            },
+        )
+        .expect("reordering a charted workbook saves");
+    }
+
+    let mut renamed = workbook.clone();
+    renamed.sheets[0].name = "Renamed".to_owned();
+    crate::serialize_workbook_with_package_and_origins_after_edits(
+        &renamed,
+        &parsed.package,
+        &[Some(0), Some(1)],
+        &provenance,
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .expect("renaming a charted workbook saves");
+
+    let mut dropped = workbook.clone();
+    dropped.sheets.pop();
+    crate::serialize_workbook_with_package_and_origins_after_edits(
+        &dropped,
+        &parsed.package,
+        &[Some(0)],
+        &vec![SharedStringCells::new(); 1],
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .expect("dropping a sheet from a charted workbook saves");
+}
+
+/// Chart XML is untrusted input reaching wasm, so the tree builder must bound
+/// or reject it rather than recurse or allocate without a ceiling.
+#[test]
+fn hostile_chart_markup_is_refused_not_survived() {
+    let deep = format!(
+        "<c:chartSpace xmlns:c=\"c\">{}{}</c:chartSpace>",
+        "<x>".repeat(crate::MAX_DEPTH + 2),
+        "</x>".repeat(crate::MAX_DEPTH + 2)
+    );
+    assert_eq!(
+        patch_refs(deep.as_bytes(), &[]).unwrap_err(),
+        ParseError::DepthExceeded
+    );
+
+    let self_closing = format!(
+        "<c:chartSpace xmlns:c=\"c\">{}<x/>{}</c:chartSpace>",
+        "<x>".repeat(crate::MAX_DEPTH - 1),
+        "</x>".repeat(crate::MAX_DEPTH - 1)
+    );
+    assert_eq!(
+        patch_refs(self_closing.as_bytes(), &[]).unwrap_err(),
+        ParseError::DepthExceeded
+    );
+
+    let doctype = br#"<!DOCTYPE c:chartSpace [<!ENTITY x "boom">]><c:chartSpace xmlns:c="c"/>"#;
+    assert!(matches!(
+        patch_refs(doctype, &[]).unwrap_err(),
+        ParseError::Malformed(_)
+    ));
+
+    let unclosed = br#"<c:chartSpace xmlns:c="c"><c:chart>"#;
+    assert!(matches!(
+        patch_refs(unclosed, &[]).unwrap_err(),
+        ParseError::Malformed(_)
+    ));
+
+    assert!(crate::chart_space(b"<c:chartSpace xmlns:c=\"c\"/>", &Default::default()).is_none());
+    assert!(crate::chart_space(b"not xml at all", &Default::default()).is_none());
+}
+
+/// A reference carrying markup-significant characters must come back escaped,
+/// so a rewrite can never reshape the part.
+#[test]
+fn a_rewritten_reference_is_escaped_into_the_part() {
+    let source = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:f>Data!$A$1</c:f></c:chartSpace>"#;
+    let patched = patch_refs(
+        source,
+        &[xlsx_model::ChartRef {
+            kind: xlsx_model::ChartRefKind::Values,
+            formula: "'A<B&C'!$A$1".to_owned(),
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(patched).unwrap(),
+        r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:f>&apos;A&lt;B&amp;C&apos;!$A$1</c:f></c:chartSpace>"#
+            .replace("&apos;", "'")
+    );
+}
+
+/// The patcher addresses `c:f` by document order, so a part that no longer
+/// holds the same references is refused rather than rewritten into the wrong
+/// slots.
+#[test]
+fn refuses_to_patch_a_chart_part_that_no_longer_matches() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    let mut refs = parsed.workbook.sheets[0].charts[0].refs.clone();
+    refs.pop();
+    let error = patch_refs(CHART, &refs).unwrap_err();
+    assert!(
+        matches!(&error, ParseError::UnsupportedEdit(message)
+            if message.contains("holds 3 references but the model carries 2")),
+        "{error:?}"
+    );
 }

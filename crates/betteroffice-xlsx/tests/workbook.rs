@@ -1,11 +1,12 @@
 #[cfg(feature = "raster")]
 use betteroffice_xlsx::RenderOptions;
 use betteroffice_xlsx::{
-    CalculationOptions, Cell, CellInput, CellRange, CellRef, CellState, CellValue, DefinedName,
-    DrawCmd, Error, FreezePane, GridGeometry, Hyperlink, MAX_COLLABORATION_BYTES,
-    MAX_COLLABORATION_CLIENT_ID, MAX_COLLABORATION_STATE_VECTOR_ENTRIES, NumberFormatKind,
-    NumberFormatMutation, Op, ProposalEditInput, ProposalRequest, Sheet, SheetId, StylePatch,
-    UpdateOrigin, Viewport, Workbook, WorkbookModel,
+    AnchorCell, AnchorEditAs, CalculationOptions, Cell, CellInput, CellRange, CellRef, CellState,
+    CellValue, ChartAnchor, ChartRef, ChartRefKind, DefinedName, DrawCmd, Error, FreezePane,
+    GridGeometry, Hyperlink, MAX_COLLABORATION_BYTES, MAX_COLLABORATION_CLIENT_ID,
+    MAX_COLLABORATION_STATE_VECTOR_ENTRIES, MAX_ROWS, NumberFormatKind, NumberFormatMutation, Op,
+    ProposalEditInput, ProposalRequest, Sheet, SheetChart, SheetId, StylePatch, UpdateOrigin,
+    Viewport, Workbook, WorkbookModel,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3260,10 +3261,339 @@ fn collaborative_materialization_retains_source_package() {
     assert!(!after.contains_key("xl/calcChain.xml"));
 }
 
-/// Chart and pivot references into this workbook cannot be rewritten, so the
-/// ops that would strand them are refused rather than silently retargeted.
+const CHART_DRAWING: &[u8] = br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>2</xdr:col><xdr:colOff>12700</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>19</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rIdChart"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
+
+const CHART_PART: &[u8] = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:plotArea><c:barChart><c:ser><c:idx val="0"/><c:tx><c:strRef><c:f>Data!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Series</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f><c:strCache><c:pt idx="0"><c:v>Q1</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:f>Data!$B$2:$B$4</c:f><c:numCache><c:pt idx="0"><c:v>3</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser><c:dLbls><c:f>Data!$C$2:$C$4</c:f></c:dLbls></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+
+/// The preservation fixture already anchors a drawing on `Data`; give that
+/// drawing a chart so the whole sheet -> drawing -> chart chain is real.
+fn charted_fixture() -> Vec<u8> {
+    let mut parts = preservation_fixture_parts();
+    set_test_part(
+        &mut parts,
+        "xl/drawings/drawing1.xml",
+        CHART_DRAWING.to_vec(),
+    );
+    parts.extend([
+        (
+            "xl/drawings/_rels/drawing1.xml.rels".to_owned(),
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#.to_vec(),
+        ),
+        ("xl/charts/chart1.xml".to_owned(), CHART_PART.to_vec()),
+    ]);
+    let content_types = test_part_text(&parts, "[Content_Types].xml").replace(
+        "</Types>",
+        r#"<Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/></Types>"#,
+    );
+    set_test_part(
+        &mut parts,
+        "[Content_Types].xml",
+        content_types.into_bytes(),
+    );
+    ooxml_opc::rezip_parts(&parts).unwrap()
+}
+
+/// The charted fixture with a second sheet the chart plots, so removing that
+/// sheet strands a reference a chart on another sheet owns.
+fn cross_sheet_charted_fixture() -> Vec<u8> {
+    let mut parts = ooxml_opc::unzip_parts(&charted_fixture()).unwrap();
+    let workbook = test_part_text(&parts, "xl/workbook.xml").replace(
+        "</sheets>",
+        r#"<sheet name="Source" sheetId="8" r:id="rIdSource"/></sheets>"#,
+    );
+    set_test_part(&mut parts, "xl/workbook.xml", workbook.into_bytes());
+    let rels = test_part_text(&parts, "xl/_rels/workbook.xml.rels").replace(
+        "</Relationships>",
+        r#"<Relationship Id="rIdSource" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#,
+    );
+    set_test_part(&mut parts, "xl/_rels/workbook.xml.rels", rels.into_bytes());
+    parts.push((
+        "xl/worksheets/sheet2.xml".to_owned(),
+        br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row></sheetData></worksheet>"#.to_vec(),
+    ));
+    let chart = String::from_utf8(CHART_PART.to_vec())
+        .unwrap()
+        .replace("Data!$B$2:$B$4", "Source!$A$1:$A$2");
+    set_test_part(&mut parts, "xl/charts/chart1.xml", chart.into_bytes());
+    ooxml_opc::rezip_parts(&parts).unwrap()
+}
+
+fn chart_formulas(workbook: &Workbook) -> Vec<String> {
+    workbook.model().sheets[0].charts[0]
+        .refs
+        .iter()
+        .map(|reference| reference.formula.clone())
+        .collect()
+}
+
+/// A row insert above the plotted range moves every chart reference with the
+/// cells, moves the anchor per its `editAs` mode, and writes both back into
+/// their parts without disturbing the cached values around them.
 #[test]
-fn refuses_structural_ops_that_would_strand_chart_references() {
+fn chart_references_and_anchor_follow_a_row_insert() {
+    let original = charted_fixture();
+    let mut workbook = Workbook::open(&original).unwrap();
+    assert_eq!(
+        chart_formulas(&workbook),
+        [
+            "Data!$B$1",
+            "Data!$A$2:$A$4",
+            "Data!$B$2:$B$4",
+            "Data!$C$2:$C$4"
+        ]
+    );
+
+    workbook
+        .apply_ops(
+            vec![Op::InsertRows {
+                sheet: SheetId(0),
+                at: 1,
+                count: 2,
+            }],
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        chart_formulas(&workbook),
+        [
+            "Data!$B$1",
+            "Data!$A$4:$A$6",
+            "Data!$B$4:$B$6",
+            "Data!$C$4:$C$6"
+        ]
+    );
+
+    let saved = workbook.save().unwrap();
+    let parts = package_map(&saved);
+    let patched = String::from_utf8(parts["xl/charts/chart1.xml"].clone()).unwrap();
+    let source = String::from_utf8(CHART_PART.to_vec()).unwrap();
+    assert_eq!(
+        patched,
+        source
+            .replace("Data!$A$2:$A$4", "Data!$A$4:$A$6")
+            .replace("Data!$B$2:$B$4", "Data!$B$4:$B$6")
+            .replace("Data!$C$2:$C$4", "Data!$C$4:$C$6")
+            .replace(
+                r#"<c:strCache><c:pt idx="0"><c:v>Q1</c:v></c:pt></c:strCache></c:strRef></c:cat>"#,
+                r#"<c:strCache><c:ptCount val="3"/></c:strCache></c:strRef></c:cat>"#,
+            )
+            .replace(
+                r#"<c:numCache><c:pt idx="0"><c:v>3</c:v></c:pt></c:numCache>"#,
+                r#"<c:numCache><c:ptCount val="3"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache>"#,
+            ),
+        "the moved references carry their caches, and nothing else changes"
+    );
+
+    let drawing = String::from_utf8(parts["xl/drawings/drawing1.xml"].clone()).unwrap();
+    let expected_drawing = String::from_utf8(CHART_DRAWING.to_vec())
+        .unwrap()
+        .replace("<xdr:row>4</xdr:row>", "<xdr:row>6</xdr:row>")
+        .replace("<xdr:row>19</xdr:row>", "<xdr:row>21</xdr:row>");
+    assert_eq!(drawing, expected_drawing, "oneCell moves without resizing");
+
+    let reopened = Workbook::open(&saved).unwrap();
+    assert_eq!(
+        chart_formulas(&reopened),
+        [
+            "Data!$B$1",
+            "Data!$A$4:$A$6",
+            "Data!$B$4:$B$6",
+            "Data!$C$4:$C$6"
+        ]
+    );
+    assert_eq!(reopened.model().sheets[0].charts[0].anchor_index, 0);
+}
+
+/// `editAs` decides what a grid edit does to a chart: `twoCell` moves and
+/// resizes, `oneCell` moves without resizing, `absolute` does neither. An
+/// insert inside the anchored span is what tells the first two apart.
+#[test]
+fn chart_anchors_honour_their_edit_as_mode() {
+    // (editAs, insert row, expected from row, expected to row)
+    for (mode, at, from_row, to_row) in [
+        ("twoCell", 1, 6, 21),
+        ("oneCell", 1, 6, 21),
+        ("absolute", 1, 4, 19),
+        ("twoCell", 10, 4, 21),
+        ("oneCell", 10, 4, 19),
+        ("absolute", 10, 4, 19),
+    ] {
+        let mut parts = ooxml_opc::unzip_parts(&charted_fixture()).unwrap();
+        let drawing = String::from_utf8(CHART_DRAWING.to_vec())
+            .unwrap()
+            .replace(r#"editAs="oneCell""#, &format!(r#"editAs="{mode}""#));
+        set_test_part(&mut parts, "xl/drawings/drawing1.xml", drawing.into_bytes());
+        let mut workbook = Workbook::open(&ooxml_opc::rezip_parts(&parts).unwrap()).unwrap();
+        workbook
+            .apply_ops(
+                vec![Op::InsertRows {
+                    sheet: SheetId(0),
+                    at,
+                    count: 2,
+                }],
+                CalculationOptions::default(),
+            )
+            .unwrap();
+        let saved = package_map(&workbook.save().unwrap());
+        let patched = String::from_utf8(saved["xl/drawings/drawing1.xml"].clone()).unwrap();
+        assert!(
+            patched.contains(&format!(
+                "<xdr:row>{from_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+            )),
+            "{mode} at row {at} put its top corner on the wrong row: {patched}"
+        );
+        assert!(
+            patched.contains(&format!(
+                "<xdr:row>{to_row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+            )),
+            "{mode} at row {at} put its bottom corner on the wrong row: {patched}"
+        );
+    }
+}
+
+/// A cache beside a reference this crate cannot resolve keeps its pre-edit
+/// values through a structural edit, because the reference itself never
+/// changes. The edit is refused rather than saved as a chart whose cache and
+/// reference disagree.
+#[test]
+fn refuses_a_structural_edit_beside_a_cache_that_cannot_be_rebuilt() {
+    let mut parts = ooxml_opc::unzip_parts(&charted_fixture()).unwrap();
+    let chart = String::from_utf8(CHART_PART.to_vec())
+        .unwrap()
+        .replace("Data!$B$2:$B$4", "SalesRange");
+    set_test_part(&mut parts, "xl/charts/chart1.xml", chart.into_bytes());
+    let mut workbook = Workbook::open(&ooxml_opc::rezip_parts(&parts).unwrap()).unwrap();
+    let before = workbook.model().clone();
+
+    let error = workbook
+        .apply_ops(
+            vec![Op::DeleteRows {
+                sheet: SheetId(0),
+                at: 1,
+                count: 1,
+            }],
+            CalculationOptions::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::InvalidOperation(message)
+            if message.contains("xl/charts/chart1.xml")),
+        "{error:?}"
+    );
+    assert_eq!(workbook.model(), &before);
+}
+
+/// Renaming the plotted sheet rewrites the qualifier in every chart reference,
+/// and undo puts the old name back.
+#[test]
+fn sheet_rename_rewrites_chart_references() {
+    let mut workbook = Workbook::open(&charted_fixture()).unwrap();
+    workbook
+        .apply_ops(
+            vec![Op::RenameSheet {
+                sheet: SheetId(0),
+                name: "Sales Data".to_owned(),
+            }],
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        chart_formulas(&workbook),
+        [
+            "'Sales Data'!$B$1",
+            "'Sales Data'!$A$2:$A$4",
+            "'Sales Data'!$B$2:$B$4",
+            "'Sales Data'!$C$2:$C$4"
+        ]
+    );
+    let saved = package_map(&workbook.save().unwrap());
+    let patched = String::from_utf8(saved["xl/charts/chart1.xml"].clone()).unwrap();
+    assert!(
+        patched.contains("<c:f>'Sales Data'!$B$1</c:f>"),
+        "renamed qualifier missing: {patched}"
+    );
+    assert!(!patched.contains("Data!$B$1"), "old qualifier left behind");
+
+    workbook.undo(CalculationOptions::default()).unwrap();
+    assert_eq!(
+        chart_formulas(&workbook),
+        [
+            "Data!$B$1",
+            "Data!$A$2:$A$4",
+            "Data!$B$2:$B$4",
+            "Data!$C$2:$C$4"
+        ]
+    );
+}
+
+/// Deleting every plotted row collapses the reference the way a cell formula
+/// would, rather than leaving it on addresses that no longer exist.
+#[test]
+fn deleted_rows_collapse_chart_references_to_ref_errors() {
+    let mut workbook = Workbook::open(&charted_fixture()).unwrap();
+    workbook
+        .apply_ops(
+            vec![Op::DeleteRows {
+                sheet: SheetId(0),
+                at: 1,
+                count: 3,
+            }],
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        chart_formulas(&workbook),
+        ["Data!$B$1", "#REF!", "#REF!", "#REF!"]
+    );
+    Workbook::open(&workbook.save().unwrap()).unwrap();
+}
+
+#[test]
+fn refuses_structural_ops_that_would_strand_pivot_references() {
+    let mut parts = ooxml_opc::unzip_parts(&preservation_fixture()).unwrap();
+    parts.push((
+        "xl/pivotcache/pivotCacheDefinition1.xml".to_owned(),
+        br#"<pivotCacheDefinition><cacheSource><worksheetSource sheet="Data" ref="A1:B2"/></cacheSource></pivotCacheDefinition>"#.to_vec(),
+    ));
+    let original = ooxml_opc::rezip_parts(&parts).unwrap();
+
+    for op in [
+        Op::InsertRows {
+            sheet: SheetId(0),
+            at: 0,
+            count: 1,
+        },
+        Op::RemoveSheet { index: 0 },
+        Op::RenameSheet {
+            sheet: SheetId(0),
+            name: "Renamed".to_owned(),
+        },
+    ] {
+        let mut workbook = Workbook::open(&original).unwrap();
+        let error = workbook
+            .apply_ops(vec![op.clone()], CalculationOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidOperation(message)
+                if message.contains("pivotCacheDefinition1.xml")),
+            "{op:?} was allowed: {error:?}"
+        );
+    }
+
+    let mut workbook = Workbook::open(&original).unwrap();
+    workbook
+        .edit_cell(
+            SheetId(0),
+            cell("A1"),
+            "edited",
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    Workbook::open(&workbook.save().unwrap()).unwrap();
+}
+
+#[test]
+fn refuses_structural_ops_that_would_strand_unclaimed_chart_parts() {
     let mut parts = ooxml_opc::unzip_parts(&preservation_fixture()).unwrap();
     parts.push((
         "xl/charts/chart1.xml".to_owned(),
@@ -3730,6 +4060,253 @@ fn undo_and_redo_restore_shared_string_provenance() {
     assert!(
         redone.contains(r#"<c r="D1" t="s"><v>1</v></c>"#),
         "{redone}"
+    );
+}
+
+fn charted_model(chart: SheetChart) -> WorkbookModel {
+    let mut sheet = Sheet::new("Data");
+    sheet.charts.push(chart);
+    let mut model = WorkbookModel::default();
+    model.sheets.push(sheet);
+    model
+}
+
+fn sample_chart() -> SheetChart {
+    SheetChart {
+        part: "xl/charts/chart1.xml".to_owned(),
+        drawing: "xl/drawings/drawing1.xml".to_owned(),
+        anchor_index: 0,
+        anchor: ChartAnchor::TwoCell {
+            from: AnchorCell::default(),
+            to: AnchorCell {
+                col: 4,
+                row: 8,
+                ..AnchorCell::default()
+            },
+            edit_as: AnchorEditAs::TwoCell,
+        },
+        refs: vec![ChartRef {
+            kind: ChartRefKind::Values,
+            formula: "Data!$A$1:$A$2".to_owned(),
+        }],
+    }
+}
+
+/// Chart state a peer controls reaches the writer, so an off-grid anchor, a
+/// character xml cannot carry, a smuggled part path and two charts claiming one
+/// anchor are all refused before anything is written.
+#[test]
+fn refuses_chart_state_the_writer_could_not_express() {
+    let off_grid = {
+        let mut chart = sample_chart();
+        chart.anchor = ChartAnchor::TwoCell {
+            from: AnchorCell::default(),
+            to: AnchorCell {
+                col: 4,
+                row: MAX_ROWS,
+                ..AnchorCell::default()
+            },
+            edit_as: AnchorEditAs::TwoCell,
+        };
+        (chart, "off the sheet grid")
+    };
+    let illegal_character = {
+        let mut chart = sample_chart();
+        chart.refs[0].formula = "Data!$A$1\u{7}".to_owned();
+        (chart, "xml cannot carry")
+    };
+    let traversal = {
+        let mut chart = sample_chart();
+        chart.part = "../../etc/passwd".to_owned();
+        (chart, "not a package part path")
+    };
+    let absolute = {
+        let mut chart = sample_chart();
+        chart.drawing = "/xl/drawings/drawing1.xml".to_owned();
+        (chart, "not a package part path")
+    };
+    for (chart, reason) in [off_grid, illegal_character, traversal, absolute] {
+        let Err(error) = Workbook::from_model(charted_model(chart)) else {
+            panic!("{reason} must be refused");
+        };
+        assert!(
+            matches!(&error, Error::InvalidOperation(message) if message.contains(reason)),
+            "{reason}: {error:?}"
+        );
+    }
+
+    let mut model = charted_model(sample_chart());
+    model.sheets[0].charts.push(sample_chart());
+    let Err(error) = Workbook::from_model(model) else {
+        panic!("two charts on one anchor must be refused");
+    };
+    assert!(
+        matches!(&error, Error::InvalidOperation(message)
+            if message.contains("same part, drawing and anchor")),
+        "{error:?}"
+    );
+}
+
+/// Chart parts come out of the package a workbook was opened with, and this
+/// crate creates none. A chart-bearing model with no source would save as a
+/// workbook that lost every chart, so every door into one is closed.
+#[test]
+fn refuses_chart_state_with_no_source_package_to_preserve_it() {
+    for build in [
+        Workbook::from_model as fn(WorkbookModel) -> Result<Workbook, Error>,
+        |model| Workbook::from_model_collaborative(model, 7),
+    ] {
+        let Err(error) = build(charted_model(sample_chart())) else {
+            panic!("a chart with no source package must be refused");
+        };
+        assert!(
+            matches!(&error, Error::InvalidOperation(message)
+                if message.contains("only be preserved from a source package")),
+            "{error:?}"
+        );
+    }
+
+    let error = xlsx_parse::serialize_workbook(&charted_model(sample_chart())).unwrap_err();
+    assert!(format!("{error}").contains("written back into the package it was read from"));
+
+    let mut workbook = Workbook::open(&charted_fixture()).unwrap();
+    workbook
+        .edit_cell(
+            SheetId(0),
+            cell("A1"),
+            "edited",
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    let reopened = Workbook::open(&workbook.save().unwrap()).unwrap();
+    assert_eq!(reopened.model().sheets[0].charts.len(), 1);
+}
+
+/// An insertion that would push a marker a chart must move past the last row
+/// is refused. Clamping it would shrink an object whose `editAs` forbids
+/// resizing, or collapse it outright.
+#[test]
+fn refuses_an_insertion_that_would_push_a_chart_anchor_off_the_grid() {
+    for (mode, edit_as) in [
+        ("twoCell", AnchorEditAs::TwoCell),
+        ("oneCell", AnchorEditAs::OneCell),
+    ] {
+        let mut parts = ooxml_opc::unzip_parts(&charted_fixture()).unwrap();
+        let drawing = String::from_utf8(CHART_DRAWING.to_vec())
+            .unwrap()
+            .replace(r#"editAs="oneCell""#, &format!(r#"editAs="{mode}""#))
+            .replace(
+                "<xdr:row>4</xdr:row>",
+                &format!("<xdr:row>{}</xdr:row>", MAX_ROWS - 6),
+            )
+            .replace(
+                "<xdr:row>19</xdr:row>",
+                &format!("<xdr:row>{}</xdr:row>", MAX_ROWS - 2),
+            );
+        set_test_part(&mut parts, "xl/drawings/drawing1.xml", drawing.into_bytes());
+        let mut workbook = Workbook::open(&ooxml_opc::rezip_parts(&parts).unwrap()).unwrap();
+        let anchored = ChartAnchor::TwoCell {
+            from: AnchorCell {
+                col: 2,
+                col_off: 12_700,
+                row: MAX_ROWS - 6,
+                row_off: 0,
+            },
+            to: AnchorCell {
+                col: 8,
+                col_off: 0,
+                row: MAX_ROWS - 2,
+                row_off: 0,
+            },
+            edit_as,
+        };
+        assert_eq!(workbook.model().sheets[0].charts[0].anchor, anchored);
+
+        let error = workbook
+            .apply_ops(
+                vec![Op::InsertRows {
+                    sheet: SheetId(0),
+                    at: 0,
+                    count: 4,
+                }],
+                CalculationOptions::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidOperation(message)
+                if message.contains("push a chart anchor past the sheet boundary")),
+            "{mode}: {error:?}"
+        );
+        assert_eq!(
+            workbook.model().sheets[0].charts[0].anchor,
+            anchored,
+            "a refused insertion must leave the anchor alone"
+        );
+
+        workbook
+            .apply_ops(
+                vec![Op::InsertRows {
+                    sheet: SheetId(0),
+                    at: 0,
+                    count: 1,
+                }],
+                CalculationOptions::default(),
+            )
+            .expect("an insertion every marker survives is accepted");
+    }
+}
+
+/// Removing a charted sheet strands the references that named it, so the
+/// remaining sheets' chart state must reach the shared document. Undo must put
+/// it back, and neither direction may leave the model ahead of the authority.
+#[test]
+fn removing_a_charted_sheet_synchronises_and_undoes_cleanly() {
+    let mut workbook = Workbook::open(&cross_sheet_charted_fixture()).unwrap();
+    let plotted =
+        |workbook: &Workbook| workbook.model().sheets[0].charts[0].refs[2].formula.clone();
+    assert_eq!(plotted(&workbook), "Source!$A$1:$A$2");
+
+    workbook
+        .apply_ops(
+            vec![Op::RemoveSheet { index: 1 }],
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(plotted(&workbook), "#REF!");
+    assert_eq!(workbook.model().sheets.len(), 1);
+
+    workbook.undo(CalculationOptions::default()).unwrap();
+    assert_eq!(plotted(&workbook), "Source!$A$1:$A$2");
+    assert_eq!(workbook.model().sheets.len(), 2);
+
+    workbook.redo(CalculationOptions::default()).unwrap();
+    assert_eq!(plotted(&workbook), "#REF!");
+    assert_eq!(workbook.model().sheets.len(), 1);
+
+    let reopened = Workbook::open(&workbook.save().unwrap()).unwrap();
+    assert_eq!(
+        reopened.model().sheets[0].charts[0].refs[2].formula,
+        "#REF!"
+    );
+}
+
+/// `SetCharts` is the inverse a remap emits; it is not something a caller may
+/// submit, because it replaces state the engine derives.
+#[test]
+fn set_charts_is_rejected_as_an_internal_operation() {
+    let mut workbook = Workbook::open(&charted_fixture()).unwrap();
+    let Err(error) = workbook.apply_ops(
+        vec![Op::SetCharts {
+            sheet: SheetId(0),
+            charts: Vec::new(),
+        }],
+        CalculationOptions::default(),
+    ) else {
+        panic!("SetCharts must be refused");
+    };
+    assert!(
+        matches!(&error, Error::InvalidOperation(message) if message.contains("internal")),
+        "{error:?}"
     );
 }
 
