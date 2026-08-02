@@ -114,8 +114,8 @@
         "wrangler": "^4.106.0",
       },
     },
-    "bindings/python": {
-      "name": "@betteroffice/python-bindings",
+    "bindings/python-xlsx": {
+      "name": "@betteroffice/python-xlsx",
       "version": "0.0.1",
     },
     "crates": {
@@ -469,7 +469,7 @@
 
     "@betteroffice/pptx-react": ["@betteroffice/pptx-react@workspace:packages/pptx-react"],
 
-    "@betteroffice/python-bindings": ["@betteroffice/python-bindings@workspace:bindings/python"],
+    "@betteroffice/python-xlsx": ["@betteroffice/python-xlsx@workspace:bindings/python-xlsx"],
 
     "@betteroffice/redact-worker": ["@betteroffice/redact-worker@workspace:apps/redact-worker"],
 
