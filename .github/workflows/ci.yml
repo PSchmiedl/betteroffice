@@ -45,7 +45,9 @@ jobs:
           git diff --exit-code -- apps/demo/public/betteroffice-demo.pptx apps/demo/public/showcase.xlsx
 
       - name: Check minimal Wasm features
-        run: cargo check -p xlsx-wasm --target wasm32-unknown-unknown --no-default-features
+        run: |
+          cargo check -p xlsx-wasm --target wasm32-unknown-unknown --no-default-features
+          cargo check -p betteroffice-docx --target wasm32-unknown-unknown
 
       - name: Build
         run: bun run build:packages
@@ -96,6 +98,12 @@ jobs:
         if: steps.ws.outputs.present == 'true'
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Clippy optional features
+        if: steps.ws.outputs.present == 'true'
+        run: |
+          cargo clippy -p betteroffice-drawingml --all-targets --all-features -- -D warnings
+          cargo clippy -p betteroffice-docx --all-targets --all-features -- -D warnings
+
       - name: Lint standalone Rust bindings
         if: steps.ws.outputs.present == 'true'
         run: |
@@ -110,7 +118,9 @@ jobs:
       # workspace member enables them.
       - name: Test optional features
         if: steps.ws.outputs.present == 'true'
-        run: cargo test -p betteroffice-drawingml --all-features
+        run: |
+          cargo test -p betteroffice-drawingml --all-features
+          cargo test -p betteroffice-docx --all-features
 
       - name: Package publishable crates
         if: steps.ws.outputs.present == 'true'

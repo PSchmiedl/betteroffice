@@ -11,9 +11,9 @@ use ooxml_text::{
 };
 use tiny_skia::{FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Transform};
 
-use crate::{FRect, RenderResources, color_with_opacity, number_f32, primitive_visual_transform};
-
-const MAX_PAINTED_GLYPHS: usize = 1_000_000;
+use crate::{
+    FRect, PageBudget, RenderResources, color_with_opacity, number_f32, primitive_visual_transform,
+};
 
 /// Measures one font run in pixels.
 pub fn measure_text(
@@ -58,6 +58,7 @@ pub(crate) struct PaintContext<'a, 'b> {
     pub pixmap: &'a mut Pixmap,
     pub resources: &'a RenderResources<'b>,
     pub cache: &'a mut GlyphCache,
+    pub budget: &'a mut PageBudget,
     pub base_transform: Transform,
     pub mask: Option<&'a Mask>,
     pub opacity: f32,
@@ -86,6 +87,7 @@ pub(crate) fn paint_text(
     if let Some(leader) = active_leader(&run.attrs.leader_glyphs) {
         return paint_leader(context, run, leader, &spec, color, transform);
     }
+    context.budget.charge_glyphs(painted_chars(run))?;
     let text = if run.all_caps {
         run.text.to_uppercase()
     } else {
@@ -124,11 +126,7 @@ pub(crate) fn paint_glyph_run(
     run: &GlyphRunPrimitive,
 ) -> Result<(), String> {
     validate_glyph_effects(run)?;
-    if run.glyphs.len() > MAX_PAINTED_GLYPHS {
-        return Err(format!(
-            "glyph run exceeds the {MAX_PAINTED_GLYPHS} glyph limit"
-        ));
-    }
+    context.budget.charge_glyphs(run.glyphs.len() as u64)?;
     if run.glyphs.is_empty() {
         return Ok(());
     }
@@ -200,6 +198,19 @@ fn validate_glyph_effects(run: &GlyphRunPrimitive) -> Result<(), String> {
     Ok(())
 }
 
+/// Characters a run paints. `allCaps` uppercases first, and one character can
+/// uppercase into three, so the charge is counted without building the string.
+fn painted_chars(run: &TextRunPrimitive) -> u64 {
+    if run.all_caps {
+        run.text
+            .chars()
+            .map(|character| character.to_uppercase().count() as u64)
+            .sum()
+    } else {
+        run.text.chars().count() as u64
+    }
+}
+
 fn active_leader(leader: &Option<LeaderGlyphMetadata>) -> Option<&LeaderGlyphMetadata> {
     leader.as_ref().filter(|leader| {
         leader
@@ -220,11 +231,13 @@ fn paint_leader(
 ) -> Result<(), String> {
     let count = usize::try_from(leader.count.unwrap_or(0))
         .map_err(|_| "leader glyph count is too large".to_string())?;
-    if count > MAX_PAINTED_GLYPHS {
-        return Err(format!(
-            "leader glyph count exceeds the {MAX_PAINTED_GLYPHS} glyph limit"
-        ));
-    }
+    let glyph = leader
+        .glyph
+        .as_deref()
+        .ok_or_else(|| "leader glyph is missing".to_string())?;
+    context
+        .budget
+        .charge_glyphs((count as u64).saturating_mul(glyph.chars().count() as u64))?;
     let advance = leader
         .advance
         .as_ref()
@@ -234,10 +247,6 @@ fn paint_leader(
     if advance <= 0.0 {
         return Ok(());
     }
-    let glyph = leader
-        .glyph
-        .as_deref()
-        .ok_or_else(|| "leader glyph is missing".to_string())?;
     let x = leader
         .x
         .as_ref()
@@ -351,7 +360,6 @@ fn paint_resolved_text(
     } else {
         ShapeDirection::Ltr
     };
-    let mut painted = 0usize;
     for segment_index in order {
         let segment = &segments[segment_index];
         let segment_text = &text[segment.start..segment.end];
@@ -365,14 +373,7 @@ fn paint_resolved_text(
             language,
         )
         .map_err(|error| error.to_string())?;
-        painted = painted
-            .checked_add(glyphs.len())
-            .ok_or_else(|| "painted glyph count overflow".to_string())?;
-        if painted > MAX_PAINTED_GLYPHS {
-            return Err(format!(
-                "text run exceeds the {MAX_PAINTED_GLYPHS} glyph limit"
-            ));
-        }
+        charge_shaped_excess(context, segment_text, glyphs.len())?;
         for (glyph_index, glyph) in glyphs.iter().enumerate() {
             let placed = PlacedGlyph {
                 id: glyph.glyph_id,
@@ -439,6 +440,7 @@ fn paint_single_font_text(
         language,
     )
     .map_err(|error| error.to_string())?;
+    charge_shaped_excess(context, text, glyphs.len())?;
     let mut pen = x;
     for glyph in glyphs {
         let placed = PlacedGlyph {
@@ -454,6 +456,19 @@ fn paint_single_font_text(
         pen += glyph.x_advance;
     }
     Ok(())
+}
+
+/// Shaping can place more glyphs than the text had characters. The caller
+/// charged the characters before the shaper ran, so only the excess is left.
+fn charge_shaped_excess(
+    context: &mut PaintContext<'_, '_>,
+    text: &str,
+    glyphs: usize,
+) -> Result<(), String> {
+    let charged = text.chars().count() as u64;
+    context
+        .budget
+        .charge_glyphs((glyphs as u64).saturating_sub(charged))
 }
 
 fn paint_placed_glyph(
