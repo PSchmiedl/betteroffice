@@ -100,7 +100,7 @@ jobs:
         if: steps.ws.outputs.present == 'true'
         run: |
           cargo fmt --check --all --manifest-path bindings/Cargo.toml
-          cargo clippy --manifest-path bindings/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path bindings/Cargo.toml --workspace --all-targets -- -D warnings
 
       - name: Test
         if: steps.ws.outputs.present == 'true'
@@ -138,12 +138,15 @@ jobs:
         with:
           workspaces: bindings
 
-      - name: Build and install the extension
-        working-directory: bindings/python-xlsx
+      - name: Build and install the extensions
         run: |
           python -m pip install --upgrade pip pytest
-          python -m pip install -e .
+          for binding in $(node scripts/python-bindings.mjs --paths); do
+            python -m pip install -e "$binding"
+          done
 
       - name: Test
-        working-directory: bindings/python-xlsx
-        run: pytest -q
+        run: |
+          for binding in $(node scripts/python-bindings.mjs --paths); do
+            (cd "$binding" && pytest -q)
+          done
