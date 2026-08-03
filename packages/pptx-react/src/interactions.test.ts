@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'bun:test';
-import type { DeckSnapshot, ShapeSnapshot, SlideDisplayList } from '@betteroffice/pptx';
+import type {
+  DeckSnapshot,
+  ShapeSnapshot,
+  SlideDisplayList,
+  TextBoxPrimitive,
+} from '@betteroffice/pptx';
 import {
   canMoveShape,
   findShape,
   findTopLevelShape,
   frameBoundsForShape,
+  hoverTargetAtPoint,
   indexShapes,
   movedShapePosition,
   passedDragThreshold,
@@ -130,6 +136,49 @@ describe('pptx interactions', () => {
     expect(passedDragThreshold(10, 10, 12, 12)).toBe(false);
     expect(passedDragThreshold(10, 10, 14, 10)).toBe(true);
     expect(passedDragThreshold(10, 10, 16, 10, 8)).toBe(false);
+  });
+
+  it('reports the hovered primitive for cursor feedback', () => {
+    expect(hoverTargetAtPoint(frame, { x: 300, y: 150 })).toBe('text');
+    expect(hoverTargetAtPoint(frame, { x: 50, y: 60 })).toBe('shape');
+    expect(hoverTargetAtPoint(frame, { x: 600, y: 600 })).toBeNull();
+  });
+
+  it('prefers the topmost primitive where they overlap', () => {
+    expect(hoverTargetAtPoint(frame, { x: 110, y: 120 })).toBe('text');
+  });
+
+  it('respects primitive rotation when hovering', () => {
+    expect(hoverTargetAtPoint(frame, { x: 198, y: 275 })).toBe('shape');
+    expect(hoverTargetAtPoint(frame, { x: 260, y: 338 })).toBeNull();
+  });
+
+  it('treats a text box with nowhere to put a caret as a movable shape', () => {
+    const textBox = frame.primitives[2] as TextBoxPrimitive;
+    const only = (patch: Partial<TextBoxPrimitive>): SlideDisplayList => ({
+      ...frame,
+      primitives: [{ ...textBox, ...patch }],
+    });
+    expect(hoverTargetAtPoint(only({ storyId: undefined }), { x: 300, y: 150 })).toBe('shape');
+    expect(hoverTargetAtPoint(only({ lines: [] }), { x: 300, y: 150 })).toBe('shape');
+    expect(
+      hoverTargetAtPoint(
+        only({ lines: textBox.lines.map((line) => ({ ...line, caretStops: [] })) }),
+        { x: 300, y: 150 }
+      )
+    ).toBe('shape');
+  });
+
+  it('resolves a drag inside a rotated text box in its unrotated frame', () => {
+    const textBox = frame.primitives[2] as TextBoxPrimitive;
+    const rotated: SlideDisplayList = {
+      ...frame,
+      primitives: [{ ...textBox, transform: { rotationDeg: 90 } }],
+    };
+    // (285,10) lands on the first caret once the 90° turn is undone; read in
+    // slide coordinates it would resolve to the far end of the line instead
+    expect(textPositionAtPoint(rotated, 'text', 'story', { x: 285, y: 10 })).toBe(0);
+    expect(textPositionAtPoint(frame, 'text', 'story', { x: 285, y: 10 })).toBe(5);
   });
 
   it('clamps captured text dragging to the nearest caret', () => {

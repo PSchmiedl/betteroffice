@@ -48,13 +48,14 @@ import {
   findShape,
   findTopLevelShape,
   frameBoundsForShape,
+  hoverTargetAtPoint,
   indexShapes,
   movedShapePosition,
   passedDragThreshold,
   slidePoint,
   textPositionAtPoint,
 } from './interactions';
-import type { FrameBounds, SlidePoint } from './interactions';
+import type { FrameBounds, HoverTarget, SlidePoint } from './interactions';
 import {
   groupPresenceBySlide,
   groupShapePresence,
@@ -244,6 +245,7 @@ function PptxEditorContent({
   const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false });
   const [zoom, setZoom] = useState<PptxZoom>('fit');
   const [activeTool, setActiveTool] = useState<PptxEditorTool>('select');
+  const [hoverTarget, setHoverTarget] = useState<HoverTarget | null>(null);
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -401,6 +403,10 @@ function PptxEditorContent({
     collaborationOnReplica(collaborationReplica);
     return () => collaborationOnReplica(null);
   }, [collaborationOnReplica, collaborationReplica]);
+
+  // hover goes untracked under a non-select tool, so drop it rather than let a
+  // stale target paint the cursor when the tool switches back
+  useEffect(() => setHoverTarget(null), [activeTool]);
 
   useEffect(() => {
     if (!collaborationPresence) {
@@ -963,7 +969,25 @@ function PptxEditorContent({
   };
 
   const pointerMove = (event: PointerEvent<HTMLCanvasElement>) => {
-    if (updatePointerGesture(event)) event.preventDefault();
+    if (updatePointerGesture(event)) {
+      event.preventDefault();
+      return;
+    }
+    // a non-select tool paints its own cursor, and a live gesture holds the one it started with
+    if (pointerGestureRef.current || activeTool !== 'select') return;
+    const current = modelRef.current;
+    if (!current?.frame) return;
+    const point = slidePoint(
+      event.currentTarget.getBoundingClientRect(),
+      current.frame,
+      event.clientX,
+      event.clientY
+    );
+    setHoverTarget(point ? hoverTargetAtPoint(current.frame, point) : null);
+  };
+
+  const pointerLeave = () => {
+    if (!pointerGestureRef.current) setHoverTarget(null);
   };
 
   const pointerUp = (event: PointerEvent<HTMLCanvasElement>) => {
@@ -1280,7 +1304,6 @@ function PptxEditorContent({
   const currentSlide = model?.slideIndex ?? 0;
   const shapeDragDelta =
     dragPreview && dragPreview.shapeId === shapeSelection?.shapeId ? dragPreview.delta : null;
-  const selectedShapeMovable = selectedShape ? canMoveShape(selectedShape) : false;
 
   return (
     <div className={className} style={styles.root}>
@@ -1423,15 +1446,16 @@ function PptxEditorContent({
                     cursor:
                       activeTool !== 'select'
                         ? 'crosshair'
-                        : selection
+                        : hoverTarget === 'text'
                           ? 'text'
-                          : selectedShapeMovable
+                          : hoverTarget === 'shape'
                             ? 'move'
                             : 'default',
                   }}
                   onPointerDown={pointerDown}
                   onPointerMove={pointerMove}
                   onPointerUp={pointerUp}
+                  onPointerLeave={pointerLeave}
                   onPointerCancel={cancelPointerGesture}
                   onLostPointerCapture={cancelPointerGesture}
                   aria-label={
