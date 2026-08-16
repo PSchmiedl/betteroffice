@@ -1,17 +1,22 @@
 ---
 title: Python
-description: betteroffice-xlsx and betteroffice-pptx on PyPI — open, recalculate, render, and save
+description: betteroffice-docx, betteroffice-xlsx, and betteroffice-pptx on PyPI — read, edit, lay out, render, and save
 ---
 
 ```bash
+pip install betteroffice-docx
 pip install betteroffice-xlsx
+pip install betteroffice-pptx
 ```
 
+All three formats are on PyPI. The Rust engine is compiled into each wheel: no
+Word, no Excel, no PowerPoint, no LibreOffice subprocess, no COM. Wheels are
+built for Linux (x86_64, aarch64), macOS (arm64, x86_64), and Windows (x86_64)
+against the stable ABI for CPython 3.9 and up.
+
 [`betteroffice-xlsx`](https://pypi.org/project/betteroffice-xlsx/) is the
-workbook distribution. The Rust XLSX engine is compiled into the wheel: no
-Excel, no LibreOffice subprocess, no COM. Wheels are built for Linux (x86_64,
-aarch64), macOS (arm64, x86_64), and Windows (x86_64) against the stable ABI for
-CPython 3.9 and up.
+workbook distribution, and the rest of this page walks through it;
+[DOCX](#docx) and [PPTX](#pptx) follow at the end.
 
 ## Formulas calculate
 
@@ -70,11 +75,19 @@ sheet until `accept_proposal` applies it as a single undo step.
 The package README on PyPI carries the full API table, the openpyxl comparison,
 and the error hierarchy.
 
-## PPTX and DOCX
+## DOCX
 
-```bash
-pip install betteroffice-pptx
-```
+[`betteroffice-docx`](https://pypi.org/project/betteroffice-docx/) reads
+paragraphs, tables, and sections, rewrites the text of
+a plain single-run paragraph, and saves back to DOCX with everything the model
+does not represent reused from the package it opened. It paginates and
+rasterizes too: the layout pass takes an already-measured projection of the
+document, because the Rust crates do not lower the DOCX model into measured
+blocks yet, and `render_png` draws one page of the resulting display list. No
+font is compiled into that wheel, and a page whose text names a family you never
+registered is an error rather than a page of invisible text.
+
+## PPTX
 
 [`betteroffice-pptx`](https://pypi.org/project/betteroffice-pptx/) reads decks,
 edits shapes and text, saves the edits back to `.pptx` bytes, and lays slides
@@ -82,7 +95,3 @@ out into the same display-list contract the canvas paints. `render_slide` fails
 until `register_font` has supplied at least one face — no font is compiled into
 that wheel. A `Presentation` is also pinned to the thread that opened it, and
 must be released there.
-
-There is no DOCX binding for Python. Reach for
-[`betteroffice-docx`](./rust) in Rust, or
-[`@betteroffice/docx`](./javascript) in JavaScript.

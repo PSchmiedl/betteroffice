@@ -32,6 +32,13 @@ describe('registry', () => {
     }
   });
 
+  test('docx publishes', () => {
+    expect(PYTHON_BINDINGS).toContain('bindings/python-docx');
+    expect(PYTHON_BINDING_NAMES).toContain('docx');
+    expect(PYTHON_PUBLISH_NAMES).toContain('docx');
+    expect(PYPI_DISTRIBUTIONS).toContain('betteroffice-docx');
+  });
+
   test('pptx publishes', () => {
     expect(PYTHON_BINDINGS).toContain('bindings/python-pptx');
     expect(PYTHON_BINDING_NAMES).toContain('pptx');
