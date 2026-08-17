@@ -249,11 +249,25 @@ fn drawing_theme(theme: &Theme) -> DrawingTheme {
 }
 
 /// The charts a sheet anchors, followed from its drawing relationships. Both
-/// worksheets and chartsheets carry drawings, so both are walked. A chart whose
-/// part is missing is skipped rather than failing the parse.
+/// worksheets and chartsheets carry drawings, so both are walked. A drawing or
+/// chart part that is missing, or that this crate cannot read, is skipped
+/// rather than failing the parse: the workbook opens without that chart, and
+/// the part itself is still carried through a save untouched.
+///
+/// A drawing is skipped whole, never anchor by anchor, because `anchor_index`
+/// names a position in the part's anchor list and a partial list would rename
+/// the anchors a later save patches.
+///
+/// Every part skipped is appended to `declined`: this is the only place that
+/// knows one was, and a part no save rewrites has to veto the structural edits
+/// that would move what it names. A chart target is recorded as the drawing
+/// relationship resolved it, which catches one outside the conventional layout
+/// and one the package does not hold — neither of which a walk over the parts
+/// can see.
 pub(crate) fn parse_sheet_charts(
     parts: &[(String, Vec<u8>)],
     sheet_path: &str,
+    declined: &mut Vec<String>,
 ) -> Result<Vec<SheetChart>, ParseError> {
     let mut charts = Vec::new();
     for (drawing_path, drawing_xml) in sheet_drawings(parts, sheet_path)? {
@@ -262,25 +276,45 @@ pub(crate) fn parse_sheet_charts(
             .transpose()?
             .unwrap_or_default();
         let drawing_dir = directory_of(&drawing_path).to_owned();
-        for (index, anchor) in read_anchors(&parse_tree(drawing_xml)?)?
-            .into_iter()
-            .enumerate()
-        {
-            let Some(part) = anchor
-                .chart_rel
-                .as_deref()
-                .and_then(|id| relationship_target(&drawing_rels, id, TYPE_CHART))
+        let Ok(drawing_root) = parse_tree(drawing_xml) else {
+            declined.push(drawing_path);
+            continue;
+        };
+        let Ok(anchors) = read_anchors(&drawing_root) else {
+            declined.push(drawing_path);
+            continue;
+        };
+        for (index, anchor) in anchors.into_iter().enumerate() {
+            let rel_id = match &anchor.chart {
+                AnchorChart::None => continue,
+                AnchorChart::Unrelated => {
+                    declined.push(drawing_path.clone());
+                    continue;
+                }
+                AnchorChart::Related(id) => id.as_str(),
+            };
+            let Some(part) = relationship_target(&drawing_rels, rel_id, TYPE_CHART)
                 .map(|target| resolve_part_path(&drawing_dir, target))
             else {
+                declined.push(drawing_path.clone());
                 continue;
             };
             let Some(chart_xml) = find_part(parts, &part) else {
+                declined.push(part);
                 continue;
             };
-            let root = parse_tree(chart_xml)?;
+            let Ok(root) = parse_tree(chart_xml) else {
+                declined.push(part);
+                continue;
+            };
             if !root.is(NS_CHART, "chartSpace") {
+                declined.push(part);
                 continue;
             }
+            let Ok(refs) = chart_refs(&root) else {
+                declined.push(part);
+                continue;
+            };
             if charts.len() >= MAX_CHART_ANCHORS {
                 return Err(ParseError::TooManyCharts);
             }
@@ -289,7 +323,7 @@ pub(crate) fn parse_sheet_charts(
                 drawing: drawing_path.clone(),
                 anchor_index: index,
                 anchor: anchor.anchor,
-                refs: chart_refs(&root)?,
+                refs,
             });
         }
     }
@@ -325,7 +359,16 @@ fn sheet_drawings<'a>(
 
 struct DrawingAnchor {
     anchor: ChartAnchor,
-    chart_rel: Option<String>,
+    chart: AnchorChart,
+}
+
+/// What an anchor's graphic frame holds: no chart, a chart naming a
+/// relationship, or a chart naming none — which is a frame this crate cannot
+/// model and a save cannot move.
+enum AnchorChart {
+    None,
+    Related(String),
+    Unrelated,
 }
 
 /// Every `xdr:` anchor in a drawing part, in document order, so an index into
@@ -361,7 +404,7 @@ fn read_anchors(root: &Element) -> Result<Vec<DrawingAnchor>, ParseError> {
         }
         anchors.push(DrawingAnchor {
             anchor,
-            chart_rel: chart_relationship_id(child, 0),
+            chart: anchor_chart(child, 0),
         });
     }
     Ok(anchors)
@@ -375,20 +418,25 @@ fn is_anchor(element: &&Element) -> bool {
         )
 }
 
-/// `c:chart/@r:id` under a graphic frame, searched depth-capped by expanded
-/// name so an alternate prefix still resolves.
-fn chart_relationship_id(element: &Element, depth: usize) -> Option<String> {
+/// The `c:chart` under a graphic frame, searched depth-capped by expanded name
+/// so an alternate prefix still resolves, and whether it names a relationship.
+fn anchor_chart(element: &Element, depth: usize) -> AnchorChart {
     if depth > MAX_DEPTH {
-        return None;
+        return AnchorChart::None;
     }
     if element.is(NS_CHART, "chart") {
-        return element
-            .attribute_ns(NS_RELATIONSHIPS, "id")
-            .map(str::to_owned);
+        return match element.attribute_ns(NS_RELATIONSHIPS, "id") {
+            Some(id) => AnchorChart::Related(id.to_owned()),
+            None => AnchorChart::Unrelated,
+        };
     }
-    element
-        .child_elements()
-        .find_map(|child| chart_relationship_id(child, depth + 1))
+    for child in element.child_elements() {
+        match anchor_chart(child, depth + 1) {
+            AnchorChart::None => {}
+            found => return found,
+        }
+    }
+    AnchorChart::None
 }
 
 fn anchor_cell(element: Option<&Element>) -> Result<AnchorCell, ParseError> {
