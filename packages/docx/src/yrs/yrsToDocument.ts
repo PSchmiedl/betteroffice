@@ -203,6 +203,7 @@ interface BookmarkBoundary extends CommentBoundary {
 
 interface OriginalRunBoundary {
   text: string;
+  noteMarks?: string[];
   marksKey?: string;
   formatting?: TextFormatting;
   propertyChanges?: Run['propertyChanges'];
@@ -1025,6 +1026,14 @@ function marksKeyToYrsAttrs(marksKey: string | undefined): Attrs | null {
   return attrs;
 }
 
+/** Rebuilds the note number marks a run held; they occupy no story unit. */
+function noteMarkContent(boundary: OriginalRunBoundary): RunContent[] | null {
+  if (!boundary.noteMarks?.length) return null;
+  return boundary.noteMarks.map((mark) => ({
+    type: mark === 'endnote' ? 'endnoteRefMark' : 'footnoteRefMark',
+  }));
+}
+
 function restoreOriginalRuns(
   content: ParagraphContent[],
   items: InlineItem[],
@@ -1035,7 +1044,8 @@ function restoreOriginalRuns(
     !content.every(
       (child) => child.type === 'run' && child.content.every((entry) => entry.type === 'text')
     ) ||
-    items.some((item) => item.kind !== 'text' || item.attributes.hyperlink)
+    items.some((item) => item.kind !== 'text' || item.attributes.hyperlink) ||
+    boundaries.some((boundary) => boundary.noteMarks?.length && boundary.text.length > 0)
   ) {
     return content;
   }
@@ -1051,8 +1061,8 @@ function restoreOriginalRuns(
     restoredAttrs.push(expected);
     let remaining = boundary.text.length;
     while (remaining > 0) {
-      const item = items[itemIndex] as TextItem | undefined;
-      if (!item) return content;
+      const item = items[itemIndex];
+      if (item?.kind !== 'text') return content;
       if (stableStringify(formattingAttrs(item.attributes)) !== stableStringify(expected)) {
         return content;
       }
@@ -1067,6 +1077,8 @@ function restoreOriginalRuns(
     }
   }
 
+  if (itemIndex !== items.length || itemOffset !== 0) return content;
+
   return boundaries.map((boundary, index) => {
     // restoreOriginalRuns restores the original segmentation/property-change
     // cache, but non-empty runs keep formatting reconstructed from their live
@@ -1077,7 +1089,7 @@ function restoreOriginalRuns(
         : attrsToTextFormatting(restoredAttrs[index]);
     const run: Run = {
       type: 'run',
-      content: runContentForText(boundary.text, formatting ?? {}),
+      content: noteMarkContent(boundary) ?? runContentForText(boundary.text, formatting ?? {}),
     };
     if (formatting && Object.keys(formatting).length > 0) run.formatting = formatting;
     if (boundary.propertyChanges?.length) run.propertyChanges = boundary.propertyChanges;
@@ -1093,7 +1105,9 @@ function runTextLength(run: Run): number {
     if (
       content.type === 'tab' ||
       content.type === 'softHyphen' ||
-      content.type === 'noBreakHyphen'
+      content.type === 'noBreakHyphen' ||
+      content.type === 'footnoteRef' ||
+      content.type === 'endnoteRef'
     ) {
       return length + 1;
     }
@@ -1538,6 +1552,51 @@ function pageBreakParagraph(): Paragraph {
   };
 }
 
+/** A note number mark run, or a tracked-change wrapper holding only those. */
+function isNoteMark(content: ParagraphContent): boolean {
+  if (
+    content.type === 'insertion' ||
+    content.type === 'deletion' ||
+    content.type === 'moveFrom' ||
+    content.type === 'moveTo'
+  ) {
+    return content.content.length > 0 && content.content.every(isNoteMark);
+  }
+  return (
+    content.type === 'run' &&
+    content.content.length > 0 &&
+    content.content.every(
+      (entry) => entry.type === 'footnoteRefMark' || entry.type === 'endnoteRefMark'
+    )
+  );
+}
+
+function hasNoteMark(blocks: readonly BlockContent[]): boolean {
+  return blocks.some((block) => block.type === 'paragraph' && block.content.some(isNoteMark));
+}
+
+/**
+ * Reinstates the `w:footnoteRef` / `w:endnoteRef` number mark on a projected
+ * note. The mark carries no story unit, so an edit that invalidates the run
+ * boundary cache would otherwise drop it; the source note is the only record.
+ */
+function restoreNoteMarks(
+  projected: BlockContent[],
+  base: readonly BlockContent[]
+): BlockContent[] {
+  if (hasNoteMark(projected)) return projected;
+  const opening = base.find((block) => block.type === 'paragraph')?.content ?? [];
+  const end = opening.findIndex((child) => !isNoteMark(child));
+  const marks = opening.slice(0, end < 0 ? opening.length : end);
+  if (marks.length === 0) return projected;
+  const index = projected.findIndex((block) => block.type === 'paragraph');
+  if (index < 0) return projected;
+  const target = projected[index] as Paragraph;
+  const restored = [...projected];
+  restored[index] = { ...target, content: [...marks, ...target.content] };
+  return restored;
+}
+
 function collectBaseParagraphs(document: Document): Map<string, Paragraph> {
   const paragraphs = new Map<string, Paragraph>();
   const visit = (blocks: readonly BlockContent[]): void => {
@@ -1814,7 +1873,11 @@ export function yrsToDocument(
     return notes?.map((note) => {
       const storyId = `${prefix}${note.id}`;
       return context.storyIds.has(storyId) && shouldProject(storyId)
-        ? { ...note, content: context.storyToBlocks(storyId), verbatimXml: undefined }
+        ? {
+            ...note,
+            content: restoreNoteMarks(context.storyToBlocks(storyId), note.content),
+            verbatimXml: undefined,
+          }
         : note;
     });
   };

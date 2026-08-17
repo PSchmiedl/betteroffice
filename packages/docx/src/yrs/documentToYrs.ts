@@ -508,8 +508,7 @@ function noteRefUnit(
     'noteRef',
     noteType === 'endnote' ? { endnoteRefId: id } : { footnoteRefId: id },
     allMarks,
-    commentId,
-    String(id).length
+    commentId
   );
 }
 
@@ -719,6 +718,19 @@ function paragraphStyleFormatting(
   return mergeTextFormatting(styleFormatting, extraRunFormatting);
 }
 
+/**
+ * Note number marks carry no story unit, so the run boundary cache is the only
+ * place a saved paragraph can learn they were there.
+ */
+function noteRefMarkTypes(run: Run): string[] {
+  const marks: string[] = [];
+  for (const content of run.content) {
+    if (content.type === 'footnoteRefMark') marks.push('footnote');
+    else if (content.type === 'endnoteRefMark') marks.push('endnote');
+  }
+  return marks;
+}
+
 function runBoundary(
   run: Run,
   styleFormatting: TextFormatting | undefined,
@@ -728,6 +740,7 @@ function runBoundary(
   if (units.some((unit) => unit.kind !== 'text' && unit.embedKind !== 'noteRef')) return null;
   const keys = units.map((unit) => marksKey(unit.marks));
   if (keys.some((key) => key !== keys[0])) return null;
+  const marks = noteRefMarkTypes(run);
   const text = units
     .map((unit) => {
       if (unit.kind === 'text') return unit.text;
@@ -738,6 +751,7 @@ function runBoundary(
   const key = keys[0];
   return {
     text,
+    ...(marks.length > 0 ? { noteMarks: marks } : {}),
     ...(key !== undefined ? { marksKey: key } : {}),
     ...(run.formatting ? { formatting: run.formatting } : {}),
     ...(run.propertyChanges ? { propertyChanges: run.propertyChanges } : {}),

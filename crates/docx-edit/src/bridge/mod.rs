@@ -25,9 +25,9 @@
 //! Positions come out in two coordinate systems. Story offsets are the UTF-16
 //! indices above; the `pm_*` fields carry the paragraph-node positions that
 //! [`pm_position`] derives, in which every paragraph adds two positions for
-//! its own open and close. They usually track each other, and diverge where
-//! one story unit displays as several characters — a `noteRef` embed occupies
-//! one unit but shows a multi-digit number.
+//! its own open and close. Inline content occupies the same width in both, so
+//! an embed that displays as several characters — a `noteRef` showing a
+//! multi-digit number — still spans exactly one position.
 //!
 //! Values the story cannot supply — theme colors, the default tab stop, the
 //! page content height, and the mapping from yrs ids to the numeric ids the
@@ -388,19 +388,17 @@ fn lower_story<T: ReadTxn>(
                     if !comment_ids.is_empty() {
                         formatting.comment_ids = Some(comment_ids);
                     }
-                    let label = note_ref_label(id);
-                    let label_width = utf16_len(&label);
                     paragraph_runs.push(RawRun {
-                        kind: RawRunKind::Text(label),
+                        kind: RawRunKind::Text(note_ref_label(id)),
                         formatting,
                         story_start: story_index,
                         story_end: story_index + 1,
                         pm_start: paragraph_pm_units,
-                        pm_end: paragraph_pm_units + label_width,
+                        pm_end: paragraph_pm_units + 1,
                         inline_sdt_widget: None,
                     });
                     story_index += 1;
-                    paragraph_pm_units += label_width;
+                    paragraph_pm_units += 1;
                     at_block_boundary = false;
                 }
                 Out::YMap(field)
@@ -1468,21 +1466,17 @@ fn lower_inline_sdt_values(
                     } else {
                         formatting.endnote_ref_id = Some(id);
                     }
-                    let label = note_ref_label(id);
-                    let width = utf16_len(&label);
                     runs.push(RawRun {
-                        kind: RawRunKind::Text(label),
+                        kind: RawRunKind::Text(note_ref_label(id)),
                         formatting,
                         story_start: story_index,
                         story_end: story_index + 1,
                         pm_start: child_pm_start,
-                        pm_end: child_pm_start + width,
+                        pm_end: child_pm_start + 1,
                         inline_sdt_widget: widget.clone(),
                     });
-                    width
-                } else {
-                    1
                 }
+                1
             }
             "sdt" => payload.map_or(2, |payload| {
                 lower_inline_sdt_values(
@@ -1644,10 +1638,8 @@ struct RawRun {
     /// Story-global UTF-16 bounds of the source content.
     story_start: u32,
     story_end: u32,
-    /// Rendered bounds relative to the paragraph's content start. Usually the
-    /// same width as the story bounds; they diverge where one story unit
-    /// displays as several characters, as a `noteRef` does when its id has
-    /// more than one digit.
+    /// Rendered bounds relative to the paragraph's content start, always the
+    /// same width as the story bounds.
     pm_start: u32,
     pm_end: u32,
     /// Checkbox chrome inherited from the nearest editable inline SDT.
@@ -3544,6 +3536,54 @@ mod tests {
 
         let footnote = yrs_doc_to_layout_blocks(&doc, "fn:5", &RenderEnv::default()).unwrap();
         assert_eq!(footnote.len(), 1);
+    }
+
+    #[test]
+    fn native_multi_digit_note_ref_occupies_one_position() {
+        let doc = EditingDoc::new(44);
+        doc.create_story("body", "", "Normal", "left").unwrap();
+        doc.apply_raw_ops(
+            "body",
+            vec![
+                RawOp::Delete { index: 0, len: 1 },
+                RawOp::Insert {
+                    index: 0,
+                    text: "A".to_owned(),
+                    attrs: Attrs::new(),
+                },
+                RawOp::InsertEmbed {
+                    index: 1,
+                    kind: "noteRef".to_owned(),
+                    payload: vec![("footnoteRefId".to_owned(), Any::Number(12.0))],
+                    attrs: Attrs::new(),
+                },
+                RawOp::Insert {
+                    index: 2,
+                    text: "B".to_owned(),
+                    attrs: Attrs::new(),
+                },
+                RawOp::InsertEmbed {
+                    index: 3,
+                    kind: "pilcrow".to_owned(),
+                    payload: vec![("paraId".to_owned(), Any::from("body-p"))],
+                    attrs: Attrs::new(),
+                },
+            ],
+            &EditCtx::local("", DATE),
+        )
+        .unwrap();
+        replace_story_with_paragraph(&doc, "fn:12", "fn-p", "Footnote text");
+
+        let body = serde_json::to_value(
+            yrs_doc_to_layout_blocks(&doc, "body", &RenderEnv::default()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body[0]["runs"][1]["text"], json!("12"));
+        assert_eq!(body[0]["runs"][1]["pmStart"], json!(2.0));
+        assert_eq!(body[0]["runs"][1]["pmEnd"], json!(3.0));
+        assert_eq!(body[0]["runs"][2]["text"], json!("B"));
+        assert_eq!(body[0]["runs"][2]["pmStart"], json!(3.0));
+        assert_eq!(body[0]["pmEnd"], json!(5.0));
     }
 
     #[test]
