@@ -15,7 +15,7 @@ use docx_layout::header_footer::{
     HeaderFooterVariant, extend_body_margins, measure_header_footer,
     resolve_header_footer_field_widths,
 };
-use docx_layout::hit::{CaretRect, HitRegion, VerticalDirection};
+use docx_layout::hit::{CaretRect, VerticalDirection};
 use docx_layout::place::LayoutCheckpoint;
 use docx_layout::regions::{
     DocumentRegions, RegionLayoutInput, apply_document_regions, apply_section_geometry,
@@ -1925,23 +1925,18 @@ impl EngineSession {
             .and_then(|rects| serde_json::to_string(&rects).map_err(|error| error.to_string()))
     }
 
-    /// Header/footer/body range geometry directly against the resident list.
+    /// Body, header/footer and note range geometry directly against the
+    /// resident list.
     pub fn display_range_rects_region_json(
         &self,
         region: &str,
-        r_id: &str,
+        part_id: &str,
         from: i64,
         to: i64,
     ) -> Result<String, String> {
-        let region = match region {
-            "body" => HitRegion::Body,
-            "header" => HitRegion::Header,
-            "footer" => HitRegion::Footer,
-            other => return Err(format!("unknown region {other:?}")),
-        };
-        let r_id = (!r_id.is_empty()).then_some(r_id);
+        let scope = docx_layout::hit::parse_region_scope(region, part_id)?;
         self.with_display_list(|list| {
-            docx_layout::hit::range_rects_in_region(list, region, r_id, from, to)
+            docx_layout::hit::range_rects_in_region(list, scope, from, to)
         })
         .ok_or_else(|| "resident display list is not built".to_owned())
         .and_then(|rects| serde_json::to_string(&rects).map_err(|error| error.to_string()))
@@ -2176,7 +2171,31 @@ mod tests {
                 }]
             },
             "notes": {
-                "contents": [{"id": 7, "height": 20}]
+                "contents": [{
+                    "id": 7,
+                    "height": 20,
+                    "blocks": [{
+                        "kind": "paragraph",
+                        "id": "note-p",
+                        "runs": [{"kind": "text", "text": "note", "pmStart": 1, "pmEnd": 5}],
+                        "pmStart": 1,
+                        "pmEnd": 6
+                    }],
+                    "measures": [{
+                        "kind": "paragraph",
+                        "lines": [{
+                            "headRun": 0,
+                            "headChar": 0,
+                            "tailRun": 0,
+                            "tailChar": 4,
+                            "width": 40,
+                            "ascent": 8,
+                            "descent": 2,
+                            "lineHeight": 20
+                        }],
+                        "totalHeight": 20
+                    }]
+                }]
             }
         })
     }
@@ -2202,39 +2221,42 @@ mod tests {
         assert_eq!(engine.stats().pagination_calls, 2);
     }
 
-    /// Note text is not editable through the display hit test, which answers a
-    /// click in the note band with the BODY position above it. The pointer must
-    /// not invite that click.
+    /// A laid-out note is reachable through the resident hit test: the point
+    /// addresses the note's own story and its glyphs invite typing.
     #[test]
-    fn hover_target_is_absent_over_a_laid_out_note_area() {
+    fn a_laid_out_note_area_resolves_to_its_own_story() {
         let engine = EngineSession::new(133);
         let output = engine
             .layout_document_with_regions_json(&note_area_layout_request().to_string())
             .unwrap();
         engine.build_display_list_json(&output).unwrap();
-        let band = engine
+        let run = engine
             .with_display_list(|list| {
-                let area = &list.pages[0].note_areas[0];
+                let run = list.pages[0].note_areas[0]
+                    .primitives
+                    .iter()
+                    .find_map(|primitive| match primitive {
+                        docx_layout::display_list::Primitive::Text(run) => Some(run),
+                        _ => None,
+                    })
+                    .expect("the note area paints its text");
                 (
-                    area.y.as_ref().unwrap().as_f64().unwrap(),
-                    area.height.as_ref().unwrap().as_f64().unwrap(),
+                    run.x.as_f64().unwrap() + run.width.as_f64().unwrap() / 2.0,
+                    run.baseline_y.as_f64().unwrap(),
                 )
             })
             .expect("the display list is built");
-        assert!(band.1 > 0.0, "the note band has no height");
 
-        let hit = |y: f64| -> serde_json::Value {
-            serde_json::from_str(&engine.display_hit_test_regions_json(0, 20.0, y).unwrap())
-                .unwrap()
+        let hit = |x: f64, y: f64| -> serde_json::Value {
+            serde_json::from_str(&engine.display_hit_test_regions_json(0, x, y).unwrap()).unwrap()
         };
-        let note = hit(band.0 + band.1 / 2.0);
-        assert_eq!(note["target"], "none");
-        assert!(
-            note["pos"].is_i64(),
-            "the note band still resolves a body position"
-        );
-        // the body line above the band stays typeable
-        assert_eq!(hit(band.0 - 2.0)["target"], "text");
+        let note = hit(run.0, run.1 - 2.0);
+        assert_eq!(note["region"], "footnote");
+        assert_eq!(note["noteId"], 7);
+        assert_eq!(note["target"], "text");
+        assert!(note["pos"].is_i64(), "the note resolved no position");
+        // the body line above the area stays the body's
+        assert_eq!(hit(20.0, 20.0)["region"], "body");
     }
 
     #[test]
@@ -3056,6 +3078,154 @@ mod tests {
         .unwrap();
         assert!(margin["pos"].is_i64());
         assert_eq!(margin["target"], "none");
+    }
+
+    /// What a laid-out note area gives a hit probe: the note it carries, and
+    /// the two runs every note paints — its presentation label, then its story
+    /// text.
+    struct PaintedNote {
+        kind: Option<String>,
+        note_ids: Vec<i64>,
+        label_doc_start: Option<i64>,
+        text_doc_start: Option<i64>,
+        text_doc_end: i64,
+        text_center_x: f64,
+        text_baseline: f64,
+    }
+
+    fn painted_notes(engine: &EngineSession) -> Vec<PaintedNote> {
+        engine
+            .with_display_list(|list| {
+                list.pages[0]
+                    .note_areas
+                    .iter()
+                    .map(|area| {
+                        let runs = area
+                            .primitives
+                            .iter()
+                            .filter_map(|primitive| match primitive {
+                                docx_layout::display_list::Primitive::Text(run) => Some(run),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        let (label, text) = (runs[0], runs[1]);
+                        PaintedNote {
+                            kind: area.kind.clone(),
+                            note_ids: area.note_ids.clone(),
+                            label_doc_start: label.attrs.doc_start,
+                            text_doc_start: text.attrs.doc_start,
+                            text_doc_end: text.attrs.doc_end.expect("note text is positioned"),
+                            text_center_x: text.x.as_f64().unwrap()
+                                + text.width.as_f64().unwrap() / 2.0,
+                            text_baseline: text.baseline_y.as_f64().unwrap(),
+                        }
+                    })
+                    .collect()
+            })
+            .expect("the display list is built")
+    }
+
+    /// Footnotes and endnotes seeded from a real file, laid out and painted
+    /// through the resident path, resolve to their own `fn:{id}` / `en:{id}`
+    /// stories. The presentation label every note carries has no position of
+    /// its own, so this is also where inheriting the body anchor would hand a
+    /// click a body position under a note region.
+    #[test]
+    fn real_notes_resolve_to_their_own_stories() {
+        let engine = EngineSession::new(19);
+        crate::seed::seed_from_docx(
+            engine.doc(),
+            include_bytes!("../tests/fixtures/footnote-anchor.docx"),
+        )
+        .unwrap();
+        let request = serde_json::json!({
+            "bodyStory": "body",
+            "regions": {"sections": [{"sectionId": "main", "properties": {}}]},
+            "notes": {"contents": [
+                {"id": 2, "noteKind": "footnote", "height": 0},
+                {"id": 3, "noteKind": "endnote", "height": 0}
+            ]},
+            "measurement": {
+                "fontChains": {},
+                "defaults": {"fontSize": 11, "fontFamily": "Calibri"},
+                "authoritativeShaping": false
+            },
+            "renderEnv": {}
+        });
+        let output = engine
+            .layout_document_with_regions_json(&request.to_string())
+            .unwrap();
+        engine.build_display_list_json(&output).unwrap();
+
+        let painted = painted_notes(&engine);
+        assert_eq!(painted.len(), 2, "one area per note kind");
+
+        for (kind, note_id) in [("footnote", 2), ("endnote", 3)] {
+            let note = painted
+                .iter()
+                .find(|note| note.kind.as_deref() == Some(kind))
+                .unwrap_or_else(|| panic!("no {kind} area"));
+            assert_eq!(note.note_ids, vec![note_id]);
+            assert_eq!(
+                note.label_doc_start, None,
+                "the {kind} label carries a position"
+            );
+            assert_eq!(
+                note.text_doc_start,
+                Some(1),
+                "the {kind} text lost its story position"
+            );
+
+            let hit: serde_json::Value = serde_json::from_str(
+                &engine
+                    .display_hit_test_regions_json(0, note.text_center_x, note.text_baseline - 2.0)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(hit["region"], kind);
+            assert_eq!(hit["noteId"], note_id);
+            assert_eq!(hit["target"], "text");
+            let position = hit["pos"].as_i64().expect("the note hit has a position");
+            assert!(
+                (1..=note.text_doc_end).contains(&position),
+                "{kind} hit resolved {position}, outside its story"
+            );
+
+            // that story's selection geometry lands in its own area, below the
+            // body rects for the very same positions
+            let note_rects: serde_json::Value = serde_json::from_str(
+                &engine
+                    .display_range_rects_region_json(
+                        kind,
+                        &note_id.to_string(),
+                        1,
+                        note.text_doc_end,
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            let body_rects: serde_json::Value = serde_json::from_str(
+                &engine
+                    .display_range_rects_json(1, note.text_doc_end)
+                    .unwrap(),
+            )
+            .unwrap();
+            let note_y = note_rects[0]["y"].as_f64().expect("a note rect");
+            let body_y = body_rects[0]["y"].as_f64().expect("a body rect");
+            assert!(
+                note_y > body_y,
+                "{kind} rect y {note_y} is not below the body rect y {body_y}"
+            );
+        }
+
+        // the body reference marks anchoring the notes are still the body's
+        let anchor: serde_json::Value = serde_json::from_str(
+            &engine
+                .display_hit_test_regions_json(0, 100.0, 110.0)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(anchor["region"], "body");
     }
 
     const LIBERATION: &[u8] =

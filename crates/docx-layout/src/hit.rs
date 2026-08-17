@@ -30,12 +30,14 @@
 //! or block id — whichever identity is present. With no identity at all,
 //! adjacency of document positions decides.
 //!
-//! Region scoping matters because a page carries three independent documents.
-//! [`hit_test_regions`] tests the page's header and footer bands first (simple
-//! vertical containment against the band box) and resolves inside the winning
-//! band, returning the region kind and its `rId`; the position then addresses
-//! that header/footer document, never the body. [`range_rects_in_region`] is
-//! the selection-geometry twin, and [`range_rects`] the body-only wrapper. The
+//! Region scoping matters because a page carries several independent
+//! documents. [`hit_test_regions`] tests the page's header and footer bands
+//! first (simple vertical containment against the band box) and then its note
+//! areas, resolving inside the winning one and returning the region kind with
+//! the part that owns it — an `rId` for a band, a note id for a note, whose
+//! story is `fn:{id}` / `en:{id}`. The position then addresses THAT document,
+//! never the body. [`range_rects_in_region`] is the selection-geometry twin,
+//! scoped by [`RegionScope`], and [`range_rects`] the body-only wrapper. The
 //! same header/footer part paints on every page that uses it, so a scoped range
 //! query emits one rect set per such page, each stamped with its own page index.
 //!
@@ -46,7 +48,8 @@
 //! image, then a run's own box, then `in_typeable_area`.
 
 use crate::display_list::{
-    DisplayBounds, DisplayList, DisplayPage, DocAttrs, HfRegion, Primitive, TableCellRef,
+    DisplayBounds, DisplayList, DisplayPage, DocAttrs, HfRegion, NoteRegion, Primitive,
+    TableCellRef, doc_attrs, note_group_id,
 };
 use serde::Serialize;
 use serde_json::Number;
@@ -730,9 +733,9 @@ fn in_bounds(bounds: &DisplayBounds, x: f64, y: f64) -> bool {
 }
 
 /// Whether a body point lies in the page's typeable area: the authored content
-/// box (so a column gutter counts like the columns it separates), minus note
-/// areas, whose text this path cannot reach. Column boxes are the fallback for
-/// a list without a content box, and neither degrades to the runs alone.
+/// box, so a column gutter counts like the columns it separates. Column boxes
+/// are the fallback for a list without a content box, and neither degrades to
+/// the runs alone.
 ///
 /// Deliberately blind to content positioned OUTSIDE the content box — a
 /// floating text box in a margin. Its glyphs still read as text (a run's own
@@ -740,16 +743,22 @@ fn in_bounds(bounds: &DisplayBounds, x: f64, y: f64) -> bool {
 /// container rect for it exists in the display list. That under-claims, never
 /// over-claims: the cursor is an arrow where a click would still type.
 fn in_typeable_area(page: &DisplayPage, x: f64, y: f64) -> bool {
-    let boxed = match &page.content_bounds {
+    match &page.content_bounds {
         Some(bounds) => in_bounds(bounds, x, y),
         None => page.column_bounds.iter().any(|c| in_bounds(c, x, y)),
+    }
+}
+
+/// Whether a point lies in a note area — the vertical `[y, y + height]` test a
+/// header/footer band gets. An area stating no band, or a zero-height one, owns
+/// no point: the list does not say where its notes paint, so claiming the
+/// region would route a click out of the body with nowhere to send it.
+fn in_note_area(area: &NoteRegion, y: f64) -> bool {
+    let px = |value: &Option<Number>| value.as_ref().and_then(Number::as_f64);
+    let (Some(top), Some(height)) = (px(&area.y), px(&area.height)) else {
+        return false;
     };
-    boxed
-        && !page.note_areas.iter().any(|area| {
-            let top = area.y.as_ref().and_then(Number::as_f64).unwrap_or(0.0);
-            let height = area.height.as_ref().and_then(Number::as_f64).unwrap_or(0.0);
-            height > 0.0 && y >= top && y <= top + height
-        })
+    height > 0.0 && y >= top && y <= top + height
 }
 
 /// Whether the topmost image under the point is one a click would select.
@@ -859,15 +868,18 @@ fn resolve_point(prims: &[Primitive], typeable: bool, x: f64, y: f64) -> PointRe
 
 /// Which part of the page owns a point, the position inside that part's
 /// document, and what sits under the pointer. For `header` / `footer` the
-/// position addresses the header/footer document identified by `rId`, never the
-/// body document, so the caller must route the resulting selection to that
-/// editor.
+/// position addresses the header/footer document identified by `rId`, and for
+/// `footnote` / `endnote` the note story named by `noteId` — never the body
+/// document, so the caller must route the resulting selection to that editor.
 #[derive(Serialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RegionHit {
     pub region: HitRegion,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r_id: Option<String>,
+    /// note whose story the position addresses (`fn:{id}` / `en:{id}`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<i64>,
     pub pos: Option<i64>,
     pub target: HoverTarget,
 }
@@ -880,27 +892,154 @@ pub enum HitRegion {
     Header,
     #[serde(rename = "footer")]
     Footer,
+    #[serde(rename = "footnote")]
+    Footnote,
+    #[serde(rename = "endnote")]
+    Endnote,
 }
 
-/// parse the region discriminant used at the JSON/wasm boundary
-/// (`"body" | "header" | "footer"`), the string twin of [`HitRegion`]'s serde
-/// rename. Shared by the JSON-arg and session-handle range-rect exports.
-pub(crate) fn parse_region(region: &str) -> Result<HitRegion, String> {
+/// A scoped query's address: the page part, plus the instance of it that owns
+/// the document the positions belong to. A header/footer part is named by its
+/// `rId`, and `None` matches any band of the kind, since the same part paints
+/// on every page using it. A note is named by its id, which is never optional:
+/// two notes are two unrelated documents whose positions must not mix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionScope<'a> {
+    Body,
+    Header(Option<&'a str>),
+    Footer(Option<&'a str>),
+    Footnote(i64),
+    Endnote(i64),
+}
+
+impl RegionScope<'_> {
+    fn region(self) -> HitRegion {
+        match self {
+            Self::Body => HitRegion::Body,
+            Self::Header(_) => HitRegion::Header,
+            Self::Footer(_) => HitRegion::Footer,
+            Self::Footnote(_) => HitRegion::Footnote,
+            Self::Endnote(_) => HitRegion::Endnote,
+        }
+    }
+}
+
+/// parse the scope used at the JSON/wasm boundary: `region` is the string twin
+/// of [`HitRegion`]'s serde rename and `part_id` names the instance — a
+/// header/footer `rId` (empty ⇒ any band of the kind) or a note id. Shared by
+/// the JSON-arg and session-handle range-rect exports.
+pub fn parse_region_scope<'a>(region: &str, part_id: &'a str) -> Result<RegionScope<'a>, String> {
+    let r_id = (!part_id.is_empty()).then_some(part_id);
+    let note_id = || {
+        part_id
+            .parse::<i64>()
+            .map_err(|_| format!("region {region:?} needs a note id, got {part_id:?}"))
+    };
     match region {
-        "body" => Ok(HitRegion::Body),
-        "header" => Ok(HitRegion::Header),
-        "footer" => Ok(HitRegion::Footer),
+        "body" => Ok(RegionScope::Body),
+        "header" => Ok(RegionScope::Header(r_id)),
+        "footer" => Ok(RegionScope::Footer(r_id)),
+        "footnote" => Ok(RegionScope::Footnote(note_id()?)),
+        "endnote" => Ok(RegionScope::Endnote(note_id()?)),
         other => Err(format!("unknown region {other:?}")),
     }
 }
 
-/// Resolves a point against the page's header and footer bands before falling
-/// through to the body.
+/// One note's primitives inside a page's note area, with the id naming the
+/// `fn:{id}` / `en:{id}` story its positions belong to.
+struct NoteStory<'a> {
+    id: i64,
+    primitives: &'a [Primitive],
+}
+
+/// The kind string an area paints under, defaulting like the display-list
+/// emitter does when the layout left it unstated. Note paint-group ids are
+/// built from it, so the two must agree.
+fn note_kind(area: &NoteRegion) -> &str {
+    area.kind.as_deref().unwrap_or("footnote")
+}
+
+fn note_region(area: &NoteRegion) -> HitRegion {
+    if note_kind(area) == "endnote" {
+        HitRegion::Endnote
+    } else {
+        HitRegion::Footnote
+    }
+}
+
+/// The stories an area stacks, in paint order: one note's primitives are
+/// emitted contiguously under its paint-group id, so each story is one span of
+/// them. A primitive with no attrs to carry a group — a paragraph or table
+/// border line — belongs to the note it sits inside and must not end a span;
+/// one naming no listed note does end it, being the area's own chrome.
+fn note_stories(area: &NoteRegion) -> Vec<NoteStory<'_>> {
+    /// The span being accumulated: its note, and where the span starts.
+    #[derive(Clone, Copy)]
+    struct OpenSpan {
+        id: i64,
+        start: usize,
+    }
+
+    let kind = note_kind(area);
+    let mut stories = Vec::new();
+    let mut open: Option<OpenSpan> = None;
+    for (index, primitive) in area.primitives.iter().enumerate() {
+        let Some(attrs) = doc_attrs(primitive) else {
+            continue;
+        };
+        let id = attrs.group_id.as_deref().and_then(|group| {
+            area.note_ids
+                .iter()
+                .copied()
+                .find(|id| note_group_id(kind, *id) == group)
+        });
+        if id == open.map(|span| span.id) {
+            continue;
+        }
+        if let Some(span) = open {
+            stories.push(NoteStory {
+                id: span.id,
+                primitives: &area.primitives[span.start..index],
+            });
+        }
+        open = id.map(|id| OpenSpan { id, start: index });
+    }
+    if let Some(span) = open {
+        stories.push(NoteStory {
+            id: span.id,
+            primitives: &area.primitives[span.start..],
+        });
+    }
+    stories
+}
+
+/// Squared distance from a point to the nearest text box of a primitive list,
+/// zero inside one and infinite for a list painting no text. Both axes count:
+/// a note area lays its notes out in columns it starts at the same vertical
+/// position, so two of them can share a band and only `x` tells them apart.
+fn text_box_distance_squared(prims: &[Primitive], x: f64, y: f64) -> f64 {
+    text_hits(prims)
+        .iter()
+        .map(|hit| {
+            let dx = (hit.x - x).max(x - (hit.x + hit.width)).max(0.0);
+            let dy = (hit.top - y).max(y - hit.bottom).max(0.0);
+            dx * dx + dy * dy
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Resolves a point against the page's header and footer bands, then its note
+/// areas, before falling through to the body.
 ///
 /// Band membership is the vertical `[y, y + height]` test on the region's box.
 /// A point inside a band always identifies that region even when `pos` is
 /// `None` — an empty band still owns the click, and the region alone is what
 /// routes editing into that header or footer.
+///
+/// A note area stacks several independent documents, so it resolves against
+/// the story nearest the point rather than the area as a whole: a click cannot
+/// borrow a position from another note. Like a band it carries no content box,
+/// so only its runs read as typeable text.
 pub fn hit_test_regions(dl: &DisplayList, page_index: usize, x: f64, y: f64) -> Option<RegionHit> {
     let page = dl.pages.get(page_index)?;
 
@@ -917,6 +1056,7 @@ pub fn hit_test_regions(dl: &DisplayList, page_index: usize, x: f64, y: f64) -> 
         return Some(RegionHit {
             region: HitRegion::Header,
             r_id: Some(h.r_id.clone()),
+            note_id: None,
             pos: resolved.pos,
             target: resolved.target,
         });
@@ -928,6 +1068,23 @@ pub fn hit_test_regions(dl: &DisplayList, page_index: usize, x: f64, y: f64) -> 
         return Some(RegionHit {
             region: HitRegion::Footer,
             r_id: Some(f.r_id.clone()),
+            note_id: None,
+            pos: resolved.pos,
+            target: resolved.target,
+        });
+    }
+    if let Some(area) = page.note_areas.iter().find(|area| in_note_area(area, y)) {
+        let story = note_stories(area)
+            .into_iter()
+            .map(|story| (text_box_distance_squared(story.primitives, x, y), story))
+            .min_by(|(left, _), (right, _)| left.total_cmp(right))
+            .map(|(_, story)| story);
+        let primitives = story.as_ref().map_or(&[][..], |story| story.primitives);
+        let resolved = resolve_point(primitives, false, x, y);
+        return Some(RegionHit {
+            region: note_region(area),
+            r_id: None,
+            note_id: story.map(|story| story.id),
             pos: resolved.pos,
             target: resolved.target,
         });
@@ -936,6 +1093,7 @@ pub fn hit_test_regions(dl: &DisplayList, page_index: usize, x: f64, y: f64) -> 
     Some(RegionHit {
         region: HitRegion::Body,
         r_id: None,
+        note_id: None,
         pos: resolved.pos,
         target: resolved.target,
     })
@@ -1025,7 +1183,7 @@ fn collect_range_rects(
 
 /// Returns body-document highlight rectangles across all pages.
 pub fn range_rects(dl: &DisplayList, from: i64, to: i64) -> Vec<RangeRect> {
-    range_rects_in_region(dl, HitRegion::Body, None, from, to)
+    range_rects_in_region(dl, RegionScope::Body, from, to)
 }
 
 /// Caret box for a body-document position: the first primitive on the earliest
@@ -1104,20 +1262,15 @@ pub fn caret_rect(dl: &DisplayList, pos: i64) -> Option<CaretRect> {
 /// Highlight rectangles for a document range inside one page region — the
 /// selection-geometry twin of [`hit_test_regions`]'s scoping.
 ///
-/// [`HitRegion::Body`] behaves exactly like [`range_rects`] and ignores `r_id`,
-/// since the body is a single document. For [`HitRegion::Header`] and
-/// [`HitRegion::Footer`], `from` and `to` address the header/footer document
-/// named by `r_id`, and only bands whose `rId` matches contribute. Because that
-/// part paints on every page using it, a match yields one rect set per such
-/// page, each stamped with its own `page_index`.
-///
-/// `r_id = None` matches any band of the kind. Passing the active part's `rId`
-/// is preferred, so a first-page variant on another page cannot contribute
-/// stray rectangles.
+/// [`RegionScope::Body`] behaves exactly like [`range_rects`], since the body
+/// is a single document. Otherwise `from` and `to` address the document the
+/// scope names — a header/footer part, or a note story — and only the parts
+/// matching it contribute. A header/footer part paints on every page using it,
+/// so a match yields one rect set per such page, each stamped with its own
+/// `page_index`.
 pub fn range_rects_in_region(
     dl: &DisplayList,
-    region: HitRegion,
-    r_id: Option<&str>,
+    scope: RegionScope<'_>,
     from: i64,
     to: i64,
 ) -> Vec<RangeRect> {
@@ -1127,20 +1280,29 @@ pub fn range_rects_in_region(
         return rects;
     }
 
-    let matches = |band: &HfRegion| r_id.is_none_or(|id| id == band.r_id);
+    let band = |band: &HfRegion, r_id: Option<&str>| r_id.is_none_or(|id| id == band.r_id);
     for (page_index, page) in dl.pages.iter().enumerate() {
-        let prims: Option<&[Primitive]> = match region {
-            HitRegion::Body => Some(&page.primitives),
-            HitRegion::Header => page
+        let prims: Option<&[Primitive]> = match scope {
+            RegionScope::Body => Some(&page.primitives),
+            RegionScope::Header(r_id) => page
                 .header
                 .as_ref()
-                .filter(|h| matches(h))
+                .filter(|h| band(h, r_id))
                 .map(|h| h.primitives.as_slice()),
-            HitRegion::Footer => page
+            RegionScope::Footer(r_id) => page
                 .footer
                 .as_ref()
-                .filter(|f| matches(f))
+                .filter(|f| band(f, r_id))
                 .map(|f| f.primitives.as_slice()),
+            RegionScope::Footnote(note_id) | RegionScope::Endnote(note_id) => page
+                .note_areas
+                .iter()
+                .filter(|area| {
+                    note_region(area) == scope.region() && area.note_ids.contains(&note_id)
+                })
+                .flat_map(note_stories)
+                .find(|story| story.id == note_id)
+                .map(|story| story.primitives),
         };
         if let Some(prims) = prims {
             collect_range_rects(prims, page_index, from, to, &mut rects);
@@ -1192,26 +1354,27 @@ pub fn range_rects_json(display_list: &str, from: i64, to: i64) -> Result<String
 }
 
 /// `range_rects_in_region` over serialized inputs. `region` is
-/// `"body" | "header" | "footer"`; `r_id` is the HF part's relationship id
-/// (ignored for `body`; empty string ⇒ match any band of the kind). Returns a
-/// JSON array of rects, or a `parse:`/`unknown region` error string.
+/// `"body" | "header" | "footer" | "footnote" | "endnote"`; `part_id` names the
+/// instance — the HF part's relationship id (empty ⇒ match any band of the
+/// kind) or the note id, and is ignored for `body`. Returns a JSON array of
+/// rects, or a `parse:`/`unknown region` error string.
 pub fn range_rects_region_json(
     display_list: &str,
     region: &str,
-    r_id: &str,
+    part_id: &str,
     from: i64,
     to: i64,
 ) -> Result<String, String> {
     let dl: DisplayList = serde_json::from_str(display_list).map_err(|e| format!("parse: {e}"))?;
-    let region = parse_region(region)?;
-    let r_id = if r_id.is_empty() { None } else { Some(r_id) };
-    serde_json::to_string(&range_rects_in_region(&dl, region, r_id, from, to))
+    let scope = parse_region_scope(region, part_id)?;
+    serde_json::to_string(&range_rects_in_region(&dl, scope, from, to))
         .map_err(|e| format!("serialize: {e}"))
 }
 
 /// `hit_test_regions` over serialized inputs; returns
-/// `{"region":"body"|"header"|"footer","rId"?,"pos":n|null,"target":"text"|"image"|"none"}`
-/// or `"null"` for an out-of-range page
+/// `{"region":"body"|"header"|"footer"|"footnote"|"endnote","rId"?,"noteId"?,`
+/// `"pos":n|null,"target":"text"|"image"|"none"}` or `"null"` for an
+/// out-of-range page
 pub fn hit_test_regions_json(
     display_list: &str,
     page_index: usize,
@@ -1277,6 +1440,27 @@ mod tests {
             serde_json::json!({"x": 80, "y": 80, "width": 340, "height": 340}),
             vec![run(100.0, 100.0, 50.0, 1), image(100.0, 200.0, Some(10))],
         )
+    }
+
+    fn note_run(baseline: f64, doc_start: i64, group_id: &str) -> serde_json::Value {
+        let mut run = run(100.0, baseline, 50.0, doc_start);
+        run["groupId"] = group_id.into();
+        run
+    }
+
+    /// [`hover_fixture`] plus a footnote area at y 360..420 stacking two note
+    /// stories over x 100..150, with bands y 374..394 and y 394..414.
+    fn note_fixture() -> DisplayList {
+        let mut dl = hover_fixture();
+        dl.pages[0].note_areas = serde_json::from_value(serde_json::json!([{
+            "kind": "footnote",
+            "y": 360,
+            "height": 60,
+            "noteIds": [7, 8],
+            "primitives": [note_run(390.0, 1, "footnote-7"), note_run(410.0, 20, "footnote-8")]
+        }]))
+        .unwrap();
+        dl
     }
 
     fn target(dl: &DisplayList, x: f64, y: f64) -> HoverTarget {
@@ -1357,18 +1541,84 @@ mod tests {
         assert_eq!(target(&dl, 250.0, 300.0), HoverTarget::Text);
     }
 
-    /// Note text lives outside `primitives` and is not editable through this
-    /// path, so the pointer must not invite a click that lands in the body.
+    /// Note text is its own story, so a point in a note area addresses that
+    /// note and its glyphs invite typing like the body's do.
     #[test]
-    fn hover_target_treats_note_areas_as_holes() {
-        let mut dl = hover_fixture();
-        dl.pages[0].note_areas =
-            serde_json::from_value(serde_json::json!([{"y": 360, "height": 60}])).unwrap();
-        let note = hit_test_regions(&dl, 0, 120.0, 390.0).unwrap();
-        assert_eq!(note.target, HoverTarget::None);
-        // the position it would have handed a click is the body run above it
+    fn a_point_in_a_note_area_addresses_the_note_story() {
+        let dl = note_fixture();
+
+        let note = hit_test_regions(&dl, 0, 120.0, 385.0).unwrap();
+        assert_eq!(note.region, HitRegion::Footnote);
+        assert_eq!(note.note_id, Some(7));
+        assert_eq!(note.target, HoverTarget::Text);
         assert!(matches!(note.pos, Some(pos) if (1..=6).contains(&pos)));
-        assert_eq!(target(&dl, 120.0, 340.0), HoverTarget::Text);
+
+        // the body line above the area still answers for the body
+        let body = hit_test_regions(&dl, 0, 120.0, 340.0).unwrap();
+        assert_eq!(body.region, HitRegion::Body);
+        assert_eq!(body.note_id, None);
+        assert_eq!(body.target, HoverTarget::Text);
+    }
+
+    /// An area stating no band of its own cannot say where its notes paint, so
+    /// it claims no point and the body answers — the same under-claim the
+    /// typeable area makes off the content box.
+    #[test]
+    fn a_note_area_without_a_band_claims_no_point() {
+        let mut dl = note_fixture();
+        dl.pages[0].note_areas[0].y = None;
+        let hit = hit_test_regions(&dl, 0, 120.0, 385.0).unwrap();
+        assert_eq!(hit.region, HitRegion::Body);
+        assert_eq!(hit.note_id, None);
+    }
+
+    /// One area stacks several independent stories, so a point must never
+    /// borrow a position from the note above or below the one it landed in.
+    #[test]
+    fn stacked_notes_resolve_against_the_story_the_point_landed_in() {
+        let dl = note_fixture();
+        let second = hit_test_regions(&dl, 0, 120.0, 405.0).unwrap();
+        assert_eq!(second.region, HitRegion::Footnote);
+        assert_eq!(second.note_id, Some(8));
+        assert!(matches!(second.pos, Some(pos) if (20..=25).contains(&pos)));
+    }
+
+    /// A note area carrying nothing still owns the click, like an empty
+    /// header band does, but names no story to route it to.
+    #[test]
+    fn an_empty_note_area_owns_the_point_without_a_story() {
+        let mut dl = hover_fixture();
+        dl.pages[0].note_areas = serde_json::from_value(
+            serde_json::json!([{"kind": "endnote", "y": 360, "height": 60}]),
+        )
+        .unwrap();
+        let note = hit_test_regions(&dl, 0, 120.0, 390.0).unwrap();
+        assert_eq!(note.region, HitRegion::Endnote);
+        assert_eq!(note.note_id, None);
+        assert_eq!(note.pos, None);
+        assert_eq!(note.target, HoverTarget::None);
+    }
+
+    /// Selection geometry follows the same scoping: a range in a note's story
+    /// highlights that note's glyphs, and the identical body range highlights
+    /// the body's — the two documents never share rectangles.
+    #[test]
+    fn range_rects_in_a_note_cover_that_note_only() {
+        let dl = note_fixture();
+
+        let note = range_rects_in_region(&dl, RegionScope::Footnote(7), 1, 6);
+        assert_eq!(note.len(), 1);
+        assert!((note[0].y - 374.0).abs() < 1.0, "note rect y {}", note[0].y);
+
+        let body = range_rects_in_region(&dl, RegionScope::Body, 1, 6);
+        assert_eq!(body.len(), 1);
+        assert!((body[0].y - 84.0).abs() < 1.0, "body rect y {}", body[0].y);
+
+        // the sibling note's story shares the position range and no geometry
+        let sibling = range_rects_in_region(&dl, RegionScope::Footnote(8), 1, 6);
+        assert!(sibling.is_empty());
+        // and an endnote scope matches no footnote area
+        assert!(range_rects_in_region(&dl, RegionScope::Endnote(7), 1, 6).is_empty());
     }
 
     /// A picture with a document position is a click target whatever its wrap
