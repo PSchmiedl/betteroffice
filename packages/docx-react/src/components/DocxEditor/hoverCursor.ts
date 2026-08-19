@@ -10,19 +10,22 @@
  * An idle header/footer band deliberately DIFFERS from that stylesheet, which
  * gave the whole band a hand: here it reads as text over its own runs, since a
  * single click on an idle band is inert and only a double-click opens it for
- * editing at that word.
+ * editing at that word. Over a note area the same reading is literal — a
+ * single click there opens the note and puts the caret under the pointer.
  *
  * A wasm build predating `target` omits it, which reads as "not text".
  */
 
 import type { DisplayListRegionHit } from '@betteroffice/docx/layout/render';
 
+import { hitBelongsToPart, isNoteAreaHit, type PartEdit } from './partEdit';
+
 export type CanvasHoverCursor = 'default' | 'text';
 
 export interface CanvasHoverMode {
   readOnly: boolean;
-  /** the header/footer region being edited inline, if any */
-  hfEditMode?: 'header' | 'footer' | null;
+  /** the non-body part open for editing, if any */
+  partEdit?: PartEdit | null;
 }
 
 export function canvasHoverCursor(
@@ -30,12 +33,13 @@ export function canvasHoverCursor(
   hit: DisplayListRegionHit | null
 ): CanvasHoverCursor {
   if (mode.readOnly || !hit) return 'default';
-  if (mode.hfEditMode) {
-    // only the edited band accepts typing; the body and the sibling band are inert
-    if (hit.region !== mode.hfEditMode) return 'default';
-    // the whole band is typeable once open, so an absent target still types
+  if (mode.partEdit) {
+    // only the open part accepts typing; the body and every sibling are inert
+    if (!hitBelongsToPart(mode.partEdit, hit)) return 'default';
+    // the whole part is typeable once open, so an absent target still types
     return hit.target === 'image' ? 'default' : 'text';
   }
+  if (isNoteAreaHit(hit)) return hit.target === 'image' ? 'default' : 'text';
   return hit.target === 'text' ? 'text' : 'default';
 }
 
