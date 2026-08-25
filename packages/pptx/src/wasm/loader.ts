@@ -191,7 +191,7 @@ export function openPresentation(
         throw new Error(`pptx wasm returned unknown update origin ${origin}`);
       }
       pendingUpdates.push({
-        update: encoded.slice(1),
+        update: encoded.subarray(1),
         origin: origin === 0 ? 'local' : 'remote',
       });
     }
@@ -264,10 +264,10 @@ export function openPresentation(
       return jsonWasmCall(() => renderer.hitTestJson(x, y));
     },
     mediaBytes(partPath: string): Uint8Array {
-      return wasmCall(() => doc.mediaBytes(partPath).slice());
+      return wasmCall(() => doc.mediaBytes(partPath));
     },
     save(): Uint8Array {
-      return wasmCall(() => doc.saveBytes().slice());
+      return wasmCall(() => doc.saveBytes());
     },
     insertText(storyId, index, text, style = {}): TextReceipt {
       return jsonWasmCall(
@@ -364,20 +364,20 @@ export function openPresentation(
       return jsonWasmCall(() => doc.redoJson(), true);
     },
     encodeStateVector(): Uint8Array {
-      return wasmCall(() => doc.encodeStateVector().slice());
+      return wasmCall(() => doc.encodeStateVector());
     },
     encodeStateAsUpdate(remoteStateVector?: Uint8Array): Uint8Array {
       return wasmCall(() =>
         remoteStateVector === undefined
-          ? doc.encodeStateAsUpdate().slice()
-          : doc.encodeDiff(remoteStateVector.slice()).slice()
+          ? doc.encodeStateAsUpdate()
+          : doc.encodeDiff(remoteStateVector)
       );
     },
     encodeDiff(remoteStateVector): Uint8Array {
-      return wasmCall(() => doc.encodeDiff(remoteStateVector.slice()).slice());
+      return wasmCall(() => doc.encodeDiff(remoteStateVector));
     },
     applyUpdate(update): DeckSnapshot {
-      return jsonWasmCall(() => doc.applyUpdateJson(update.slice()), true);
+      return jsonWasmCall(() => doc.applyUpdateJson(update), true);
     },
     onUpdate(listener): () => void {
       assertAlive();

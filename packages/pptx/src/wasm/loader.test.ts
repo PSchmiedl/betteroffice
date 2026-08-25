@@ -52,6 +52,48 @@ describe('PPTX wasm boundary', () => {
     right.dispose();
   });
 
+  // the wasm event arrives as `[origin, ...update]`, so a listener that reaches
+  // for `.buffer` must not find the origin tag riding along — and the shape must
+  // not depend on how many other listeners happen to be subscribed.
+  test('delivers exact update buffers regardless of subscriber count', () => {
+    const seed = openPresentation(fixture, { clientId: 9201 });
+    let update: Uint8Array;
+    try {
+      update = seed.encodeStateAsUpdate();
+    } finally {
+      seed.dispose();
+    }
+    for (const extraSubscriber of [false, true]) {
+      const source = openPresentation(Uint8Array.of(0xff), {
+        clientId: extraSubscriber ? 9202 : 9203,
+        initialUpdate: update,
+      });
+      const peer = openPresentation(Uint8Array.of(0xff), {
+        clientId: extraSubscriber ? 9204 : 9205,
+        initialUpdate: update,
+      });
+      const received: Uint8Array[] = [];
+      try {
+        source.onUpdate((bytes, origin) => {
+          if (origin === 'local') received.push(bytes);
+        });
+        if (extraSubscriber) source.onUpdate(() => {});
+
+        const story = firstStory(source.snapshot().slides.flatMap((slide) => slide.shapes));
+        source.insertText(story.id, story.length - 1, ' exact');
+        expect(received).toHaveLength(1);
+        expect(received[0].byteOffset).toBe(0);
+        expect(received[0].buffer.byteLength).toBe(received[0].byteLength);
+
+        peer.applyUpdate(new Uint8Array(received[0].buffer));
+        expect(peer.story(story.id)).toEqual(source.story(story.id));
+      } finally {
+        source.dispose();
+        peer.dispose();
+      }
+    }
+  });
+
   test('opens, edits, reflows, hit-tests, and observes a local update', () => {
     const snapshot = handle.snapshot();
     expect(snapshot.slides.length).toBe(3);
