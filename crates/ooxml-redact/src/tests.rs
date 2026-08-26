@@ -396,6 +396,384 @@ fn empty_shared_string_cell_does_not_leak_next_value() {
 }
 
 #[test]
+fn scheme_bearing_relationship_targets_redacted_without_target_mode() {
+    let rels = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://secret.example/docx" TargetMode="External"/>"#,
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/a"/>"#,
+        r#"<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="file:///C:/Users/jane/x.xlsx"/>"#,
+        r#"<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="file:///\\server\share\x.xlsx"/>"#,
+        r#"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>"#,
+        r#"</Relationships>"#,
+    );
+    let mut report = RedactionReport::default();
+    let output = xml::redact_xml(
+        Format::Docx,
+        "word/_rels/document.xml.rels",
+        rels.as_bytes(),
+        &mut report,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains(r#"Target="https://example.com""#));
+    assert!(!text.contains("secret.example"));
+    assert!(!text.contains(r"\server\share"));
+    assert!(!text.contains("/Users/jane"));
+    assert!(text.contains(r#"Target="media/image1.png""#));
+    assert_eq!(report.attributes, 4);
+}
+
+#[test]
+fn rfc3986_scheme_targets_redacted_without_target_mode() {
+    let rels = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="tel:+49123456789"/>"#,
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="MAILTO:jane@example.com"/>"#,
+        r#"<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="myapp://x"/>"#,
+        r#"<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="../fonts/x.ttf"/>"#,
+        r#"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="media/image:1.png"/>"#,
+        r#"</Relationships>"#,
+    );
+    let mut report = RedactionReport::default();
+    let output = xml::redact_xml(
+        Format::Docx,
+        "word/_rels/document.xml.rels",
+        rels.as_bytes(),
+        &mut report,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(text.matches(r#"Target="https://example.com""#).count(), 3);
+    assert!(!text.contains("tel:"));
+    assert!(!text.contains("jane@example.com"));
+    assert!(!text.contains("myapp:"));
+    assert!(text.contains(r#"Target="../fonts/x.ttf""#));
+    assert!(text.contains(r#"Target="media/image:1.png""#));
+    assert_eq!(report.attributes, 3);
+}
+
+#[test]
+fn uri_in_fragment_keeps_relationship_internal() {
+    let rels = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="worksheet.xml#ref=https://example.com/x"/>"#,
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/x"/>"#,
+        r#"</Relationships>"#,
+    );
+    let mut report = RedactionReport::default();
+    let output = xml::redact_xml(
+        Format::Docx,
+        "word/_rels/document.xml.rels",
+        rels.as_bytes(),
+        &mut report,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains(r#"Target="worksheet.xml#ref=https://example.com/x""#));
+    assert!(!text.contains(r#"Target="https://example.com/x""#));
+    assert!(text.contains(r#"Target="https://example.com""#));
+    assert_eq!(report.attributes, 1);
+}
+
+#[test]
+fn unc_and_protocol_relative_targets_redacted_without_target_mode() {
+    let rels = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="\\fileserver01\finance\q3.xlsx"/>"#,
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="\\?\UNC\fileserver02\finance\q4.xlsx"/>"#,
+        r#"<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="//fileserver03.example/finance/q1.xlsx"/>"#,
+        r#"<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="\word\media\image1.png"/>"#,
+        r#"</Relationships>"#,
+    );
+    let mut report = RedactionReport::default();
+    let output = xml::redact_xml(
+        Format::Docx,
+        "word/_rels/document.xml.rels",
+        rels.as_bytes(),
+        &mut report,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(text.matches(r#"Target="https://example.com""#).count(), 3);
+    assert!(!text.contains("fileserver01"));
+    assert!(!text.contains("fileserver02"));
+    assert!(!text.contains("fileserver03"));
+    assert!(text.contains(r#"Target="\word\media\image1.png""#));
+    assert_eq!(report.attributes, 3);
+}
+
+#[test]
+fn percent_encoded_and_dotted_relative_targets_stay_internal() {
+    let rels = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../../word/media/im%7Eage1.png"/>"#,
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../../word/./media/image2.png"/>"#,
+        r#"<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="..\..\word\media\image3.png"/>"#,
+        r#"</Relationships>"#,
+    );
+    let mut report = RedactionReport::default();
+    let output = xml::redact_xml(
+        Format::Docx,
+        "word/_rels/document.xml.rels",
+        rels.as_bytes(),
+        &mut report,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains(r#"Target="../../word/media/im%7Eage1.png""#));
+    assert!(text.contains(r#"Target="../../word/./media/image2.png""#));
+    assert!(text.contains(r#"Target="..\..\word\media\image3.png""#));
+    assert!(!text.contains("TargetMode"));
+    assert_eq!(report.attributes, 0);
+}
+
+#[test]
+fn padded_target_mode_still_marks_relationship_external() {
+    let source = pptx_fixture_with_slide_relationship(
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="PPTX_SECRET_SHARE/finance/q1.xlsx" TargetMode=" External "/>"#,
+    );
+    let (output, _) = redact_with_report(&source, Format::Pptx).unwrap();
+    let parts = ooxml_opc::unzip_parts(&output).unwrap();
+    let rels =
+        String::from_utf8_lossy(part(&parts, "ppt/slides/_rels/slide1.xml.rels")).into_owned();
+    assert!(rels.contains(r#"Target="https://example.com""#));
+    assert!(rels.contains(r#"TargetMode="External""#));
+    assert!(!rels.contains("PPTX_SECRET_SHARE"));
+    pptx_parse::parse_pptx(&output).unwrap();
+}
+
+#[test]
+fn lowercase_target_mode_attribute_is_written_back_canonically() {
+    let source = pptx_fixture_with_slide_relationship(
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://PPTX_SECRET_HOST/x" targetmode="external"/>"#,
+    );
+    let (output, _) = redact_with_report(&source, Format::Pptx).unwrap();
+    let parts = ooxml_opc::unzip_parts(&output).unwrap();
+    let rels =
+        String::from_utf8_lossy(part(&parts, "ppt/slides/_rels/slide1.xml.rels")).into_owned();
+    assert!(rels.contains(r#"TargetMode="External""#));
+    assert!(!rels.contains("targetmode"));
+    assert!(!rels.contains("PPTX_SECRET_HOST"));
+    pptx_parse::parse_pptx(&output).unwrap();
+}
+
+#[test]
+fn a_case_variant_target_does_not_externalize_the_real_one() {
+    let rels = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml" target="mailto:jane@example.com"/>"#,
+        r#"</Relationships>"#,
+    );
+    let mut report = RedactionReport::default();
+    let output = xml::redact_xml(
+        Format::Pptx,
+        "ppt/_rels/presentation.xml.rels",
+        rels.as_bytes(),
+        &mut report,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains(r#"Target="slides/slide1.xml""#));
+    assert!(!text.contains("TargetMode"));
+    assert_eq!(report.attributes, 0);
+}
+
+#[test]
+fn repeated_target_mode_spellings_collapse_to_one_attribute() {
+    let rels = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://secret.example/x" TargetMode="External" targetmode="external"/>"#,
+        r#"</Relationships>"#,
+    );
+    let mut report = RedactionReport::default();
+    let output = xml::redact_xml(
+        Format::Docx,
+        "word/_rels/document.xml.rels",
+        rels.as_bytes(),
+        &mut report,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(text.matches("TargetMode").count(), 1);
+    assert!(!text.contains("secret.example"));
+    let mut again = RedactionReport::default();
+    xml::redact_xml(
+        Format::Docx,
+        "word/_rels/document.xml.rels",
+        text.as_bytes(),
+        &mut again,
+    )
+    .unwrap();
+}
+
+#[test]
+fn internal_target_mode_keeps_the_producer_spelling() {
+    let rels = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png" targetmode="internal"/>"#,
+        r#"</Relationships>"#,
+    );
+    let mut report = RedactionReport::default();
+    let output = xml::redact_xml(
+        Format::Docx,
+        "word/_rels/document.xml.rels",
+        rels.as_bytes(),
+        &mut report,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains(r#"targetmode="internal""#));
+    assert_eq!(report.attributes, 0);
+}
+
+#[test]
+fn inferred_external_relationship_declares_target_mode() {
+    let source = pptx_fixture_with_slide_relationship(
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="tel:+49PPTX_SECRET_PHONE"/>"#,
+    );
+    pptx_parse::parse_pptx(&source).unwrap();
+
+    let (output, _) = redact_with_report(&source, Format::Pptx).unwrap();
+    let parts = ooxml_opc::unzip_parts(&output).unwrap();
+    let rels =
+        String::from_utf8_lossy(part(&parts, "ppt/slides/_rels/slide1.xml.rels")).into_owned();
+    assert!(rels.contains(r#"Target="https://example.com""#));
+    assert!(rels.contains(r#"TargetMode="External""#));
+    assert!(
+        parts
+            .iter()
+            .all(|(_, bytes)| !String::from_utf8_lossy(bytes).contains("PPTX_SECRET_PHONE")),
+        "secret survived: PPTX_SECRET_PHONE"
+    );
+    pptx_parse::parse_pptx(&output).unwrap();
+}
+
+#[test]
+fn declared_target_mode_is_not_duplicated() {
+    let source = pptx_fixture_with_slide_relationship(
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://secret.example/pptx" TargetMode="External"/>"#,
+    );
+    let (output, _) = redact_with_report(&source, Format::Pptx).unwrap();
+    let parts = ooxml_opc::unzip_parts(&output).unwrap();
+    let rels =
+        String::from_utf8_lossy(part(&parts, "ppt/slides/_rels/slide1.xml.rels")).into_owned();
+    assert_eq!(rels.matches("TargetMode").count(), 1);
+    pptx_parse::parse_pptx(&output).unwrap();
+}
+
+#[test]
+fn declared_internal_mode_is_corrected_when_the_target_is_external() {
+    let source = pptx_fixture_with_slide_relationship(
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="tel:+49PPTX_SECRET_PHONE" TargetMode="Internal"/>"#,
+    );
+    pptx_parse::parse_pptx(&source).unwrap();
+
+    let (output, _) = redact_with_report(&source, Format::Pptx).unwrap();
+    let parts = ooxml_opc::unzip_parts(&output).unwrap();
+    let rels =
+        String::from_utf8_lossy(part(&parts, "ppt/slides/_rels/slide1.xml.rels")).into_owned();
+    assert!(rels.contains(r#"Target="https://example.com""#));
+    assert!(rels.contains(r#"TargetMode="External""#));
+    assert!(!rels.contains("PPTX_SECRET_PHONE"));
+    pptx_parse::parse_pptx(&output).unwrap();
+}
+
+#[test]
+fn relative_target_with_parent_segments_stays_internal() {
+    let target = "../../xl/nested/../worksheets/sheet1.xml";
+    let source = fixture_with_part(
+        xlsx_fixture(),
+        "xl/_rels/workbook.xml.rels",
+        xml(&format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{target}"/></Relationships>"#
+        )),
+    );
+    let (output, _) = redact_with_report(&source, Format::Xlsx).unwrap();
+    let parts = ooxml_opc::unzip_parts(&output).unwrap();
+    let rels = String::from_utf8_lossy(part(&parts, "xl/_rels/workbook.xml.rels")).into_owned();
+    assert!(rels.contains(&format!(r#"Target="{target}""#)));
+    assert!(!rels.contains("TargetMode"));
+    xlsx_parse::parse_workbook(&parts).unwrap();
+}
+
+#[test]
+fn foreign_attributes_do_not_drive_relationship_mode() {
+    let rels = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships" xmlns:q="urn:qa">"#,
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml" q:Target="https://foreign.example/x"/>"#,
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes" Target="endnotes.xml" q:TargetMode="External"/>"#,
+        r#"</Relationships>"#,
+    );
+    let mut report = RedactionReport::default();
+    let output = xml::redact_xml(
+        Format::Docx,
+        "word/_rels/document.xml.rels",
+        rels.as_bytes(),
+        &mut report,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains(r#"Target="footnotes.xml""#));
+    assert!(text.contains(r#"Target="endnotes.xml""#));
+    assert!(text.contains(r#"q:TargetMode="External""#));
+    assert!(!text.contains(r#" TargetMode="External""#));
+    assert_eq!(report.attributes, 0);
+}
+
+#[test]
+fn target_inspection_is_limited_to_rels_parts() {
+    let body = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:q="urn:qa">"#,
+        r#"<q:Relationship Target="tel:+49123456789"/>"#,
+        r#"<q:Relationship Target="https://secret.example/x" TargetMode="External"/>"#,
+        r#"</w:document>"#,
+    );
+    let mut report = RedactionReport::default();
+    let output = xml::redact_xml(
+        Format::Docx,
+        "word/document.xml",
+        body.as_bytes(),
+        &mut report,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains(r#"Target="tel:+49123456789""#));
+    assert!(!text.contains("secret.example"));
+    assert_eq!(text.matches("TargetMode").count(), 1);
+    assert_eq!(report.attributes, 1);
+}
+
+fn pptx_fixture_with_slide_relationship(relationship: &str) -> Vec<u8> {
+    fixture_with_part(
+        pptx_fixture(),
+        "ppt/slides/_rels/slide1.xml.rels",
+        xml(&format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{relationship}</Relationships>"#
+        )),
+    )
+}
+
+fn fixture_with_part(source: Vec<u8>, path: &str, data: Vec<u8>) -> Vec<u8> {
+    let mut parts = ooxml_opc::unzip_parts(&source).unwrap();
+    for (candidate, bytes) in &mut parts {
+        if candidate == path {
+            *bytes = data.clone();
+        }
+    }
+    ooxml_opc::rezip_parts(&parts).unwrap()
+}
+
+#[test]
 fn media_placeholder_keeps_each_format() {
     for (format, ext) in [
         (ImageFormat::Gif, "gif"),
