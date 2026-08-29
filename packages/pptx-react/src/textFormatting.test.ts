@@ -66,6 +66,12 @@ describe('pptx text formatting', () => {
     expect(paragraphAlignmentFromSelection(inherited, textBox('center', 'left'), 3, 3)).toBe('ctr');
   });
 
+  it('marks the last paragraph when the caret sits at the story end', () => {
+    const aligned = alignedStory('ctr', 'r');
+    expect(paragraphAlignmentFromSelection(aligned, undefined, 15, 15)).toBe('r');
+    expect(paragraphAlignmentFromSelection(aligned, undefined, 16, 16)).toBe('r');
+  });
+
   it('normalizes the justified variants', () => {
     expect(paragraphAlignmentFromSelection(alignedStory('dist', null), undefined, 3, 3)).toBe('just');
   });

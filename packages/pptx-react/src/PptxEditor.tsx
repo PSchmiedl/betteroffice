@@ -1176,7 +1176,7 @@ function PptxEditorContent({
         event.preventDefault();
         const story = handle.story(selection.storyId);
         const delta = event.key === 'ArrowLeft' ? -1 : 1;
-        const focus = Math.max(0, Math.min(story.length, selection.focus + delta));
+        const focus = Math.max(0, Math.min(story.length - 1, selection.focus + delta));
         setSelection({
           ...selection,
           anchor: event.shiftKey ? selection.anchor : focus,

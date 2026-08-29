@@ -72,9 +72,11 @@ export function paragraphAlignmentFromSelection(
   anchor: number,
   focus: number
 ): ParagraphAlignment | undefined {
-  const start = Math.min(anchor, focus);
+  const ranges = storyTextRanges(story);
+  const limit = ranges[ranges.length - 1]?.end ?? 0;
+  const start = Math.min(Math.min(anchor, focus), limit);
   const end = Math.max(anchor, focus);
-  const alignments = storyTextRanges(story)
+  const alignments = ranges
     .map((range, index) => ({ range, index }))
     .filter(({ range }) =>
       start === end

@@ -504,6 +504,7 @@ fn check_text_bounds<T: ReadTxn>(story: &TextRef, txn: &T, start: u32, end: u32)
 /// The pilcrow of every paragraph the range touches. A collapsed caret picks
 /// the paragraph it sits in; a range stopping at a paragraph start does not.
 fn selected_pilcrows<T: ReadTxn>(story: &TextRef, txn: &T, start: u32, end: u32) -> Vec<MapRef> {
+    let start = start.min(story.len(txn).saturating_sub(1));
     let mut pilcrows = Vec::new();
     let mut paragraph_start = 0;
     let mut offset = 0;
