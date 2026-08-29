@@ -13,6 +13,7 @@ import type {
   DeckSnapshot,
   HistoryResult,
   HitTestResult,
+  ParagraphAlignment,
   PresetShapeDraft,
   PptxFontFace,
   ShapeAdjustReceipt,
@@ -58,6 +59,14 @@ export interface PresentationHandle extends CollaborationReplica {
   deleteText(storyId: string, start: number, end: number): TextReceipt;
   formatText(storyId: string, start: number, end: number, patch: TextStylePatch): TextReceipt;
   insertParagraphBreak(storyId: string, index: number): TextReceipt;
+  /** Sets the alignment of every paragraph the range touches; `null` restores
+   *  the inherited value. */
+  setParagraphAlignment(
+    storyId: string,
+    start: number,
+    end: number,
+    alignment: ParagraphAlignment | null
+  ): TextReceipt;
   insertSlide(index: number, layoutPartPath?: string): SlideReceipt;
   deleteSlide(slideId: string): SlideReceipt;
   moveSlide(slideId: string, toIndex: number): SlideReceipt;
@@ -290,6 +299,13 @@ export function openPresentation(
     insertParagraphBreak(storyId, index): TextReceipt {
       return jsonWasmCall(
         () => doc.insertParagraphBreakJson(JSON.stringify({ storyId, index })),
+        true
+      );
+    },
+    setParagraphAlignment(storyId, start, end, alignment): TextReceipt {
+      return jsonWasmCall(
+        () =>
+          doc.setParagraphAlignmentJson(JSON.stringify({ storyId, start, end, alignment })),
         true
       );
     },

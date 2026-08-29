@@ -15,6 +15,10 @@ export type ToolbarIconName =
   | 'italic'
   | 'underline'
   | 'textColor'
+  | 'alignLeft'
+  | 'alignCenter'
+  | 'alignRight'
+  | 'alignJustify'
   | 'more'
   | 'chevronDown'
   | 'remove'
@@ -90,6 +94,10 @@ export function ToolbarIcon({ name, size = 20, style }: ToolbarIconProps) {
           <path d="M5 20h14" strokeWidth="3" />
         </>
       )}
+      {name === 'alignLeft' && <path d="M4 6h16M4 10h10M4 14h16M4 18h10" />}
+      {name === 'alignCenter' && <path d="M4 6h16M7 10h10M4 14h16M7 18h10" />}
+      {name === 'alignRight' && <path d="M4 6h16M10 10h10M4 14h16M10 18h10" />}
+      {name === 'alignJustify' && <path d="M4 6h16M4 10h16M4 14h16M4 18h16" />}
       {name === 'more' && (
         <>
           <circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" />

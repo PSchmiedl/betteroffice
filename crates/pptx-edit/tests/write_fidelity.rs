@@ -544,6 +544,28 @@ fn a_colour_write_replaces_an_existing_no_fill() {
 }
 
 #[test]
+fn an_alignment_write_reaches_the_paragraph_properties() {
+    let session = open();
+    let snapshot = session.snapshot().unwrap();
+    let story_id = snapshot.slides[0]
+        .shapes
+        .iter()
+        .find(|shape| shape.name == "Title")
+        .unwrap()
+        .text_stories[0]
+        .id
+        .clone();
+    session
+        .set_paragraph_alignment(&context(), &story_id, 0, 0, Some("ctr"))
+        .unwrap();
+
+    let saved = parts(&session.save().unwrap());
+    let slide = part_text(&saved, "ppt/slides/slide1.xml");
+    assert_eq!(slide.matches(r#"algn="ctr""#).count(), 1);
+    assert!(slide.contains("Accent"));
+}
+
+#[test]
 fn a_resize_keeps_a_partial_transforms_own_offset_and_rotation() {
     let session = open();
     let snapshot = session.snapshot().unwrap();

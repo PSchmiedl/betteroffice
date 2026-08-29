@@ -250,6 +250,19 @@ impl Presentation {
             .format_text(context, story_id, start, end, patch)?)
     }
 
+    pub fn set_paragraph_alignment(
+        &self,
+        context: &EditCtx,
+        story_id: &str,
+        start: u32,
+        end: u32,
+        alignment: Option<&str>,
+    ) -> Result<TextReceipt> {
+        Ok(self
+            .session
+            .set_paragraph_alignment(context, story_id, start, end, alignment)?)
+    }
+
     pub fn insert_paragraph_break(
         &self,
         context: &EditCtx,

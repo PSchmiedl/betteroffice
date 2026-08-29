@@ -9,6 +9,7 @@ import type {
   CanvasImageResolver,
   CollaborationReplica,
   DeckSnapshot,
+  ParagraphAlignment,
   PptxPresence,
   PptxPresencePeer,
   PptxFontFace,
@@ -64,6 +65,7 @@ import {
 } from './presence-rendering';
 import {
   effectiveStyleFromSelection,
+  paragraphAlignmentFromSelection,
   selectionFormattingFromStory,
   storyFormattingFromStory,
 } from './textFormatting';
@@ -613,6 +615,24 @@ function PptxEditorContent({
     }
   }, [model, selectedShapeStoryId, selection, textStyle]);
 
+  const selectionAlignment = useMemo<ParagraphAlignment | undefined>(() => {
+    const handle = handleRef.current;
+    const storyId = selection?.storyId ?? selectedShapeStoryId;
+    if (!handle || !storyId) return undefined;
+    try {
+      const story = handle.story(storyId);
+      const textBox = model?.frame?.primitives.find(
+        (primitive): primitive is TextBoxPrimitive =>
+          primitive.kind === 'textBox' && primitive.storyId === storyId
+      );
+      return selection
+        ? paragraphAlignmentFromSelection(story, textBox, selection.anchor, selection.focus)
+        : paragraphAlignmentFromSelection(story, textBox, 0, story.length);
+    } catch {
+      return undefined;
+    }
+  }, [model, selectedShapeStoryId, selection]);
+
   const slideLayouts = useMemo<SlideLayoutOption[]>(() => {
     const unique = new Set<string | null>();
     for (const slide of model?.snapshot.slides ?? []) unique.add(slide.layoutPartPath);
@@ -1156,7 +1176,7 @@ function PptxEditorContent({
         event.preventDefault();
         const story = handle.story(selection.storyId);
         const delta = event.key === 'ArrowLeft' ? -1 : 1;
-        const focus = Math.max(0, Math.min(story.length, selection.focus + delta));
+        const focus = Math.max(0, Math.min(story.length - 1, selection.focus + delta));
         setSelection({
           ...selection,
           anchor: event.shiftKey ? selection.anchor : focus,
@@ -1242,6 +1262,27 @@ function PptxEditorContent({
     }
   };
 
+  const applyAlignment = (alignment: ParagraphAlignment) => {
+    const handle = handleRef.current;
+    const storyId = selection?.storyId ?? selectedShapeStoryId;
+    if (!handle || !storyId) return;
+    try {
+      if (selection) {
+        handle.setParagraphAlignment(
+          storyId,
+          Math.min(selection.anchor, selection.focus),
+          Math.max(selection.anchor, selection.focus),
+          alignment
+        );
+      } else {
+        handle.setParagraphAlignment(storyId, 0, handle.story(storyId).length, alignment);
+      }
+      refreshAt(undefined, true);
+    } catch (value) {
+      reportError(value);
+    }
+  };
+
   const formatSelection = (action: FormattingAction) => {
     if (action === 'bold') {
       applyFormatting({ bold: !selectionFormatting.bold });
@@ -1255,6 +1296,8 @@ function PptxEditorContent({
       applyFormatting({ fontSizePt: action.value });
     } else if (action.type === 'textColor') {
       applyFormatting({ color: action.value });
+    } else if (action.type === 'align') {
+      applyAlignment(action.value);
     }
   };
 
@@ -1351,7 +1394,7 @@ function PptxEditorContent({
     <div className={className} style={styles.root}>
       <div style={styles.toolbarShell}>
         <EditorToolbar
-          currentFormatting={selectionFormatting}
+          currentFormatting={{ ...selectionFormatting, align: selectionAlignment }}
           textSelectionActive={selection !== null || selectedShapeStoryId !== null}
           onFormat={formatSelection}
           currentShapeFormatting={selectedShapeFormatting}

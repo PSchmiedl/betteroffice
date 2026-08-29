@@ -23,6 +23,9 @@ export interface TextRunSnapshot {
   style: TextStyleSnapshot;
 }
 
+/** OOXML `a:pPr@algn` token. */
+export type ParagraphAlignment = 'l' | 'ctr' | 'r' | 'just';
+
 export interface ParagraphSnapshot {
   id: string;
   alignment: string | null;

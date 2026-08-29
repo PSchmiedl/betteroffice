@@ -131,6 +131,30 @@ describe('PPTX wasm boundary', () => {
     unsubscribe();
   });
 
+  test('aligns paragraphs, reflows the text box, and undoes in one step', () => {
+    const snapshot = handle.snapshot();
+    const story = firstStory(snapshot.slides.flatMap((slide) => slide.shapes));
+    const laidOut = () =>
+      handle.layoutSlide(0).primitives.find(
+        (primitive): primitive is TextBoxPrimitive =>
+          primitive.kind === 'textBox' && primitive.storyId === story.id
+      );
+    const storedBefore = handle.story(story.id).paragraphs[0].alignment;
+    const renderedBefore = laidOut()?.paragraphs[0]?.align;
+
+    handle.setParagraphAlignment(story.id, 0, 0, 'ctr');
+    expect(handle.story(story.id).paragraphs[0].alignment).toBe('ctr');
+    expect(laidOut()?.paragraphs[0]?.align).toBe('center');
+
+    expect(handle.undo().applied).toBe(true);
+    expect(handle.story(story.id).paragraphs[0].alignment).toBe(storedBefore);
+    expect(laidOut()?.paragraphs[0]?.align).toBe(renderedBefore);
+
+    expect(() =>
+      handle.setParagraphAlignment(story.id, 0, 0, 'middle' as never)
+    ).toThrow();
+  });
+
   test('inserts and styles preset shapes with undo and redo', () => {
     const slide = handle.snapshot().slides[0];
     const receipt = handle.addShape(slide.id, {

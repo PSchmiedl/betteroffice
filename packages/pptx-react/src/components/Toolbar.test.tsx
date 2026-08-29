@@ -1,6 +1,6 @@
 import { GlobalRegistrator } from '@happy-dom/global-registrator';
 import { afterAll, afterEach, describe, expect, it } from 'bun:test';
-import type { ShapeFormattingAction } from './Toolbar';
+import type { FormattingAction, ShapeFormattingAction } from './Toolbar';
 import { LocaleProvider } from '../i18n';
 import { Toolbar } from './Toolbar';
 
@@ -19,6 +19,53 @@ afterAll(async () => {
   if (clientWidth) Object.defineProperty(elementPrototype, 'clientWidth', clientWidth);
   else Reflect.deleteProperty(elementPrototype, 'clientWidth');
   if (GlobalRegistrator.isRegistered) await GlobalRegistrator.unregister();
+});
+
+describe('Toolbar alignment controls', () => {
+  it('emits the alignment the button stands for', () => {
+    const actions: FormattingAction[] = [];
+    const { getByTestId } = render(
+      <LocaleProvider>
+        <Toolbar
+          textSelectionActive
+          currentFormatting={{ align: 'ctr' }}
+          onFormat={(action) => actions.push(action)}
+        />
+      </LocaleProvider>
+    );
+
+    fireEvent.click(getByTestId('pptx-align-right'));
+    fireEvent.click(getByTestId('pptx-align-justify'));
+
+    expect(actions).toEqual([
+      { type: 'align', value: 'r' },
+      { type: 'align', value: 'just' },
+    ]);
+  });
+
+  it('marks the alignment of the current selection', () => {
+    const { getByTestId } = render(
+      <LocaleProvider>
+        <Toolbar textSelectionActive currentFormatting={{ align: 'ctr' }} onFormat={() => {}} />
+      </LocaleProvider>
+    );
+
+    expect(getByTestId('pptx-align-center').getAttribute('aria-pressed')).toBe('true');
+    expect(getByTestId('pptx-align-left').getAttribute('aria-pressed')).toBeNull();
+  });
+
+  it('disables the buttons without a text selection', () => {
+    const actions: FormattingAction[] = [];
+    const { getByTestId } = render(
+      <LocaleProvider>
+        <Toolbar onFormat={(action) => actions.push(action)} />
+      </LocaleProvider>
+    );
+
+    fireEvent.click(getByTestId('pptx-align-center'));
+
+    expect(actions).toEqual([]);
+  });
 });
 
 describe('Toolbar shape controls', () => {

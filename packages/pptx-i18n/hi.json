@@ -24,7 +24,14 @@
       "tools": null,
       "font": null,
       "text": null,
-      "shape": null
+      "shape": null,
+      "alignment": "संरेखण"
+    },
+    "align": {
+      "left": "बाएं संरेखित करें",
+      "center": "केंद्रित करें",
+      "right": "दाएं संरेखित करें",
+      "justify": "दोनों ओर संरेखित करें"
     },
     "newSlide": null,
     "newSlideWithLayout": null,

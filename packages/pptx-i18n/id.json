@@ -24,7 +24,14 @@
       "tools": null,
       "font": null,
       "text": null,
-      "shape": null
+      "shape": null,
+      "alignment": "Perataan"
+    },
+    "align": {
+      "left": "Rata Kiri",
+      "center": "Tengah",
+      "right": "Rata Kanan",
+      "justify": "Rata Kiri-Kanan"
     },
     "newSlide": null,
     "newSlideWithLayout": null,

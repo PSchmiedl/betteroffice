@@ -24,7 +24,14 @@
       "tools": null,
       "font": null,
       "text": null,
-      "shape": null
+      "shape": null,
+      "alignment": "对齐"
+    },
+    "align": {
+      "left": "左对齐",
+      "center": "居中",
+      "right": "右对齐",
+      "justify": "两端对齐"
     },
     "newSlide": null,
     "newSlideWithLayout": null,

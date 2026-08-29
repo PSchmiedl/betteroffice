@@ -36,6 +36,7 @@ export const pptxdocument_redoJson: (a: number) => [number, number, number, numb
 export const pptxdocument_removeShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_resizeShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_saveBytes: (a: number) => [number, number, number, number];
+export const pptxdocument_setParagraphAlignmentJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_setShapeAdjustJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_setShapeFillJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_setShapeStrokeJson: (a: number, b: number, c: number) => [number, number, number, number];
