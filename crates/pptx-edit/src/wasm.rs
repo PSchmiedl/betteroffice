@@ -57,6 +57,16 @@ struct FormatTextArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetParagraphAlignmentArgs {
+    story_id: String,
+    start: u32,
+    end: u32,
+    #[serde(default)]
+    alignment: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ParagraphBreakArgs {
     story_id: String,
     index: u32,
@@ -331,6 +341,22 @@ impl PptxDocument {
                     args.start,
                     args.end,
                     &args.patch,
+                )
+                .map_err(js_error)?,
+        )
+    }
+
+    #[wasm_bindgen(js_name = setParagraphAlignmentJson)]
+    pub fn set_paragraph_alignment_json(&self, args: &str) -> Result<String, JsValue> {
+        let args: SetParagraphAlignmentArgs = parse_args(args)?;
+        json(
+            self.session
+                .set_paragraph_alignment(
+                    &local_context(),
+                    &args.story_id,
+                    args.start,
+                    args.end,
+                    args.alignment.as_deref(),
                 )
                 .map_err(js_error)?,
         )

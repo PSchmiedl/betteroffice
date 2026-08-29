@@ -24,7 +24,14 @@
       "tools": null,
       "font": null,
       "text": null,
-      "shape": null
+      "shape": null,
+      "alignment": "Alignement"
+    },
+    "align": {
+      "left": "Aligner à gauche",
+      "center": "Centrer",
+      "right": "Aligner à droite",
+      "justify": "Justifier"
     },
     "newSlide": null,
     "newSlideWithLayout": null,

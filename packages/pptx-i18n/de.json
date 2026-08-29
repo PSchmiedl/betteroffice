@@ -24,7 +24,14 @@
       "tools": null,
       "font": null,
       "text": null,
-      "shape": null
+      "shape": null,
+      "alignment": "Ausrichtung"
+    },
+    "align": {
+      "left": "Linksbündig",
+      "center": "Zentriert",
+      "right": "Rechtsbündig",
+      "justify": "Blocksatz"
     },
     "newSlide": null,
     "newSlideWithLayout": null,

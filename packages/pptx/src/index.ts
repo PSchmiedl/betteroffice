@@ -42,6 +42,7 @@ export type {
   HitTestResult,
   ImagePrimitive,
   Paint,
+  ParagraphAlignment,
   ParagraphSnapshot,
   PlaceholderPrimitive,
   PositionedGlyph,

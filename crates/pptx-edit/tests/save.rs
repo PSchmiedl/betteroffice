@@ -165,6 +165,36 @@ fn a_formatted_range_survives_reopen() {
 }
 
 #[test]
+fn a_paragraph_alignment_survives_reopen() {
+    let session = open_fixture();
+    let (_, _, story_id) = first_story(&session.snapshot().unwrap());
+    session
+        .set_paragraph_alignment(&context(), &story_id, 0, 0, Some("ctr"))
+        .unwrap();
+
+    let reopened = reopen(&session);
+    let snapshot = reopened.snapshot().unwrap();
+    let story = snapshot
+        .slides
+        .iter()
+        .flat_map(|slide| &slide.shapes)
+        .flat_map(shape_stories)
+        .find(|story| story.id == story_id)
+        .unwrap();
+    assert_eq!(story.paragraphs[0].alignment.as_deref(), Some("ctr"));
+}
+
+#[test]
+fn an_unknown_paragraph_alignment_is_rejected() {
+    let session = open_fixture();
+    let (_, _, story_id) = first_story(&session.snapshot().unwrap());
+    let error = session
+        .set_paragraph_alignment(&context(), &story_id, 0, 0, Some("middle"))
+        .unwrap_err();
+    assert!(matches!(error, EditError::InvalidText(message) if message.contains("middle")));
+}
+
+#[test]
 fn fill_and_stroke_survive_reopen() {
     let session = open_fixture();
     let snapshot = session.snapshot().unwrap();
