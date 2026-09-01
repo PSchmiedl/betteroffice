@@ -65,3 +65,72 @@ function clampedIndex(text: string, index: number): number {
   if (!Number.isFinite(index)) return 0;
   return Math.max(0, Math.min(text.length, Math.trunc(index)));
 }
+
+/** The laid-out lines a caret can move through, as the display list reports
+ *  them. Only the fields caret movement reads are required. */
+export interface CaretLine {
+  start: number;
+  end: number;
+  caretStops: ReadonlyArray<{ position: number; x: number }>;
+}
+
+/** Vertical movement keeps the column the caret started from, so a run through
+ *  short lines and back does not drift left. `undefined` when the position has
+ *  no caret stop to measure. */
+export function caretGoalX(
+  lines: readonly CaretLine[],
+  position: number
+): number | undefined {
+  const line = lines[lineIndexAt(lines, position)];
+  return line?.caretStops.find((stop) => stop.position === position)?.x;
+}
+
+/** The position one line up or down, holding `goalX`. Stays put at the first
+ *  and last line, matching PowerPoint. */
+export function verticalCaretMove(
+  lines: readonly CaretLine[],
+  position: number,
+  direction: 'up' | 'down',
+  goalX?: number
+): number {
+  if (lines.length === 0) return position;
+  const index = lineIndexAt(lines, position);
+  const target = lines[index + (direction === 'up' ? -1 : 1)];
+  if (!target) return position;
+  const x = goalX ?? caretGoalX(lines, position);
+  if (x === undefined) return target.start;
+  const nearest = target.caretStops.reduce<{ position: number; x: number } | null>(
+    (best, stop) => (best === null || Math.abs(stop.x - x) < Math.abs(best.x - x) ? stop : best),
+    null
+  );
+  return nearest?.position ?? target.start;
+}
+
+/** The first or last position of the line the caret sits in. */
+export function lineEdge(
+  lines: readonly CaretLine[],
+  position: number,
+  edge: 'start' | 'end'
+): number {
+  const line = lines[lineIndexAt(lines, position)];
+  if (!line) return position;
+  return edge === 'start' ? line.start : line.end;
+}
+
+/** The next word boundary in `direction`, for a word-wise caret jump. */
+export function wordBoundary(text: string, index: number, direction: -1 | 1): number {
+  const position = clampedIndex(text, index);
+  const starts = [...wordSegmenter.segment(text)]
+    .filter((segment) => segment.isWordLike)
+    .flatMap((segment) => [segment.index, segment.index + segment.segment.length]);
+  const candidates = direction < 0 ? starts.filter((s) => s < position) : starts.filter((s) => s > position);
+  if (candidates.length === 0) return direction < 0 ? 0 : text.length;
+  return direction < 0 ? Math.max(...candidates) : Math.min(...candidates);
+}
+
+function lineIndexAt(lines: readonly CaretLine[], position: number): number {
+  const index = lines.findIndex(
+    (line) => position >= line.start && position <= line.end
+  );
+  return index === -1 ? Math.max(0, lines.length - 1) : index;
+}
