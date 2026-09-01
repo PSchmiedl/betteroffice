@@ -10,10 +10,15 @@ import {
   findShape,
   findTopLevelShape,
   frameBoundsForShape,
+  handleAnchor,
   hoverTargetAtPoint,
   indexShapes,
+  pointerTargetAtPoint,
   movedShapePosition,
   passedDragThreshold,
+  resizeCursor,
+  resizedBounds,
+  resizedShapeBox,
   slidePoint,
   textPositionAtPoint,
 } from './interactions';
@@ -144,6 +149,21 @@ describe('pptx interactions', () => {
     expect(hoverTargetAtPoint(frame, { x: 600, y: 600 })).toBeNull();
   });
 
+  it('reads a text box edge as the shape, so the border moves it', () => {
+    // the box spans x 100-400, y 100-200; a few px inside any edge grabs it
+    expect(pointerTargetAtPoint(frame, { x: 102, y: 150 })).toBe('shape');
+    expect(pointerTargetAtPoint(frame, { x: 398, y: 150 })).toBe('shape');
+    expect(pointerTargetAtPoint(frame, { x: 300, y: 102 })).toBe('shape');
+    expect(pointerTargetAtPoint(frame, { x: 300, y: 198 })).toBe('shape');
+    expect(pointerTargetAtPoint(frame, { x: 300, y: 150 })).toBe('text');
+  });
+
+  it('leaves the engine mirror without a border band', () => {
+    expect(hoverTargetAtPoint(frame, { x: 102, y: 150 })).toBe('text');
+    expect(pointerTargetAtPoint(frame, { x: 50, y: 60 })).toBe('shape');
+    expect(pointerTargetAtPoint(frame, { x: 600, y: 600 })).toBeNull();
+  });
+
   it('prefers the topmost primitive where they overlap', () => {
     expect(hoverTargetAtPoint(frame, { x: 110, y: 120 })).toBe('text');
   });
@@ -214,3 +234,57 @@ function shape(id: string, x: number, y: number, width: number, height: number):
     children: [],
   };
 }
+
+describe('pptx resize handles', () => {
+  const bounds = { x: 100, y: 200, width: 300, height: 100 };
+
+  it('anchors each grip on the selection box', () => {
+    expect(handleAnchor(bounds, 'nw')).toEqual({ x: 100, y: 200 });
+    expect(handleAnchor(bounds, 'se')).toEqual({ x: 400, y: 300 });
+    expect(handleAnchor(bounds, 'n')).toEqual({ x: 250, y: 200 });
+    expect(handleAnchor(bounds, 'w')).toEqual({ x: 100, y: 250 });
+  });
+
+  it('holds the edge opposite the dragged handle', () => {
+    expect(resizedBounds(bounds, 'se', { x: 50, y: 20 })).toEqual({
+      x: 100,
+      y: 200,
+      width: 350,
+      height: 120,
+    });
+    expect(resizedBounds(bounds, 'nw', { x: 50, y: 20 })).toEqual({
+      x: 150,
+      y: 220,
+      width: 250,
+      height: 80,
+    });
+    expect(resizedBounds(bounds, 'n', { x: 999, y: 20 })).toEqual({
+      x: 100,
+      y: 220,
+      width: 300,
+      height: 80,
+    });
+  });
+
+  it('never collapses the box past the minimum', () => {
+    const collapsed = resizedBounds(bounds, 'e', { x: -1000, y: 0 }, 8);
+    expect(collapsed.width).toBe(8);
+    const fromWest = resizedBounds(bounds, 'w', { x: 1000, y: 0 }, 8);
+    expect(fromWest.width).toBe(8);
+    expect(fromWest.x).toBe(392);
+  });
+
+  it('converts a drag into the shape box, in EMU', () => {
+    const box = resizedShapeBox(deck, frame, picture, 'se', { x: 128, y: 72 });
+    expect(box.width).toBe(picture.width + 1_219_200);
+    expect(box.height).toBe(picture.height + 685_800);
+    expect(box.x).toBe(picture.x);
+  });
+
+  it('names the cursor each grip carries', () => {
+    expect(resizeCursor('nw')).toBe('nwse-resize');
+    expect(resizeCursor('ne')).toBe('nesw-resize');
+    expect(resizeCursor('n')).toBe('ns-resize');
+    expect(resizeCursor('w')).toBe('ew-resize');
+  });
+});

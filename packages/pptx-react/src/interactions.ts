@@ -14,6 +14,24 @@ export interface SlidePoint {
 
 export type HoverTarget = 'text' | 'shape';
 
+export type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+
+export const RESIZE_HANDLES: readonly ResizeHandle[] = [
+  'nw',
+  'n',
+  'ne',
+  'e',
+  'se',
+  's',
+  'sw',
+  'w',
+];
+
+/** Slide-space band along a text box's edge that grabs the box itself. Inside
+ *  it the pointer moves the shape; further in it edits text, as PowerPoint
+ *  splits the two. */
+const BORDER_BAND = 6;
+
 type PrimitiveGeometry = Pick<SlidePrimitive, 'x' | 'y' | 'w' | 'h' | 'transform'>;
 
 /** `f32::to_radians` folds PI/180 to one f32 constant before multiplying. */
@@ -259,4 +277,104 @@ function lineDistance(y: number, height: number, pointY: number): number {
   if (pointY < y) return y - pointY;
   if (pointY > y + height) return pointY - y - height;
   return 0;
+}
+
+/** Where a handle's grip sits on the selection box. */
+export function handleAnchor(bounds: FrameBounds, handle: ResizeHandle): SlidePoint {
+  const x = handle.includes('w')
+    ? bounds.x
+    : handle.includes('e')
+      ? bounds.x + bounds.width
+      : bounds.x + bounds.width / 2;
+  const y = handle.startsWith('n')
+    ? bounds.y
+    : handle.startsWith('s')
+      ? bounds.y + bounds.height
+      : bounds.y + bounds.height / 2;
+  return { x, y };
+}
+
+export function resizeCursor(handle: ResizeHandle): string {
+  if (handle === 'nw' || handle === 'se') return 'nwse-resize';
+  if (handle === 'ne' || handle === 'sw') return 'nesw-resize';
+  return handle === 'n' || handle === 's' ? 'ns-resize' : 'ew-resize';
+}
+
+/** The selection box a drag of `delta` on `handle` produces. Edges opposite
+ *  the handle stay put, and the box never collapses past `minimum`. */
+export function resizedBounds(
+  bounds: FrameBounds,
+  handle: ResizeHandle,
+  delta: SlidePoint,
+  minimum = 8
+): FrameBounds {
+  let { x, y, width, height } = bounds;
+  if (handle.includes('w')) {
+    const dx = Math.min(delta.x, width - minimum);
+    x += dx;
+    width -= dx;
+  } else if (handle.includes('e')) {
+    width = Math.max(minimum, width + delta.x);
+  }
+  if (handle.startsWith('n')) {
+    const dy = Math.min(delta.y, height - minimum);
+    y += dy;
+    height -= dy;
+  } else if (handle.startsWith('s')) {
+    height = Math.max(minimum, height + delta.y);
+  }
+  return { x, y, width, height };
+}
+
+/** The same resize in EMU, ready for `moveShape` and `resizeShape`. */
+export function resizedShapeBox(
+  deck: DeckSnapshot,
+  frame: SlideDisplayList,
+  shape: ShapeSnapshot,
+  handle: ResizeHandle,
+  delta: SlidePoint,
+  minimum = 1_000
+): { x: number; y: number; width: number; height: number } {
+  const emu = {
+    x: Math.round((delta.x * deck.widthEmu) / frame.width),
+    y: Math.round((delta.y * deck.heightEmu) / frame.height),
+  };
+  const box = resizedBounds(
+    { x: shape.x, y: shape.y, width: shape.width, height: shape.height },
+    handle,
+    emu,
+    minimum
+  );
+  return { x: box.x, y: box.y, width: box.width, height: box.height };
+}
+
+/** What a pointer gesture acts on. This is the engine's hit with one addition:
+ *  the band along a text box's edge reads as the shape, so the border grabs the
+ *  box while its middle types — the split PowerPoint draws. `hitTest` has no
+ *  such band, and `hoverTargetAtPoint` stays an exact mirror of it. */
+export function pointerTargetAtPoint(
+  frame: SlideDisplayList,
+  point: SlidePoint
+): HoverTarget | null {
+  const target = hoverTargetAtPoint(frame, point);
+  if (target !== 'text') return target;
+  const at = { x: Math.fround(point.x), y: Math.fround(point.y) };
+  for (let index = frame.primitives.length - 1; index >= 0; index -= 1) {
+    const primitive = frame.primitives[index];
+    if (!primitive.shapeId) continue;
+    const local = containedPoint(primitive, at);
+    if (!local) continue;
+    return withinBorderBand(primitive, local) ? 'shape' : 'text';
+  }
+  return target;
+}
+
+function withinBorderBand(primitive: PrimitiveGeometry, point: SlidePoint): boolean {
+  const band = Math.min(BORDER_BAND, primitive.w / 3, primitive.h / 3);
+  return (
+    point.x - primitive.x <= band ||
+    primitive.x + primitive.w - point.x <= band ||
+    point.y - primitive.y <= band ||
+    primitive.y + primitive.h - point.y <= band
+  );
 }
