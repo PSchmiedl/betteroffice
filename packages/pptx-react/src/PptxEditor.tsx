@@ -55,6 +55,7 @@ import {
   movedShapePosition,
   passedDragThreshold,
   handleAnchor,
+  resizeCommitDelta,
   resizeCursor,
   resizedBounds,
   resizedShapeBox,
@@ -283,6 +284,7 @@ function PptxEditorContent({
     start: SlidePoint;
     slideId: string;
     shapeId: string;
+    delta: SlidePoint;
   } | null>(null);
   const [resizeDelta, setResizeDelta] = useState<SlidePoint | null>(null);
   const pointerGestureRef = useRef<PointerGesture | null>(null);
@@ -1501,27 +1503,51 @@ function PptxEditorContent({
         start: point,
         slideId: shapeSelection.slideId,
         shapeId: shapeSelection.shapeId,
+        delta: { x: 0, y: 0 },
       };
       setResizeDelta({ x: 0, y: 0 });
       event.currentTarget.setPointerCapture(event.pointerId);
     };
 
-  const resizePointerMove = (event: PointerEvent<HTMLSpanElement>) => {
+  /** The gesture's geometry lives on the ref, and the state only mirrors it for
+   *  the preview: the release commits the pointer's own position, so a move
+   *  whose render has not landed yet cannot resize the shape to a stale size. */
+  const resizeDeltaFrom = (event: PointerEvent<HTMLSpanElement>): SlidePoint | null => {
     const gesture = resizeRef.current;
-    if (!gesture) return;
-    const point = slidePointFromClient(event.clientX, event.clientY);
-    if (!point) return;
-    setResizeDelta({ x: point.x - gesture.start.x, y: point.y - gesture.start.y });
+    if (!gesture) return null;
+    return resizeCommitDelta(
+      gesture.start,
+      gesture.delta,
+      slidePointFromClient(event.clientX, event.clientY)
+    );
   };
 
-  const resizePointerUp = (event: PointerEvent<HTMLSpanElement>) => {
+  const resizePointerMove = (event: PointerEvent<HTMLSpanElement>) => {
     const gesture = resizeRef.current;
-    const delta = resizeDelta;
+    const delta = resizeDeltaFrom(event);
+    if (!gesture || !delta) return;
+    gesture.delta = delta;
+    setResizeDelta(delta);
+  };
+
+  const endResizeGesture = (event: PointerEvent<HTMLSpanElement>) => {
+    const gesture = resizeRef.current;
     resizeRef.current = null;
     setResizeDelta(null);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+    return gesture;
+  };
+
+  /** A cancelled pointer abandons the drag; the shape keeps the size it had. */
+  const resizePointerCancel = (event: PointerEvent<HTMLSpanElement>) => {
+    endResizeGesture(event);
+  };
+
+  const resizePointerUp = (event: PointerEvent<HTMLSpanElement>) => {
+    const delta = resizeDeltaFrom(event);
+    const gesture = endResizeGesture(event);
     const api = handleRef.current;
     if (!gesture || !delta || !api || !model?.frame || !selectedShape) return;
     if (delta.x === 0 && delta.y === 0) return;
@@ -1766,7 +1792,7 @@ function PptxEditorContent({
                           onPointerDown={resizePointerDown(handle)}
                           onPointerMove={resizePointerMove}
                           onPointerUp={resizePointerUp}
-                          onPointerCancel={resizePointerUp}
+                          onPointerCancel={resizePointerCancel}
                           style={{
                             ...styles.resizeHandle,
                             left: anchor.x * scale - HANDLE_SIZE / 2,

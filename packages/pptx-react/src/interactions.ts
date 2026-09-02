@@ -326,6 +326,17 @@ export function resizedBounds(
   return { x, y, width, height };
 }
 
+/** The delta a resize commits. The release event's own position wins, so a
+ *  move whose render has not landed cannot commit a stale size; `tracked` is
+ *  the fallback for a release the canvas cannot resolve to a slide point. */
+export function resizeCommitDelta(
+  start: SlidePoint,
+  tracked: SlidePoint,
+  release: SlidePoint | null
+): SlidePoint {
+  return release ? { x: release.x - start.x, y: release.y - start.y } : tracked;
+}
+
 /** The same resize in EMU, ready for `moveShape` and `resizeShape`. */
 export function resizedShapeBox(
   deck: DeckSnapshot,

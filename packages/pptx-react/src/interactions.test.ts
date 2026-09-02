@@ -16,6 +16,7 @@ import {
   pointerTargetAtPoint,
   movedShapePosition,
   passedDragThreshold,
+  resizeCommitDelta,
   resizeCursor,
   resizedBounds,
   resizedShapeBox,
@@ -286,5 +287,19 @@ describe('pptx resize handles', () => {
     expect(resizeCursor('ne')).toBe('nesw-resize');
     expect(resizeCursor('n')).toBe('ns-resize');
     expect(resizeCursor('w')).toBe('ew-resize');
+  });
+});
+
+describe('pptx resize commit', () => {
+  const start = { x: 100, y: 100 };
+  const tracked = { x: 5, y: 5 };
+
+  it('commits the release position, not the last rendered delta', () => {
+    // the pointer travelled to 180,140 after the move React last rendered
+    expect(resizeCommitDelta(start, tracked, { x: 180, y: 140 })).toEqual({ x: 80, y: 40 });
+  });
+
+  it('falls back to the tracked delta when the release resolves nowhere', () => {
+    expect(resizeCommitDelta(start, tracked, null)).toEqual(tracked);
   });
 });
