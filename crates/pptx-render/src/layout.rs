@@ -1205,11 +1205,23 @@ fn layout_paragraph(
         }]);
     }
     let ranges = wrap_clusters(&clusters, width);
-    let mut output = Vec::with_capacity(ranges.len());
+    let line_count = ranges.len();
+    let mut output = Vec::with_capacity(line_count);
     let mut line_y = y;
-    for (start, end) in ranges {
+    for (line_index, (start, end)) in ranges.into_iter().enumerate() {
         let slice = &clusters[start..end];
         let line_width = slice.iter().map(|cluster| cluster.width).sum::<f32>();
+        // A paragraph's last line and a line ended by a hard break keep their
+        // natural spacing, the way PowerPoint leaves them.
+        let stretched = matches!(paragraph.align, TextAlign::Justify)
+            && line_index + 1 < line_count
+            && !slice.last().is_some_and(|cluster| cluster.mandatory);
+        let padding = if stretched {
+            justification_padding(&justify_clusters(slice), width)
+        } else {
+            vec![0.0; slice.len()]
+        };
+        let padded_width = line_width + padding.iter().sum::<f32>();
         let line_x = match paragraph.align {
             TextAlign::Center => x + ((width - line_width) / 2.0).max(0.0),
             TextAlign::Right => x + (width - line_width).max(0.0),
@@ -1221,8 +1233,8 @@ fn layout_paragraph(
             x: line_x,
         }];
         let mut cursor_x = line_x;
-        for cluster in slice {
-            cursor_x += cluster.width;
+        for (index, cluster) in slice.iter().enumerate() {
+            cursor_x += cluster.width + padding[index];
             caret_stops.push(CaretStop {
                 position: cluster.end,
                 x: cursor_x,
@@ -1231,11 +1243,11 @@ fn layout_paragraph(
         caret_stops.dedup_by(|left, right| {
             left.position == right.position && left.x.to_bits() == right.x.to_bits()
         });
-        let runs = positioned_runs(slice, line_x, line_y + line_box.ascent, scale);
+        let runs = positioned_runs(slice, &padding, line_x, line_y + line_box.ascent, scale);
         output.push(PositionedTextLine {
             x: line_x,
             y: line_y,
-            width: line_width,
+            width: padded_width,
             height: line_box.height(),
             baseline: line_y + line_box.ascent,
             start: slice[0].start,
@@ -1459,13 +1471,14 @@ fn wrap_clusters(clusters: &[ShapedCluster], width: f32) -> Vec<(usize, usize)> 
 
 fn positioned_runs(
     clusters: &[ShapedCluster],
+    padding: &[f32],
     line_x: f32,
     baseline: f32,
     scale: f32,
 ) -> Vec<PositionedTextRun> {
     let mut output: Vec<PositionedTextRun> = Vec::new();
     let mut cursor_x = line_x;
-    for cluster in clusters {
+    for (index, cluster) in clusters.iter().enumerate() {
         if cluster.text == "\n" {
             continue;
         }
@@ -1504,10 +1517,66 @@ fn positioned_runs(
                 y_offset: baseline + glyph.y_offset,
             });
         }
-        run.width += cluster.width;
-        cursor_x += cluster.width;
+        let advance = cluster.width + padding.get(index).copied().unwrap_or(0.0);
+        run.width += advance;
+        cursor_x += advance;
     }
     output
+}
+
+/// What justification needs to know about one cluster.
+struct JustifyCluster {
+    width: f32,
+    break_after: bool,
+    blank: bool,
+}
+
+fn justify_clusters(clusters: &[ShapedCluster]) -> Vec<JustifyCluster> {
+    clusters
+        .iter()
+        .map(|cluster| JustifyCluster {
+            width: cluster.width,
+            break_after: cluster.break_after,
+            blank: !cluster.text.is_empty() && cluster.text.chars().all(char::is_whitespace),
+        })
+        .collect()
+}
+
+/// Extra width to add after each cluster so the line fills `available`. Only
+/// the break opportunities inside the line stretch, so the glyphs spread while
+/// the words stay whole; trailing blanks are excluded from both the measurement
+/// and the stretch, which lands the last glyph on the far edge.
+fn justification_padding(clusters: &[JustifyCluster], available: f32) -> Vec<f32> {
+    let mut padding = vec![0.0; clusters.len()];
+    let trailing = clusters
+        .iter()
+        .rev()
+        .take_while(|cluster| cluster.blank)
+        .count();
+    let visible = clusters.len() - trailing;
+    let width: f32 = clusters[..visible]
+        .iter()
+        .map(|cluster| cluster.width)
+        .sum();
+    let extra = available - width;
+    if !extra.is_finite() || extra <= 0.0 || visible == 0 {
+        return padding;
+    }
+    let gaps: Vec<usize> = clusters[..visible]
+        .iter()
+        .enumerate()
+        .take(visible.saturating_sub(1))
+        .filter(|(_, cluster)| cluster.break_after)
+        .map(|(index, _)| index)
+        .collect();
+    if gaps.is_empty() {
+        return padding;
+    }
+    let share = extra / gaps.len() as f32;
+    for index in gaps {
+        padding[index] = share;
+    }
+    padding
 }
 
 fn clusters_line_box(
@@ -2008,6 +2077,77 @@ mod tests {
             renderer.register_font("Arial", bold, false, FONT).unwrap();
         }
         renderer
+    }
+
+    fn justify(widths: &[(f32, bool, bool)]) -> Vec<JustifyCluster> {
+        widths
+            .iter()
+            .map(|(width, break_after, blank)| JustifyCluster {
+                width: *width,
+                break_after: *break_after,
+                blank: *blank,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn justification_spreads_the_slack_across_the_gaps() {
+        // "aa bb cc" laid out in 100px: 80px of clusters, two gaps to share 20px
+        let line = justify(&[
+            (20.0, false, false),
+            (10.0, true, true),
+            (20.0, false, false),
+            (10.0, true, true),
+            (20.0, false, false),
+        ]);
+        let padding = justification_padding(&line, 100.0);
+        assert_eq!(padding, vec![0.0, 10.0, 0.0, 10.0, 0.0]);
+        let width: f32 = line
+            .iter()
+            .zip(&padding)
+            .map(|(cluster, pad)| cluster.width + pad)
+            .sum();
+        assert_eq!(width, 100.0);
+    }
+
+    #[test]
+    fn justification_ignores_a_trailing_blank() {
+        // the wrap keeps the space that ended the line; stretching to it would
+        // leave the last glyph short of the edge
+        let line = justify(&[
+            (20.0, false, false),
+            (10.0, true, true),
+            (20.0, false, false),
+            (10.0, true, true),
+        ]);
+        let padding = justification_padding(&line, 60.0);
+        assert_eq!(padding, vec![0.0, 10.0, 0.0, 0.0]);
+        let width: f32 = line[..3]
+            .iter()
+            .zip(&padding)
+            .map(|(cluster, pad)| cluster.width + pad)
+            .sum();
+        assert_eq!(width, 60.0);
+    }
+
+    #[test]
+    fn justification_leaves_a_line_it_cannot_stretch() {
+        // one unbroken word has no gap to widen, and an overfull line no slack
+        assert_eq!(
+            justification_padding(&justify(&[(80.0, false, false)]), 100.0),
+            vec![0.0]
+        );
+        assert_eq!(
+            justification_padding(
+                &justify(&[
+                    (80.0, false, false),
+                    (10.0, true, true),
+                    (80.0, false, false)
+                ]),
+                100.0
+            ),
+            vec![0.0, 0.0, 0.0]
+        );
     }
 
     #[test]
