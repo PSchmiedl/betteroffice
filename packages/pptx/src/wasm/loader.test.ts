@@ -155,6 +155,36 @@ describe('PPTX wasm boundary', () => {
     ).toThrow();
   });
 
+  test('sets a shape rectangle in one update and one undo step', () => {
+    const source = openPresentation(fixture, { clientId: 9011 });
+    const slide = source.snapshot().slides[0];
+    const shape = slide.shapes[0];
+    const before = {
+      x: shape.x,
+      y: shape.y,
+      width: shape.width,
+      height: shape.height,
+    };
+    const after = {
+      x: before.x + 120_000,
+      y: before.y + 80_000,
+      width: before.width + 300_000,
+      height: before.height + 200_000,
+    };
+    const updates: Uint8Array[] = [];
+    source.onUpdate((update, origin) => {
+      if (origin === 'local') updates.push(update);
+    });
+
+    expect(source.setShapeRect(slide.id, shape.id, after).after).toEqual(after);
+    expect(updates).toHaveLength(1);
+    expect(shapeSnapshotFrom(source, shape.id)).toMatchObject(after);
+    expect(source.undo().applied).toBe(true);
+    expect(shapeSnapshotFrom(source, shape.id)).toMatchObject(before);
+    expect(source.canUndo()).toBe(false);
+    source.dispose();
+  });
+
   test('inserts and styles preset shapes with undo and redo', () => {
     const slide = handle.snapshot().slides[0];
     const receipt = handle.addShape(slide.id, {
@@ -256,7 +286,11 @@ describe('PPTX wasm boundary', () => {
 });
 
 function shapeSnapshot(shapeId: string) {
-  const shape = handle.snapshot().slides[0].shapes.find((candidate) => candidate.id === shapeId);
+  return shapeSnapshotFrom(handle, shapeId);
+}
+
+function shapeSnapshotFrom(source: PresentationHandle, shapeId: string) {
+  const shape = source.snapshot().slides[0].shapes.find((candidate) => candidate.id === shapeId);
   if (!shape) throw new Error(`shape ${shapeId} was not found`);
   return shape;
 }
