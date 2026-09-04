@@ -7,11 +7,12 @@ import type {
   StorySnapshot,
   TextBoxPrimitive,
 } from '../index';
-import { initWasm, openPresentation } from '../index';
+import { initWasm, openPresentation, paintSlide } from '../index';
 
 const root = resolve(import.meta.dir, '../../../..');
 let handle: PresentationHandle;
 let fixture: Uint8Array;
+let fontBytes: Uint8Array;
 
 beforeAll(async () => {
   const [wasm, pptx, font] = await Promise.all([
@@ -21,6 +22,7 @@ beforeAll(async () => {
   ]);
   await initWasm(wasm);
   fixture = pptx;
+  fontBytes = font;
   handle = openPresentation(pptx, {
     clientId: 9001,
     fonts: [{ family: 'Liberation Sans', bytes: font }],
@@ -183,6 +185,69 @@ describe('PPTX wasm boundary', () => {
     expect(shapeSnapshotFrom(source, shape.id)).toMatchObject(before);
     expect(source.canUndo()).toBe(false);
     source.dispose();
+  });
+
+  test('paints engine-produced justified word starts at caret positions', async () => {
+    const source = openPresentation(fixture, {
+      clientId: 9012,
+      fonts: [{ family: 'Liberation Sans', bytes: fontBytes }],
+    });
+    try {
+      const shape = source.snapshot().slides[0].shapes.find(
+        (candidate) => candidate.name === 'Subtitle'
+      );
+      const story = shape?.textStories[0];
+      if (!story) throw new Error('subtitle story is missing');
+      source.setParagraphAlignment(story.id, 0, story.length, 'just');
+      const frame = source.layoutSlide(0);
+      const textBox = frame.primitives.find(
+        (primitive): primitive is TextBoxPrimitive =>
+          primitive.kind === 'textBox' && primitive.storyId === story.id
+      );
+      if (!textBox) throw new Error('subtitle layout is missing');
+      expect(textBox.lines.length).toBeGreaterThan(1);
+
+      const calls: Array<{ text: string; x: number; y: number }> = [];
+      const ctx = new Proxy(
+        {
+          fillText: (text: string, x: number, y: number) => calls.push({ text, x, y }),
+        } as Record<string, unknown>,
+        {
+          get(target, property) {
+            if (property in target) return target[property as string];
+            return () => undefined;
+          },
+          set(target, property, value) {
+            target[property as string] = value;
+            return true;
+          },
+        }
+      ) as unknown as CanvasRenderingContext2D;
+      await paintSlide(ctx, { ...frame, background: undefined, primitives: [textBox] });
+
+      const first = textBox.lines[0];
+      const painted = calls.filter((call) => call.y === first.baseline);
+      expect(painted.length).toBeGreaterThan(1);
+      let position = first.start;
+      for (const call of painted) {
+        const caret = first.caretStops.find((stop) => stop.position === position);
+        if (!caret) throw new Error(`caret stop ${position} is missing`);
+        expect(call.x).toBe(caret.x);
+        position += call.text.length;
+      }
+      expect(position).toBe(first.end);
+
+      const last = textBox.lines[textBox.lines.length - 1];
+      expect(calls.filter((call) => call.y === last.baseline)).toEqual([
+        {
+          text: last.runs.map((run) => run.text).join(''),
+          x: last.runs[0].x,
+          y: last.baseline,
+        },
+      ]);
+    } finally {
+      source.dispose();
+    }
   });
 
   test('inserts and styles preset shapes with undo and redo', () => {
