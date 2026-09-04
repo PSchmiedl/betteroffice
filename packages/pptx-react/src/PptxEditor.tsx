@@ -46,10 +46,12 @@ import type {
 import { SHAPE_PRESETS } from './components/Toolbar';
 import {
   RESIZE_HANDLES,
+  canResizeShape,
   canMoveShape,
   findShape,
   findTopLevelShape,
   frameBoundsForShape,
+  gestureOwnsPointer,
   pointerTargetAtPoint,
   indexShapes,
   movedShapePosition,
@@ -57,10 +59,11 @@ import {
   handleAnchor,
   resizeCommitDelta,
   resizeCursor,
-  resizedBounds,
   resizedShapeBox,
+  resizedShapeBounds,
+  shapeTargetExists,
   slidePoint,
-  textPositionAtPoint,
+  textLocationAtPoint,
 } from './interactions';
 import type { FrameBounds, HoverTarget, ResizeHandle, SlidePoint } from './interactions';
 import {
@@ -79,8 +82,10 @@ import type { EffectiveTextStyle } from './textFormatting';
 import { shapeFormattingFromShape } from './shapeFormatting';
 import {
   caretGoalX,
+  caretLineIndex,
   extendTextRange,
   lineEdge,
+  sameCaretGoalKey,
   textRangeAt,
   verticalCaretMove,
   wordBoundary,
@@ -92,6 +97,7 @@ export interface PptxTextSelection {
   storyId: string;
   anchor: number;
   focus: number;
+  focusLine?: number;
 }
 
 export interface PptxEditorApi {
@@ -146,6 +152,7 @@ type PointerGesture =
       storyId: string;
       anchor: number;
       focus: number;
+      focusLine?: number;
       granularity: 'character' | TextSelectionGranularity;
       clickCount: number;
       clickShapeId: string;
@@ -276,10 +283,15 @@ function PptxEditorContent({
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasHostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
-  const [caretVisible, setCaretVisible] = useState(true);
-  const caretGoalRef = useRef<{ goalX: number; focus: number } | null>(null);
+  const [stageFocused, setStageFocused] = useState(false);
+  const caretGoalRef = useRef<{
+    shapeId: string;
+    position: number;
+    lineIndex?: number;
+    goalX: number;
+  } | null>(null);
   const resizeRef = useRef<{
+    pointerId: number;
     handle: ResizeHandle;
     start: SlidePoint;
     slideId: string;
@@ -324,6 +336,7 @@ function PptxEditorContent({
       const handle = handleRef.current;
       if (!handle) return null;
       try {
+        caretGoalRef.current = null;
         const snapshot = handle.snapshot();
         const index = clampSlideIndex(
           requestedIndex ?? modelRef.current?.slideIndex ?? 0,
@@ -364,6 +377,11 @@ function PptxEditorContent({
           setDragPreview(null);
           setTextBoxPreview(null);
         }
+        const resize = resizeRef.current;
+        if (resize && !shapeTargetExists(activeSlide, resize)) {
+          resizeRef.current = null;
+          setResizeDelta(null);
+        }
         modelRef.current = next;
         setModel(next);
         setHistoryState({ canUndo: handle.canUndo(), canRedo: handle.canRedo() });
@@ -396,9 +414,12 @@ function PptxEditorContent({
     setShapeSelection(null);
     setDragPreview(null);
     setTextBoxPreview(null);
+    setResizeDelta(null);
     setHistoryState({ canUndo: false, canRedo: false });
     setActiveTool('select');
     pointerGestureRef.current = null;
+    resizeRef.current = null;
+    caretGoalRef.current = null;
     recentClickRef.current = null;
     setError(null);
     imageCacheRef.current.clear();
@@ -512,29 +533,6 @@ function PptxEditorContent({
       cancelled = true;
     };
   }, [decodeImageError, model?.frame, reportError, scale]);
-
-  // Every caret move replaces `selection`, which restarts the phase: the caret
-  // is solid the instant it lands, as it is in PowerPoint.
-  useEffect(() => {
-    if (!selection || selection.anchor !== selection.focus) return;
-    setCaretVisible(true);
-    const timer = window.setInterval(
-      () => setCaretVisible((visible) => !visible),
-      CARET_BLINK_MS
-    );
-    return () => window.clearInterval(timer);
-  }, [selection]);
-
-  useEffect(() => {
-    const canvas = overlayCanvasRef.current;
-    const frame = model?.frame;
-    if (!canvas || !frame) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const dpr = window.devicePixelRatio || 1;
-    sizeCanvasForSlide(canvas, frame, dpr, scale);
-    paintSelection(ctx, frame, selection, dpr, scale, caretVisible);
-  }, [caretVisible, model?.frame, scale, selection]);
 
   const selectedShape = useMemo(() => {
     if (!model?.frame || !shapeSelection) return null;
@@ -688,6 +686,9 @@ function PptxEditorContent({
   }, [model?.snapshot]);
 
   const selectSlide = (index: number) => {
+    caretGoalRef.current = null;
+    resizeRef.current = null;
+    setResizeDelta(null);
     setSelection(null);
     setShapeSelection(null);
     setDragPreview(null);
@@ -749,7 +750,13 @@ function PptxEditorContent({
       );
       const story = shape?.textStories[0];
       if (story) {
-        setSelection({ shapeId: shape.id, storyId: story.id, anchor: 0, focus: 0 });
+        setSelection({
+          shapeId: shape.id,
+          storyId: story.id,
+          anchor: 0,
+          focus: 0,
+          focusLine: 0,
+        });
         stageRef.current?.focus();
       }
     } catch (value) {
@@ -827,6 +834,9 @@ function PptxEditorContent({
       event.clientY
     );
     if (!point) return;
+    caretGoalRef.current = null;
+    resizeRef.current = null;
+    setResizeDelta(null);
     const slide = current.snapshot.slides[current.slideIndex];
     const shapePreset = shapePresetFromTool(activeTool);
     if ((activeTool === 'textBox' || shapePreset) && slide) {
@@ -863,7 +873,7 @@ function PptxEditorContent({
       // reads as a shape hit and matches the cursor the pointer showed.
       const hit =
         engineHit?.kind === 'text' &&
-        pointerTargetAtPoint(current.frame, point) === 'shape'
+        pointerTargetAtPoint(current.frame, point, scale) === 'shape'
           ? { kind: 'shape' as const, shapeId: engineHit.shapeId }
           : engineHit;
       const shape = slide && hit ? findTopLevelShape(slide, hit.shapeId) : null;
@@ -881,6 +891,10 @@ function PptxEditorContent({
       );
       const clickCount =
         repeatedClick && recentClick ? Math.min(recentClick.count + 1, 3) : 1;
+      const hitLocation =
+        hit?.kind === 'text'
+          ? textLocationAtPoint(current.frame, hit.shapeId, hit.storyId, point)
+          : null;
       recentClickRef.current = null;
       if (
         slide &&
@@ -896,6 +910,7 @@ function PptxEditorContent({
           storyId: hit.storyId,
           anchor: range.start,
           focus: range.end,
+          focusLine: hitLocation?.lineIndex,
         });
         setShapeSelection(null);
         setDragPreview(null);
@@ -907,6 +922,7 @@ function PptxEditorContent({
           storyId: hit.storyId,
           anchor: range.start,
           focus: range.end,
+          focusLine: hitLocation?.lineIndex,
           granularity,
           clickCount,
           clickShapeId: shape.id,
@@ -929,6 +945,7 @@ function PptxEditorContent({
           storyId: hit.storyId,
           anchor,
           focus: hit.position,
+          focusLine: hitLocation?.lineIndex,
         });
         setShapeSelection(null);
         setDragPreview(null);
@@ -940,6 +957,7 @@ function PptxEditorContent({
           storyId: hit.storyId,
           anchor,
           focus: hit.position,
+          focusLine: hitLocation?.lineIndex,
           granularity: 'character',
           clickCount,
           clickShapeId: shape?.id ?? hit.shapeId,
@@ -1017,21 +1035,21 @@ function PptxEditorContent({
       ) {
         gesture.dragging = true;
       }
-      const focus = textPositionAtPoint(
+      const focus = textLocationAtPoint(
         current.frame,
         gesture.shapeId,
         gesture.storyId,
         point
       );
-      if (focus !== null) {
+      if (focus) {
         const range =
           gesture.granularity === 'character'
-            ? { anchor: gesture.anchor, focus }
+            ? { anchor: gesture.anchor, focus: focus.position }
             : extendTextRange(
                 { start: gesture.anchor, end: gesture.focus },
                 textRangeAt(
                   storyText(handle.story(gesture.storyId)),
-                  focus,
+                  focus.position,
                   gesture.granularity
                 )
               );
@@ -1039,6 +1057,7 @@ function PptxEditorContent({
           shapeId: gesture.shapeId,
           storyId: gesture.storyId,
           ...range,
+          focusLine: focus.lineIndex,
         });
       }
     } else if (gesture.kind === 'shape') {
@@ -1083,7 +1102,7 @@ function PptxEditorContent({
       event.clientX,
       event.clientY
     );
-    setHoverTarget(point ? pointerTargetAtPoint(current.frame, point) : null);
+    setHoverTarget(point ? pointerTargetAtPoint(current.frame, point, scale) : null);
   };
 
   const pointerLeave = () => {
@@ -1168,7 +1187,7 @@ function PptxEditorContent({
   };
 
   const commit = (nextSelection: PptxTextSelection | null) => {
-    setSelection(nextSelection);
+    setSelection(nextSelection ? { ...nextSelection, focusLine: undefined } : null);
     setShapeSelection(null);
     recentClickRef.current = null;
     refreshAt(undefined, true);
@@ -1182,6 +1201,8 @@ function PptxEditorContent({
       setActiveTool('select');
       setTextBoxPreview(null);
       pointerGestureRef.current = null;
+      resizeRef.current = null;
+      setResizeDelta(null);
       event.preventDefault();
       return;
     }
@@ -1232,8 +1253,9 @@ function PptxEditorContent({
         event.preventDefault();
         setSelection({
           ...selection,
-          anchor: event.shiftKey ? selection.anchor : moved,
-          focus: moved,
+          anchor: event.shiftKey ? selection.anchor : moved.position,
+          focus: moved.position,
+          focusLine: moved.lineIndex,
         });
         return;
       }
@@ -1321,42 +1343,62 @@ function PptxEditorContent({
   const caretDestination = (
     event: KeyboardEvent<HTMLDivElement>,
     selection: PptxTextSelection
-  ): number | null => {
+  ): { position: number; lineIndex?: number } | null => {
     const handle = handleRef.current;
     if (!handle) return null;
     const story = handle.story(selection.storyId);
     const last = Math.max(0, story.length - 1);
     const clamp = (position: number) => Math.max(0, Math.min(last, position));
     const lines = caretLinesFor(model?.frame, selection);
+    const current = { position: selection.focus, lineIndex: selection.focusLine };
     // macOS reads Option as word-wise and Command as line-edge; Control is the
     // Windows word-wise modifier.
     const wordWise = event.altKey || (event.ctrlKey && !event.metaKey);
     const toEdge = event.metaKey;
 
     if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      const goalKey = { shapeId: selection.shapeId, ...current };
       const goal =
-        caretGoalRef.current?.focus === selection.focus
+        caretGoalRef.current && sameCaretGoalKey(caretGoalRef.current, goalKey)
           ? caretGoalRef.current.goalX
-          : caretGoalX(lines, selection.focus);
+          : caretGoalX(lines, current);
       const direction = event.key === 'ArrowUp' ? 'up' : 'down';
-      const destination = clamp(verticalCaretMove(lines, selection.focus, direction, goal));
-      caretGoalRef.current = goal === undefined ? null : { goalX: goal, focus: destination };
+      const moved = verticalCaretMove(lines, current, direction, goal);
+      const destination = { ...moved, position: clamp(moved.position) };
+      caretGoalRef.current =
+        goal === undefined
+          ? null
+          : {
+              shapeId: selection.shapeId,
+              goalX: goal,
+              position: destination.position,
+              lineIndex: destination.lineIndex,
+            };
       return destination;
     }
     caretGoalRef.current = null;
     if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
       const direction = event.key === 'ArrowLeft' ? -1 : 1;
       if (toEdge) {
-        return clamp(lineEdge(lines, selection.focus, direction < 0 ? 'start' : 'end'));
+        const destination = lineEdge(lines, current, direction < 0 ? 'start' : 'end');
+        return { ...destination, position: clamp(destination.position) };
       }
-      if (wordWise) return clamp(wordBoundary(storyText(story), selection.focus, direction));
-      return clamp(selection.focus + direction);
+      const position = wordWise
+        ? wordBoundary(storyText(story), selection.focus, direction)
+        : selection.focus + direction;
+      return { position: clamp(position), lineIndex: selection.focusLine };
     }
     if (event.key === 'Home') {
-      return toEdge || event.ctrlKey ? 0 : clamp(lineEdge(lines, selection.focus, 'start'));
+      if (toEdge || event.ctrlKey) return { position: 0, lineIndex: 0 };
+      const destination = lineEdge(lines, current, 'start');
+      return { ...destination, position: clamp(destination.position) };
     }
     if (event.key === 'End') {
-      return toEdge || event.ctrlKey ? last : clamp(lineEdge(lines, selection.focus, 'end'));
+      if (toEdge || event.ctrlKey) {
+        return { position: last, lineIndex: Math.max(0, lines.length - 1) };
+      }
+      const destination = lineEdge(lines, current, 'end');
+      return { ...destination, position: clamp(destination.position) };
     }
     return null;
   };
@@ -1448,6 +1490,8 @@ function PptxEditorContent({
       setActiveTool('select');
       pointerGestureRef.current = null;
       recentClickRef.current = null;
+      resizeRef.current = null;
+      setResizeDelta(null);
       refreshAt(index, true, true);
     } catch (value) {
       reportError(value);
@@ -1466,6 +1510,8 @@ function PptxEditorContent({
       setActiveTool('select');
       pointerGestureRef.current = null;
       recentClickRef.current = null;
+      resizeRef.current = null;
+      setResizeDelta(null);
       refreshAt(undefined, true);
     } catch (value) {
       reportError(value);
@@ -1493,12 +1539,13 @@ function PptxEditorContent({
 
   const resizePointerDown =
     (handle: ResizeHandle) => (event: PointerEvent<HTMLSpanElement>) => {
-      if (!shapeSelection) return;
+      if (!shapeSelection || !selectedShape || !canResizeShape(selectedShape)) return;
       const point = slidePointFromClient(event.clientX, event.clientY);
       if (!point) return;
       event.preventDefault();
       event.stopPropagation();
       resizeRef.current = {
+        pointerId: event.pointerId,
         handle,
         start: point,
         slideId: shapeSelection.slideId,
@@ -1514,7 +1561,7 @@ function PptxEditorContent({
    *  whose render has not landed yet cannot resize the shape to a stale size. */
   const resizeDeltaFrom = (event: PointerEvent<HTMLSpanElement>): SlidePoint | null => {
     const gesture = resizeRef.current;
-    if (!gesture) return null;
+    if (!gestureOwnsPointer(gesture, event.pointerId)) return null;
     return resizeCommitDelta(
       gesture.start,
       gesture.delta,
@@ -1525,13 +1572,14 @@ function PptxEditorContent({
   const resizePointerMove = (event: PointerEvent<HTMLSpanElement>) => {
     const gesture = resizeRef.current;
     const delta = resizeDeltaFrom(event);
-    if (!gesture || !delta) return;
+    if (!gestureOwnsPointer(gesture, event.pointerId) || !delta) return;
     gesture.delta = delta;
     setResizeDelta(delta);
   };
 
   const endResizeGesture = (event: PointerEvent<HTMLSpanElement>) => {
     const gesture = resizeRef.current;
+    if (!gestureOwnsPointer(gesture, event.pointerId)) return null;
     resizeRef.current = null;
     setResizeDelta(null);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
@@ -1549,23 +1597,38 @@ function PptxEditorContent({
     const delta = resizeDeltaFrom(event);
     const gesture = endResizeGesture(event);
     const api = handleRef.current;
-    if (!gesture || !delta || !api || !model?.frame || !selectedShape) return;
+    const current = modelRef.current;
+    const slide = current?.snapshot.slides[current.slideIndex];
+    const shape = slide && gesture ? findShape(slide.shapes, gesture.shapeId) : null;
+    if (
+      !gesture ||
+      !delta ||
+      !api ||
+      !current?.frame ||
+      slide?.id !== gesture.slideId ||
+      !shape
+    ) {
+      return;
+    }
     if (delta.x === 0 && delta.y === 0) return;
     try {
       const box = resizedShapeBox(
-        model.snapshot,
-        model.frame,
-        selectedShape,
+        current.snapshot,
+        current.frame,
+        shape,
         gesture.handle,
         delta
       );
-      if (box.x !== selectedShape.x || box.y !== selectedShape.y) {
-        api.moveShape(gesture.slideId, gesture.shapeId, box.x, box.y);
+      if (
+        box &&
+        (box.x !== shape.x ||
+          box.y !== shape.y ||
+          box.width !== shape.width ||
+          box.height !== shape.height)
+      ) {
+        api.setShapeRect(gesture.slideId, gesture.shapeId, box);
+        refreshAt(undefined, true);
       }
-      if (box.width !== selectedShape.width || box.height !== selectedShape.height) {
-        api.resizeShape(gesture.slideId, gesture.shapeId, box.width, box.height);
-      }
-      refreshAt(undefined, true);
     } catch (value) {
       reportError(value);
     }
@@ -1576,9 +1639,19 @@ function PptxEditorContent({
   const shapeDragDelta =
     dragPreview && dragPreview.shapeId === shapeSelection?.shapeId ? dragPreview.delta : null;
   const resizingHandle = resizeRef.current?.handle;
+  const resizePreview =
+    model?.frame && selectedShape && resizeDelta && resizingHandle
+      ? resizedShapeBounds(
+          model.snapshot,
+          model.frame,
+          selectedShape,
+          resizingHandle,
+          resizeDelta
+        )
+      : null;
   const selectionBox = selectedShapeBounds
     ? resizeDelta && resizingHandle
-      ? resizedBounds(selectedShapeBounds, resizingHandle, resizeDelta)
+      ? resizePreview ?? selectedShapeBounds
       : {
           ...selectedShapeBounds,
           x: selectedShapeBounds.x + (shapeDragDelta?.x ?? 0),
@@ -1615,6 +1688,8 @@ function PptxEditorContent({
             }
             setTextBoxPreview(null);
             pointerGestureRef.current = null;
+            resizeRef.current = null;
+            setResizeDelta(null);
             stageRef.current?.focus();
           }}
           disabled={!model || slideCount === 0}
@@ -1710,6 +1785,8 @@ function PptxEditorContent({
           role="application"
           aria-label={t('editor.appLabel')}
           onKeyDown={keyDown}
+          onFocus={() => setStageFocused(true)}
+          onBlur={() => setStageFocused(false)}
         >
           <div ref={canvasHostRef} style={styles.canvasHost}>
             {model?.frame ? (
@@ -1753,7 +1830,12 @@ function PptxEditorContent({
                         })
                   }
                 />
-                <canvas ref={overlayCanvasRef} style={styles.canvasOverlay} aria-hidden="true" />
+                <SelectionOverlay
+                  frame={model.frame}
+                  selection={selection}
+                  scale={scale}
+                  focused={stageFocused}
+                />
                 {remoteShapePresence.visible.map(
                   ({ peer, peerCount, shapeId, bounds }, index) => (
                     <RemoteShapeOutline
@@ -1783,25 +1865,28 @@ function PptxEditorContent({
                       }}
                       aria-hidden="true"
                     />
-                    {RESIZE_HANDLES.map((handle) => {
-                      const anchor = handleAnchor(selectionBox, handle);
-                      return (
-                        <span
-                          key={handle}
-                          data-testid={`pptx-resize-${handle}`}
-                          onPointerDown={resizePointerDown(handle)}
-                          onPointerMove={resizePointerMove}
-                          onPointerUp={resizePointerUp}
-                          onPointerCancel={resizePointerCancel}
-                          style={{
-                            ...styles.resizeHandle,
-                            left: anchor.x * scale - HANDLE_SIZE / 2,
-                            top: anchor.y * scale - HANDLE_SIZE / 2,
-                            cursor: resizeCursor(handle),
-                          }}
-                        />
-                      );
-                    })}
+                    {selectedShape && canResizeShape(selectedShape)
+                      ? RESIZE_HANDLES.map((handle) => {
+                          const anchor = handleAnchor(selectionBox, handle);
+                          return (
+                            <span
+                              key={handle}
+                              data-testid={`pptx-resize-${handle}`}
+                              onPointerDown={resizePointerDown(handle)}
+                              onPointerMove={resizePointerMove}
+                              onPointerUp={resizePointerUp}
+                              onPointerCancel={resizePointerCancel}
+                              onLostPointerCapture={resizePointerCancel}
+                              style={{
+                                ...styles.resizeHandle,
+                                left: anchor.x * scale - HANDLE_SIZE / 2,
+                                top: anchor.y * scale - HANDLE_SIZE / 2,
+                                cursor: resizeCursor(handle),
+                              }}
+                            />
+                          );
+                        })
+                      : null}
                   </>
                 ) : null}
                 {editedShapeBounds ? (
@@ -1930,6 +2015,55 @@ function SlideThumbnail({
     void paintSlide(ctx, frame, dpr, scale, { resolveImage }).catch(() => undefined);
   }, [frame, resolveImage]);
   return <canvas ref={canvasRef} style={styles.thumbnailCanvas} aria-hidden="true" />;
+}
+
+export function SelectionOverlay({
+  frame,
+  selection,
+  scale,
+  focused,
+}: {
+  frame: SlideDisplayList;
+  selection: PptxTextSelection | null;
+  scale: number;
+  focused: boolean;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [pageVisible, setPageVisible] = useState(
+    () => typeof document === 'undefined' || document.visibilityState === 'visible'
+  );
+  const [caretVisible, setCaretVisible] = useState(false);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    const update = () => setPageVisible(document.visibilityState === 'visible');
+    document.addEventListener('visibilitychange', update);
+    return () => document.removeEventListener('visibilitychange', update);
+  }, []);
+
+  useEffect(() => {
+    const blinking =
+      focused && pageVisible && selection !== null && selection.anchor === selection.focus;
+    setCaretVisible(blinking);
+    if (!blinking) return;
+    const timer = window.setInterval(
+      () => setCaretVisible((visible) => !visible),
+      CARET_BLINK_MS
+    );
+    return () => window.clearInterval(timer);
+  }, [focused, pageVisible, selection]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    sizeCanvasForSlide(canvas, frame, dpr, scale);
+    paintSelection(ctx, frame, selection, dpr, scale, caretVisible);
+  }, [caretVisible, frame, scale, selection]);
+
+  return <canvas ref={canvasRef} style={styles.canvasOverlay} aria-hidden="true" />;
 }
 
 function clampSlideIndex(index: number, count: number): number {
@@ -2080,7 +2214,7 @@ function caretLinesFor(
   return textBox?.lines ?? [];
 }
 
-function paintSelection(
+export function paintSelection(
   ctx: CanvasRenderingContext2D,
   frame: SlideDisplayList,
   selection: PptxTextSelection | null,
@@ -2111,9 +2245,12 @@ function paintSelection(
       ctx.fillRect(Math.min(x1, x2), line.y, Math.max(1, Math.abs(x2 - x1)), line.height);
     }
   } else if (caretVisible) {
-    const line =
-      textBox.lines.find((candidate) => start >= candidate.start && start <= candidate.end) ??
-      textBox.lines[textBox.lines.length - 1];
+    const line = textBox.lines[
+      caretLineIndex(textBox.lines, {
+        position: start,
+        lineIndex: selection.focusLine,
+      })
+    ];
     if (line) {
       const x = caretX(line, start);
       ctx.fillStyle = '#1d4ed8';

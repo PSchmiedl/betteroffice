@@ -4,6 +4,7 @@ import {
   extendTextRange,
   lineEdge,
   paragraphRangeAt,
+  sameCaretGoalKey,
   textRangeAt,
   verticalCaretMove,
   wordBoundary,
@@ -48,31 +49,79 @@ describe('pptx text selection boundaries', () => {
 describe('pptx caret movement', () => {
   const lines: CaretLine[] = [
     { start: 0, end: 5, caretStops: stops(0, [0, 10, 20, 30, 40, 50]) },
-    { start: 6, end: 8, caretStops: stops(6, [0, 12, 24]) },
-    { start: 9, end: 14, caretStops: stops(9, [0, 10, 20, 30, 40, 50]) },
+    { start: 5, end: 8, caretStops: stops(5, [0, 12, 24, 36]) },
+    { start: 8, end: 13, caretStops: stops(8, [0, 10, 20, 30, 40, 50]) },
   ];
 
   it('moves between lines at the nearest column', () => {
-    expect(verticalCaretMove(lines, 3, 'down')).toBe(8);
-    expect(verticalCaretMove(lines, 8, 'up')).toBe(2);
+    expect(verticalCaretMove(lines, { position: 3, lineIndex: 0 }, 'down')).toEqual({
+      position: 7,
+      lineIndex: 1,
+    });
+    expect(verticalCaretMove(lines, { position: 7, lineIndex: 1 }, 'up')).toEqual({
+      position: 2,
+      lineIndex: 0,
+    });
   });
 
   it('stays put at the first and last line', () => {
-    expect(verticalCaretMove(lines, 2, 'up')).toBe(2);
-    expect(verticalCaretMove(lines, 11, 'down')).toBe(11);
+    expect(verticalCaretMove(lines, { position: 2, lineIndex: 0 }, 'up')).toEqual({
+      position: 2,
+      lineIndex: 0,
+    });
+    expect(verticalCaretMove(lines, { position: 11, lineIndex: 2 }, 'down')).toEqual({
+      position: 11,
+      lineIndex: 2,
+    });
   });
 
   it('holds the goal column across a short line', () => {
-    const goal = caretGoalX(lines, 5);
+    const goal = caretGoalX(lines, { position: 5, lineIndex: 0 });
     expect(goal).toBe(50);
-    const middle = verticalCaretMove(lines, 5, 'down', goal);
-    expect(middle).toBe(8);
-    expect(verticalCaretMove(lines, middle, 'down', goal)).toBe(14);
+    const middle = verticalCaretMove(lines, { position: 5, lineIndex: 0 }, 'down', goal);
+    expect(middle).toEqual({ position: 8, lineIndex: 1 });
+    expect(verticalCaretMove(lines, middle, 'down', goal)).toEqual({
+      position: 13,
+      lineIndex: 2,
+    });
   });
 
-  it('finds the edges of the line the caret sits in', () => {
-    expect(lineEdge(lines, 7, 'start')).toBe(6);
-    expect(lineEdge(lines, 7, 'end')).toBe(8);
+  it('keeps shared endpoints on their visual line', () => {
+    expect(lineEdge(lines, { position: 5, lineIndex: 0 }, 'start')).toEqual({
+      position: 0,
+      lineIndex: 0,
+    });
+    expect(lineEdge(lines, { position: 5, lineIndex: 1 }, 'start')).toEqual({
+      position: 5,
+      lineIndex: 1,
+    });
+    expect(lineEdge(lines, { position: 4, lineIndex: 0 }, 'end')).toEqual({
+      position: 5,
+      lineIndex: 0,
+    });
+  });
+
+  it('moves through an empty shared-endpoint line', () => {
+    const empty: CaretLine[] = [
+      { start: 0, end: 1, caretStops: stops(0, [0, 10]) },
+      { start: 1, end: 1, caretStops: [{ position: 1, x: 0 }] },
+      { start: 1, end: 2, caretStops: stops(1, [0, 10]) },
+    ];
+    const goal = caretGoalX(empty, { position: 1, lineIndex: 0 });
+    const middle = verticalCaretMove(empty, { position: 1, lineIndex: 0 }, 'down', goal);
+    expect(middle).toEqual({ position: 1, lineIndex: 1 });
+    expect(lineEdge(empty, middle, 'start')).toEqual({ position: 1, lineIndex: 1 });
+    expect(verticalCaretMove(empty, middle, 'down', goal)).toEqual({
+      position: 2,
+      lineIndex: 2,
+    });
+  });
+
+  it('keys the goal column by shape and visual line', () => {
+    const goal = { shapeId: 'first', position: 5, lineIndex: 1 };
+    expect(sameCaretGoalKey(goal, { ...goal })).toBe(true);
+    expect(sameCaretGoalKey(goal, { ...goal, shapeId: 'second' })).toBe(false);
+    expect(sameCaretGoalKey(goal, { ...goal, lineIndex: 0 })).toBe(false);
   });
 
   it('jumps whole words and stops at the text edges', () => {

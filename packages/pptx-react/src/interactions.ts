@@ -12,6 +12,11 @@ export interface SlidePoint {
   y: number;
 }
 
+export interface TextPointLocation {
+  position: number;
+  lineIndex: number;
+}
+
 export type HoverTarget = 'text' | 'shape';
 
 export type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
@@ -27,10 +32,8 @@ export const RESIZE_HANDLES: readonly ResizeHandle[] = [
   'w',
 ];
 
-/** Slide-space band along a text box's edge that grabs the box itself. Inside
- *  it the pointer moves the shape; further in it edits text, as PowerPoint
- *  splits the two. */
-const BORDER_BAND = 6;
+const BORDER_BAND_SCREEN_PX = 6;
+export const MIN_SHAPE_SIZE_EMU = 76_200;
 
 type PrimitiveGeometry = Pick<SlidePrimitive, 'x' | 'y' | 'w' | 'h' | 'transform'>;
 
@@ -97,8 +100,29 @@ export function findTopLevelShape(slide: SlideSnapshot, shapeId: string): ShapeS
   return null;
 }
 
+export function shapeTargetExists(
+  slide: SlideSnapshot | undefined,
+  target: { slideId: string; shapeId: string }
+): boolean {
+  return Boolean(
+    slide && slide.id === target.slideId && findShape(slide.shapes, target.shapeId)
+  );
+}
+
+export function gestureOwnsPointer<T extends { pointerId: number }>(
+  gesture: T | null,
+  pointerId: number
+): gesture is T {
+  return gesture?.pointerId === pointerId;
+}
+
 export function canMoveShape(shape: ShapeSnapshot): boolean {
   return shape.width > 0 && shape.height > 0;
+}
+
+export function canResizeShape(shape: ShapeSnapshot): boolean {
+  const rotation = ((shape.rotationDeg % 360) + 360) % 360;
+  return canMoveShape(shape) && rotation === 0 && !shape.flipH && !shape.flipV;
 }
 
 export function frameBoundsForShape(
@@ -151,6 +175,15 @@ export function textPositionAtPoint(
   storyId: string,
   point: SlidePoint
 ): number | null {
+  return textLocationAtPoint(frame, shapeId, storyId, point)?.position ?? null;
+}
+
+export function textLocationAtPoint(
+  frame: SlideDisplayList,
+  shapeId: string,
+  storyId: string,
+  point: SlidePoint
+): TextPointLocation | null {
   const textBox = frame.primitives.find(
     (primitive): primitive is TextBoxPrimitive =>
       primitive.kind === 'textBox' &&
@@ -158,23 +191,27 @@ export function textPositionAtPoint(
       primitive.storyId === storyId
   );
   if (!textBox || textBox.lines.length === 0) return null;
-  // lines are laid out unrotated, so a drag has to resolve in the same frame the
-  // engine's hitTest used when the gesture started
   const local = localPoint(textBox, point);
-  const line = textBox.lines.reduce((nearest, candidate) =>
-    lineDistance(candidate.y, candidate.height, local.y) <
-    lineDistance(nearest.y, nearest.height, local.y)
-      ? candidate
-      : nearest
-  );
+  let lineIndex = 0;
+  for (let index = 1; index < textBox.lines.length; index += 1) {
+    const candidate = textBox.lines[index];
+    const nearest = textBox.lines[lineIndex];
+    if (
+      lineDistance(candidate.y, candidate.height, local.y) <
+      lineDistance(nearest.y, nearest.height, local.y)
+    ) {
+      lineIndex = index;
+    }
+  }
+  const line = textBox.lines[lineIndex];
   const firstCaret = line.caretStops[0];
-  if (!firstCaret) return line.start;
+  if (!firstCaret) return { position: line.start, lineIndex };
   const caret = line.caretStops.reduce(
     (nearest, candidate) =>
       Math.abs(candidate.x - local.x) < Math.abs(nearest.x - local.x) ? candidate : nearest,
     firstCaret
   );
-  return caret.position;
+  return { position: caret.position, lineIndex };
 }
 
 /** Mirrors the engine's `hitTest`, which resolves text only where a caret can
@@ -306,7 +343,7 @@ export function resizedBounds(
   bounds: FrameBounds,
   handle: ResizeHandle,
   delta: SlidePoint,
-  minimum = 8
+  minimum: number
 ): FrameBounds {
   let { x, y, width, height } = bounds;
   if (handle.includes('w')) {
@@ -343,9 +380,9 @@ export function resizedShapeBox(
   frame: SlideDisplayList,
   shape: ShapeSnapshot,
   handle: ResizeHandle,
-  delta: SlidePoint,
-  minimum = 1_000
-): { x: number; y: number; width: number; height: number } {
+  delta: SlidePoint
+): { x: number; y: number; width: number; height: number } | null {
+  if (!canResizeShape(shape)) return null;
   const emu = {
     x: Math.round((delta.x * deck.widthEmu) / frame.width),
     y: Math.round((delta.y * deck.heightEmu) / frame.height),
@@ -354,9 +391,26 @@ export function resizedShapeBox(
     { x: shape.x, y: shape.y, width: shape.width, height: shape.height },
     handle,
     emu,
-    minimum
+    MIN_SHAPE_SIZE_EMU
   );
   return { x: box.x, y: box.y, width: box.width, height: box.height };
+}
+
+export function resizedShapeBounds(
+  deck: DeckSnapshot,
+  frame: SlideDisplayList,
+  shape: ShapeSnapshot,
+  handle: ResizeHandle,
+  delta: SlidePoint
+): FrameBounds | null {
+  const box = resizedShapeBox(deck, frame, shape, handle, delta);
+  if (!box || deck.widthEmu <= 0 || deck.heightEmu <= 0) return null;
+  return {
+    x: (box.x * frame.width) / deck.widthEmu,
+    y: (box.y * frame.height) / deck.heightEmu,
+    width: (box.width * frame.width) / deck.widthEmu,
+    height: (box.height * frame.height) / deck.heightEmu,
+  };
 }
 
 /** What a pointer gesture acts on. This is the engine's hit with one addition:
@@ -365,7 +419,8 @@ export function resizedShapeBox(
  *  such band, and `hoverTargetAtPoint` stays an exact mirror of it. */
 export function pointerTargetAtPoint(
   frame: SlideDisplayList,
-  point: SlidePoint
+  point: SlidePoint,
+  scale = 1
 ): HoverTarget | null {
   const target = hoverTargetAtPoint(frame, point);
   if (target !== 'text') return target;
@@ -375,13 +430,22 @@ export function pointerTargetAtPoint(
     if (!primitive.shapeId) continue;
     const local = containedPoint(primitive, at);
     if (!local) continue;
-    return withinBorderBand(primitive, local) ? 'shape' : 'text';
+    return withinBorderBand(primitive, local, scale) ? 'shape' : 'text';
   }
   return target;
 }
 
-function withinBorderBand(primitive: PrimitiveGeometry, point: SlidePoint): boolean {
-  const band = Math.min(BORDER_BAND, primitive.w / 3, primitive.h / 3);
+function withinBorderBand(
+  primitive: PrimitiveGeometry,
+  point: SlidePoint,
+  scale: number
+): boolean {
+  const normalizedScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  const band = Math.min(
+    BORDER_BAND_SCREEN_PX / normalizedScale,
+    primitive.w / 3,
+    primitive.h / 3
+  );
   return (
     point.x - primitive.x <= band ||
     primitive.x + primitive.w - point.x <= band ||

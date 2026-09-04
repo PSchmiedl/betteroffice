@@ -74,47 +74,63 @@ export interface CaretLine {
   caretStops: ReadonlyArray<{ position: number; x: number }>;
 }
 
-/** Vertical movement keeps the column the caret started from, so a run through
- *  short lines and back does not drift left. `undefined` when the position has
- *  no caret stop to measure. */
-export function caretGoalX(
-  lines: readonly CaretLine[],
-  position: number
-): number | undefined {
-  const line = lines[lineIndexAt(lines, position)];
-  return line?.caretStops.find((stop) => stop.position === position)?.x;
+export interface CaretLocation {
+  position: number;
+  lineIndex?: number;
 }
 
-/** The position one line up or down, holding `goalX`. Stays put at the first
- *  and last line, matching PowerPoint. */
+export interface CaretGoalKey extends CaretLocation {
+  shapeId: string;
+}
+
+export function sameCaretGoalKey(left: CaretGoalKey, right: CaretGoalKey): boolean {
+  return (
+    left.shapeId === right.shapeId &&
+    left.position === right.position &&
+    left.lineIndex === right.lineIndex
+  );
+}
+
+/** Returns the caret's visual column. */
+export function caretGoalX(
+  lines: readonly CaretLine[],
+  caret: CaretLocation
+): number | undefined {
+  const line = lines[caretLineIndex(lines, caret)];
+  return line?.caretStops.find((stop) => stop.position === caret.position)?.x;
+}
+
+/** Moves vertically while retaining `goalX`. */
 export function verticalCaretMove(
   lines: readonly CaretLine[],
-  position: number,
+  caret: CaretLocation,
   direction: 'up' | 'down',
   goalX?: number
-): number {
-  if (lines.length === 0) return position;
-  const index = lineIndexAt(lines, position);
-  const target = lines[index + (direction === 'up' ? -1 : 1)];
-  if (!target) return position;
-  const x = goalX ?? caretGoalX(lines, position);
-  if (x === undefined) return target.start;
+): Required<CaretLocation> {
+  if (lines.length === 0) return { position: caret.position, lineIndex: 0 };
+  const index = caretLineIndex(lines, caret);
+  const targetIndex = index + (direction === 'up' ? -1 : 1);
+  const target = lines[targetIndex];
+  if (!target) return { position: caret.position, lineIndex: index };
+  const x = goalX ?? caretGoalX(lines, caret);
+  if (x === undefined) return { position: target.start, lineIndex: targetIndex };
   const nearest = target.caretStops.reduce<{ position: number; x: number } | null>(
     (best, stop) => (best === null || Math.abs(stop.x - x) < Math.abs(best.x - x) ? stop : best),
     null
   );
-  return nearest?.position ?? target.start;
+  return { position: nearest?.position ?? target.start, lineIndex: targetIndex };
 }
 
 /** The first or last position of the line the caret sits in. */
 export function lineEdge(
   lines: readonly CaretLine[],
-  position: number,
+  caret: CaretLocation,
   edge: 'start' | 'end'
-): number {
-  const line = lines[lineIndexAt(lines, position)];
-  if (!line) return position;
-  return edge === 'start' ? line.start : line.end;
+): Required<CaretLocation> {
+  const lineIndex = caretLineIndex(lines, caret);
+  const line = lines[lineIndex];
+  if (!line) return { position: caret.position, lineIndex };
+  return { position: edge === 'start' ? line.start : line.end, lineIndex };
 }
 
 /** The next word boundary in `direction`, for a word-wise caret jump. */
@@ -128,9 +144,24 @@ export function wordBoundary(text: string, index: number, direction: -1 | 1): nu
   return direction < 0 ? Math.max(...candidates) : Math.min(...candidates);
 }
 
-function lineIndexAt(lines: readonly CaretLine[], position: number): number {
-  const index = lines.findIndex(
-    (line) => position >= line.start && position <= line.end
-  );
+export function caretLineIndex(
+  lines: readonly CaretLine[],
+  caret: CaretLocation
+): number {
+  const preferred = caret.lineIndex;
+  if (
+    preferred !== undefined &&
+    preferred >= 0 &&
+    preferred < lines.length &&
+    caret.position >= lines[preferred].start &&
+    caret.position <= lines[preferred].end
+  ) {
+    return preferred;
+  }
+  let index = -1;
+  for (let candidate = 0; candidate < lines.length; candidate += 1) {
+    const line = lines[candidate];
+    if (caret.position >= line.start && caret.position <= line.end) index = candidate;
+  }
   return index === -1 ? Math.max(0, lines.length - 1) : index;
 }
