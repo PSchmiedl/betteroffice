@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import type {
   PresentationHandle,
   ShapePrimitive,
+  SlidePrimitive,
   StorySnapshot,
   TextBoxPrimitive,
 } from '../index';
@@ -187,6 +188,43 @@ describe('PPTX wasm boundary', () => {
     source.dispose();
   });
 
+  test('paints the non-justified demo deck with one call per text run', async () => {
+    const source = openPresentation(fixture, {
+      clientId: 9013,
+      fonts: [{ family: 'Liberation Sans', bytes: fontBytes }],
+    });
+    const calls: Array<{ text: string; x: number; y: number }> = [];
+    const expected: Array<{ text: string; x: number; y: number }> = [];
+    const ctx = new Proxy(
+      {
+        fillText: (text: string, x: number, y: number) => calls.push({ text, x, y }),
+      } as Record<string, unknown>,
+      {
+        get(target, property) {
+          if (property in target) return target[property as string];
+          return () => undefined;
+        },
+        set(target, property, value) {
+          target[property as string] = value;
+          return true;
+        },
+      }
+    ) as unknown as CanvasRenderingContext2D;
+    try {
+      for (let slideIndex = 0; slideIndex < source.snapshot().slides.length; slideIndex += 1) {
+        const frame = source.layoutSlide(slideIndex);
+        expected.push(...oneCallPerTextRun(frame.primitives));
+        await paintSlide(ctx, frame);
+      }
+
+      expect(expected).toHaveLength(62);
+      expect(calls).toHaveLength(expected.length);
+      expect(calls).toEqual(expected);
+    } finally {
+      source.dispose();
+    }
+  });
+
   test('paints engine-produced justified word starts at caret positions', async () => {
     const source = openPresentation(fixture, {
       clientId: 9012,
@@ -365,4 +403,26 @@ function firstStory(shapes: Array<{ textStories: StorySnapshot[]; children: unkn
     if (shape.textStories[0]) return shape.textStories[0];
   }
   throw new Error('fixture has no text story');
+}
+
+function oneCallPerTextRun(
+  primitives: SlidePrimitive[]
+): Array<{ text: string; x: number; y: number }> {
+  const calls: Array<{ text: string; x: number; y: number }> = [];
+  for (const primitive of primitives) {
+    if (primitive.kind === 'textBox') {
+      for (const line of primitive.lines) {
+        for (const run of line.runs) calls.push({ text: run.text, x: run.x, y: line.baseline });
+      }
+    } else if (primitive.kind === 'chart') {
+      calls.push(...oneCallPerTextRun(primitive.primitives));
+    } else if (primitive.kind === 'placeholder' && primitive.label) {
+      calls.push({
+        text: primitive.label,
+        x: primitive.x + primitive.w / 2,
+        y: primitive.y + primitive.h / 2,
+      });
+    }
+  }
+  return calls;
 }

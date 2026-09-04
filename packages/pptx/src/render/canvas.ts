@@ -259,7 +259,7 @@ function positionedTextChunks(run: PositionedTextRun): Array<{ text: string; x: 
       textStart = offset;
       x = glyph.x;
     }
-    expectedX = glyph.x + glyph.advance;
+    expectedX = Math.fround(Math.fround(glyph.x) + Math.fround(glyph.advance));
   }
   chunks.push({ text: run.text.slice(textStart), x });
   return chunks;
