@@ -132,12 +132,12 @@ describe('PptxEditor caret painting', () => {
     paintSelection(
       ctx,
       frame,
-      { shapeId: 'shape', storyId: 'story', anchor: 5, focus: 5, focusLine: 1 },
+      { shapeId: 'shape', storyId: 'story', anchor: 5, focus: 5, focusLine: 0 },
       1,
       1
     );
 
-    expect(calls).toEqual([[20, 40, 1.5, 20]]);
+    expect(calls).toEqual([[120, 10, 1.5, 20]]);
   });
 
   it('stops caret blinking while blurred or hidden', async () => {
