@@ -4,8 +4,19 @@ use ooxml_drawingml::GeometryPathCommand;
 pub fn realize_geometry(section: &ResolvedSection) -> RealizedGeometry {
     let mut out = RealizedGeometry::default();
     let mut current = (0.0, 0.0);
-    let mut rows: Vec<&ResolvedRow> = section.rows.values().collect();
-    rows.sort_by(|left, right| row_order(&left.key).cmp(&row_order(&right.key)));
+    let rows: Vec<&ResolvedRow> = if section.row_order.is_empty() {
+        let mut rows: Vec<&ResolvedRow> = section.rows.values().collect();
+        rows.sort_by(|left, right| {
+            numeric_row_index(&left.key).cmp(&numeric_row_index(&right.key))
+        });
+        rows
+    } else {
+        section
+            .row_order
+            .iter()
+            .filter_map(|key| section.rows.get(key))
+            .collect()
+    };
     for row in rows {
         let ty = row.row_type.as_deref().unwrap_or("");
         if matches!(
@@ -135,7 +146,7 @@ pub fn realize_geometry(section: &ResolvedSection) -> RealizedGeometry {
 }
 
 /// Keys sort lexically, so `IX:10` would precede `IX:2` and displace relative rows.
-fn row_order(key: &str) -> (u32, &str) {
+fn numeric_row_index(key: &str) -> (u32, &str) {
     key.strip_prefix("IX:")
         .and_then(|index| index.parse().ok())
         .map_or((u32::MAX, key), |index| (index, ""))
@@ -530,6 +541,7 @@ mod tests {
         let section = ResolvedSection {
             name: "Geometry".into(),
             deleted: false,
+            row_order: vec![],
 
             rows: BTreeMap::from([
                 (
@@ -556,6 +568,7 @@ mod tests {
             let section = ResolvedSection {
                 name: "Geometry".into(),
                 deleted: false,
+                row_order: vec![],
                 rows: BTreeMap::from([(
                     "IX:0".into(),
                     resolved_row("MoveTo", vec![cell("X", value), cell("Y", "2")]),
@@ -579,6 +592,7 @@ mod tests {
         let section = ResolvedSection {
             name: "Geometry".into(),
             deleted: false,
+            row_order: vec![],
             rows: BTreeMap::from([
                 (
                     "IX:0".into(),
@@ -609,6 +623,7 @@ mod tests {
         let section = ResolvedSection {
             name: "Geometry".into(),
             deleted: false,
+            row_order: vec![],
             rows: BTreeMap::from([(
                 "IX:0".into(),
                 resolved_row(
@@ -633,6 +648,7 @@ mod tests {
         let section = ResolvedSection {
             name: "Geometry".into(),
             deleted: false,
+            row_order: vec![],
             rows: BTreeMap::from([(
                 "IX:0".into(),
                 resolved_row(
@@ -664,6 +680,7 @@ mod tests {
         let section = ResolvedSection {
             name: "Geometry".into(),
             deleted: false,
+            row_order: vec![],
             rows: BTreeMap::from([
                 (
                     "IX:0".into(),
@@ -691,6 +708,7 @@ mod tests {
         let section = ResolvedSection {
             name: "Geometry".into(),
             deleted: false,
+            row_order: vec![],
             rows: BTreeMap::from([
                 (
                     "IX:0".into(),
@@ -718,6 +736,7 @@ mod tests {
         let section = ResolvedSection {
             name: "Geometry".into(),
             deleted: false,
+            row_order: vec![],
             rows: BTreeMap::from([(
                 "IX:0".into(),
                 resolved_row(
@@ -764,6 +783,7 @@ mod tests {
         let section = ResolvedSection {
             name: "Geometry".into(),
             deleted: false,
+            row_order: vec![],
             rows: BTreeMap::from([(
                 "IX:0".into(),
                 resolved_row(
@@ -794,6 +814,7 @@ mod tests {
         let section = ResolvedSection {
             name: "Geometry".into(),
             deleted: false,
+            row_order: vec![],
             rows: BTreeMap::from([
                 (
                     "IX:0".into(),
@@ -838,6 +859,7 @@ mod tests {
         let section = ResolvedSection {
             name: "Geometry".into(),
             deleted: false,
+            row_order: vec![],
             rows: BTreeMap::from([
                 keyed("IX:1", "MoveTo", vec![cell("X", "0"), cell("Y", "0")]),
                 keyed("IX:2", "RelLineTo", vec![cell("X", "1"), cell("Y", "0")]),

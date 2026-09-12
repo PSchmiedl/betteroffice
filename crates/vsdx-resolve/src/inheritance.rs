@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashSet};
 
-use vsdx_parse::{Cell, Row, Section, Shape, Sheet, TextToken, VsdxPackage};
+use vsdx_parse::{
+    Cell, Row, Section, Shape, ShapeChild, Sheet, SheetChild, TextToken, VsdxPackage,
+};
 
 use crate::text::row_cells;
 use crate::{
@@ -18,12 +20,16 @@ impl<'a> Resolver<'a> {
     pub fn new(package: &'a VsdxPackage) -> Self {
         Self {
             package,
-            defaults: BTreeMap::new(),
+            defaults: documented_display_defaults(),
         }
     }
     pub fn with_defaults(mut self, defaults: impl IntoIterator<Item = Cell>) -> Self {
-        self.defaults = defaults.into_iter().map(|c| (c.name.clone(), c)).collect();
+        self.defaults
+            .extend(defaults.into_iter().map(|c| (c.name.clone(), c)));
         self
+    }
+    pub fn package(&self) -> &'a VsdxPackage {
+        self.package
     }
     pub fn resolve_shape(
         &self,
@@ -45,33 +51,104 @@ impl<'a> Resolver<'a> {
             .unwrap_or(page_contents);
         self.resolve_shape_ref(shape, page)
     }
+    pub fn resolve_shape_in_sheet(
+        &self,
+        shape: &Shape,
+        sheet: &Sheet,
+    ) -> Result<ResolvedShape, ResolveError> {
+        self.resolve_shape_ref(shape, sheet)
+    }
+    /// Resolves a page or document ShapeSheet with document-level inheritance.
+    pub fn resolve_sheet(&self, sheet: &Sheet) -> Result<ResolvedShape, ResolveError> {
+        let shape = Shape {
+            id: 0,
+            name: None,
+            name_u: None,
+            shape_type: None,
+            master: None,
+            master_shape: None,
+            line_style: None,
+            fill_style: None,
+            text_style: None,
+            children: sheet
+                .children
+                .iter()
+                .filter_map(|child| match child {
+                    SheetChild::Cell(cell) => Some(ShapeChild::Cell(cell.clone())),
+                    SheetChild::Section(section) => Some(ShapeChild::Section(section.clone())),
+                    _ => None,
+                })
+                .collect(),
+            del: false,
+            other_attrs: Vec::new(),
+        };
+        self.resolve_shape_ref(&shape, sheet)
+    }
+    pub fn resolve_page_shapes(
+        &self,
+        page_part: &str,
+    ) -> Result<BTreeMap<u32, ResolvedShape>, ResolveError> {
+        let page_contents = self
+            .package
+            .page_contents
+            .get(page_part)
+            .ok_or_else(|| ResolveError::MissingPage(page_part.into()))?;
+        let mut shapes = BTreeMap::new();
+        for shape in page_contents.shapes() {
+            self.resolve_page_shape_tree(page_part, shape, &mut shapes)?;
+        }
+        Ok(shapes)
+    }
+    fn resolve_page_shape_tree(
+        &self,
+        page_part: &str,
+        shape: &Shape,
+        shapes: &mut BTreeMap<u32, ResolvedShape>,
+    ) -> Result<(), ResolveError> {
+        shapes.insert(shape.id, self.resolve_shape(page_part, shape.id)?);
+        for child in shape.shapes() {
+            self.resolve_page_shape_tree(page_part, child, shapes)?;
+        }
+        Ok(())
+    }
     pub fn resolve_text(
         &self,
         shape: &Shape,
         page: &Sheet,
     ) -> Result<Vec<ResolvedTextToken>, ResolveError> {
         let resolved = self.resolve_shape_ref(shape, page)?;
-        Ok(shape
+        self.resolve_text_in_context(shape, page, &resolved)
+    }
+    pub fn resolve_text_in_context(
+        &self,
+        shape: &Shape,
+        page: &Sheet,
+        resolved: &ResolvedShape,
+    ) -> Result<Vec<ResolvedTextToken>, ResolveError> {
+        let masters = self.master_chain(shape, page)?;
+        let tokens = shape
             .text()
+            .or_else(|| masters.iter().find_map(|(_, master)| master.text()));
+        Ok(tokens
             .unwrap_or_default()
             .iter()
             .map(|token| match token {
                 TextToken::Literal(value) => ResolvedTextToken::Literal(value.clone()),
                 TextToken::CharacterRun(index) => ResolvedTextToken::CharacterRun {
                     index: *index,
-                    properties: row_cells(&resolved, "Character", *index),
+                    properties: row_cells(resolved, "Character", *index),
                 },
                 TextToken::ParagraphRun(index) => ResolvedTextToken::ParagraphRun {
                     index: *index,
-                    properties: row_cells(&resolved, "Paragraph", *index),
+                    properties: row_cells(resolved, "Paragraph", *index),
                 },
                 TextToken::Tab(index) => ResolvedTextToken::Tab {
                     index: *index,
-                    properties: row_cells(&resolved, "Tabs", *index),
+                    properties: row_cells(resolved, "Tabs", *index),
                 },
                 TextToken::Field(index) => ResolvedTextToken::Field {
                     index: *index,
-                    properties: row_cells(&resolved, "Field", *index),
+                    properties: row_cells(resolved, "Field", *index),
                 },
             })
             .collect())
@@ -87,7 +164,7 @@ impl<'a> Resolver<'a> {
                 ..Default::default()
             });
         }
-        let masters = self.master_chain(shape)?;
+        let masters = self.master_chain(shape, page)?;
         let styles = self.style_chains(shape, &masters)?;
         let mut names = HashSet::new();
         for source in std::iter::once(shape as &dyn HasCells)
@@ -141,13 +218,26 @@ impl<'a> Resolver<'a> {
         }
         Ok(out)
     }
-    fn master_chain(&self, shape: &Shape) -> Result<Vec<(Provenance, &'a Shape)>, ResolveError> {
+    fn master_chain(
+        &self,
+        shape: &Shape,
+        source_sheet: &'a Sheet,
+    ) -> Result<Vec<(Provenance, &'a Shape)>, ResolveError> {
         let mut out = Vec::new();
         let mut current = shape;
+        let mut current_sheet = source_sheet;
         let mut seen = HashSet::new();
         for depth in 0..MAX_INHERITANCE_DEPTH {
-            let Some(master_id) = current.master else {
-                return Ok(out);
+            let (master_id, master_shape, own_master) = match (current.master, current.master_shape)
+            {
+                (Some(master_id), master_shape) => (master_id, master_shape, true),
+                (None, Some(master_shape)) => {
+                    let Some(master_id) = self.enclosing_master(current_sheet, current.id) else {
+                        return Ok(out);
+                    };
+                    (master_id, Some(master_shape), false)
+                }
+                (None, None) => return Ok(out),
             };
             let Some(path) = self
                 .package
@@ -155,32 +245,48 @@ impl<'a> Resolver<'a> {
                 .iter()
                 .find_map(|(path, id)| (*id == master_id).then_some(path))
             else {
-                return Ok(out);
+                return Err(ResolveError::MissingMaster(master_id));
             };
             let Some(sheet) = self.package.master_contents.get(path) else {
-                return Ok(out);
+                return Err(ResolveError::MissingMaster(master_id));
             };
-            let id = current.master_shape.unwrap_or(master_id);
-            if !seen.insert((master_id, id)) {
-                return Err(ResolveError::Cycle(format!("master {master_id}/{id}")));
+            // MS-VSDX 2.2.2: an own MasterShape narrows within its own Master's root;
+            // an inherited one may name any shape in the master.
+            let (next, provenance) = if own_master {
+                let root = sheet.shapes().next();
+                match master_shape.and_then(|id| root.and_then(|root| find_shape_in(root, id))) {
+                    Some(shape) => (Some(shape), Provenance::MasterShape),
+                    None => (root, Provenance::Master),
+                }
+            } else {
+                (
+                    master_shape.and_then(|id| find_shape(sheet, id)),
+                    Provenance::MasterShape,
+                )
+            };
+            let Some(next) = next else {
+                return Err(ResolveError::MissingMaster(master_id));
+            };
+            if !seen.insert((master_id, next.id)) {
+                return Err(ResolveError::Cycle(format!(
+                    "master {master_id}/{}",
+                    next.id
+                )));
             }
-            let Some(next) = find_shape(sheet, id).or_else(|| find_shape(sheet, master_id)) else {
-                return Ok(out);
-            };
-            out.push((
-                if current.master_shape.is_some() {
-                    Provenance::MasterShape
-                } else {
-                    Provenance::Master
-                },
-                next,
-            ));
+            out.push((provenance, next));
             current = next;
+            current_sheet = sheet;
             if depth + 1 == MAX_INHERITANCE_DEPTH {
                 return Err(ResolveError::Cycle("maximum inheritance depth".into()));
             }
         }
         unreachable!()
+    }
+    fn enclosing_master(&self, sheet: &'a Sheet, shape_id: u32) -> Option<u32> {
+        let parent = enclosing_shape(sheet, shape_id)?;
+        parent
+            .master
+            .or_else(|| self.enclosing_master(sheet, parent.id))
     }
     fn style_chains(
         &self,
@@ -251,8 +357,20 @@ impl<'a> Resolver<'a> {
                 .as_ref()
                 .and_then(|s| s.cells().find(|c| c.name == name)),
         ));
+        let mut inherited = None;
         for (provenance, cell) in sources {
             if let Some(cell) = cell {
+                if cell
+                    .formula
+                    .as_deref()
+                    .is_some_and(|formula| formula.eq_ignore_ascii_case("Inh"))
+                {
+                    inherited.get_or_insert_with(|| ResolvedCell {
+                        cell: cell.clone(),
+                        provenance,
+                    });
+                    continue;
+                }
                 return found(cell, provenance);
             }
         }
@@ -263,6 +381,7 @@ impl<'a> Resolver<'a> {
                 provenance: Provenance::Default,
             })
             .map(Lookup::Found)
+            .or_else(|| inherited.map(Lookup::Found))
             .unwrap_or(Lookup::Absent)
     }
     fn resolve_section(
@@ -310,10 +429,13 @@ impl<'a> Resolver<'a> {
             }
             sources.truncate(position);
         }
-        let mut keys = HashSet::new();
+        let mut keys = Vec::new();
         for (_, section) in &sources {
-            if let Some(section) = section {
-                keys.extend(section.rows().map(row_key));
+            let Some(section) = section else { continue };
+            for key in row_keys(section) {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
             }
         }
         let mut out = ResolvedSection {
@@ -326,21 +448,29 @@ impl<'a> Resolver<'a> {
                 .map(|(p, section)| {
                     (
                         *p,
-                        section.and_then(|s| s.rows().find(|r| row_key(r) == key)),
+                        section.and_then(|s| {
+                            row_keys(s)
+                                .into_iter()
+                                .zip(s.rows())
+                                .find(|(row_key, _)| row_key == &key)
+                                .map(|(_, row)| row)
+                        }),
                     )
                 })
                 .collect();
             let row = rows.iter().find_map(|(_, row)| *row);
             let Some(row) = row else { continue };
+            let resolved_key = resolved_row_key(&key, &out.rows);
             if row.del {
                 out.rows.insert(
-                    key.clone(),
+                    resolved_key.clone(),
                     ResolvedRow {
-                        key,
+                        key: resolved_key.clone(),
                         deleted: true,
                         ..Default::default()
                     },
                 );
+                out.row_order.push(resolved_key);
                 continue;
             }
             let mut names = HashSet::new();
@@ -354,30 +484,69 @@ impl<'a> Resolver<'a> {
             }
             let mut cells = BTreeMap::new();
             for cell_name in names {
-                let lookup = rows
+                let mut inherited = None;
+                let mut lookup = None;
+                for (provenance, row) in rows
                     .iter()
                     .filter(|(_, row)| row.is_none_or(|row| !row.del))
-                    .find_map(|(p, row)| {
-                        row.and_then(|row| {
-                            row.cells()
-                                .find(|c| c.name == cell_name)
-                                .map(|c| found(c, *p))
-                        })
-                    });
+                {
+                    let Some(cell) =
+                        row.and_then(|row| row.cells().find(|cell| cell.name == cell_name))
+                    else {
+                        continue;
+                    };
+                    if cell
+                        .formula
+                        .as_deref()
+                        .is_some_and(|formula| formula.eq_ignore_ascii_case("Inh"))
+                    {
+                        inherited.get_or_insert_with(|| found(cell, *provenance));
+                        continue;
+                    }
+                    lookup = Some(found(cell, *provenance));
+                    break;
+                }
+                let lookup = lookup.or(inherited);
                 cells.insert(cell_name, lookup.unwrap_or(Lookup::Absent));
             }
             out.rows.insert(
-                key.clone(),
+                resolved_key.clone(),
                 ResolvedRow {
-                    key,
+                    key: resolved_key.clone(),
                     deleted: false,
                     row_type: row.row_type.clone(),
                     cells,
                 },
             );
+            out.row_order.push(resolved_key);
         }
         out
     }
+}
+
+/// Documented transform defaults: https://learn.microsoft.com/en-us/office/client-developer/visio/cells-visio-shapesheet-reference
+fn documented_display_defaults() -> BTreeMap<String, Cell> {
+    [
+        ("LocPinX", "Width * 0.5"),
+        ("LocPinY", "Height * 0.5"),
+        ("TxtPinX", "Width * 0.5"),
+        ("TxtPinY", "Height * 0.5"),
+    ]
+    .into_iter()
+    .map(|(name, formula)| {
+        (
+            name.into(),
+            Cell {
+                name: name.into(),
+                formula: Some(formula.into()),
+                value: None,
+                unit: None,
+                del: false,
+                other_attrs: Vec::new(),
+            },
+        )
+    })
+    .collect()
 }
 
 fn found(cell: &Cell, provenance: Provenance) -> Lookup {
@@ -391,16 +560,26 @@ fn found(cell: &Cell, provenance: Provenance) -> Lookup {
     }
 }
 fn find_shape(sheet: &Sheet, id: u32) -> Option<&Shape> {
-    let mut pending: Vec<&Shape> = sheet.shapes().collect();
-    let mut index = 0;
-    while let Some(shape) = pending.get(index).copied() {
-        index += 1;
-        if shape.id == id {
-            return Some(shape);
-        }
-        pending.extend(shape.shapes());
+    sheet.shapes().find_map(|shape| find_shape_in(shape, id))
+}
+fn find_shape_in(shape: &Shape, id: u32) -> Option<&Shape> {
+    if shape.id == id {
+        return Some(shape);
     }
-    None
+    shape.shapes().find_map(|child| find_shape_in(child, id))
+}
+fn enclosing_shape(sheet: &Sheet, id: u32) -> Option<&Shape> {
+    sheet
+        .shapes()
+        .find_map(|shape| enclosing_shape_in(shape, id))
+}
+fn enclosing_shape_in(shape: &Shape, id: u32) -> Option<&Shape> {
+    if shape.shapes().any(|child| child.id == id) {
+        return Some(shape);
+    }
+    shape
+        .shapes()
+        .find_map(|child| enclosing_shape_in(child, id))
 }
 fn based_on(sheet: &Sheet) -> Option<u32> {
     sheet
@@ -409,7 +588,7 @@ fn based_on(sheet: &Sheet) -> Option<u32> {
         .find(|(name, _)| name == "BasedOn")
         .and_then(|(_, value)| value.parse().ok())
 }
-/// Built-in ownership is from MS-VSDX ShapeSheet style-sheet cells; unlisted cells bypass styles.
+/// Classifies style-owned cells per MS-VSDX 2.2.5; Geometry never inherits styles.
 fn style_owner(name: &str) -> Option<Provenance> {
     const LINE: &[&str] = &[
         "LineColor",
@@ -422,6 +601,7 @@ fn style_owner(name: &str) -> Option<Provenance> {
         "EndArrowSize",
         "LineColorTrans",
         "LinePatternTrans",
+        "CompoundType",
         "Rounding",
         "LineGradientDir",
         "LineGradientAngle",
@@ -440,7 +620,14 @@ fn style_owner(name: &str) -> Option<Provenance> {
         "FillGradientStopCount",
         "ShdwForegnd",
         "ShdwForegndTrans",
+        "ShdwBkgnd",
+        "ShdwBkgndTrans",
         "ShdwPattern",
+        "ShdwOffsetX",
+        "ShdwOffsetY",
+        "ShdwType",
+        "ShdwObliqueAngle",
+        "ShdwScaleFactor",
         "ShapeShdwType",
         "ShapeShdwOffsetX",
         "ShapeShdwOffsetY",
@@ -449,6 +636,26 @@ fn style_owner(name: &str) -> Option<Provenance> {
         "Char",
         "Para",
         "Text",
+        "Font",
+        "Color",
+        "Size",
+        "Style",
+        "Case",
+        "Pos",
+        "FontScale",
+        "Letterspace",
+        "ColorTrans",
+        "Locale",
+        "HorzAlign",
+        "IndFirst",
+        "IndLeft",
+        "IndRight",
+        "SpLine",
+        "SpBefore",
+        "SpAfter",
+        "BulletStr",
+        "Bullet",
+        "Flags",
         "VerticalAlign",
         "TxtPinX",
         "TxtPinY",
@@ -502,10 +709,32 @@ impl HasSections for Sheet {
         Box::new(self.sections())
     }
 }
-fn row_key(row: &Row) -> String {
+fn row_base_key(row: &Row) -> String {
     row.name
         .clone()
         .map(|name| format!("N:{name}"))
         .or_else(|| row.index.map(|index| format!("IX:{index}")))
-        .unwrap_or_default()
+        .unwrap_or_else(|| "row".into())
+}
+
+fn row_keys(section: &Section) -> Vec<String> {
+    let mut occurrences = BTreeMap::new();
+    section
+        .rows()
+        .map(|row| {
+            let key = row_base_key(row);
+            let occurrence = occurrences.entry(key.clone()).or_insert(0usize);
+            let identity = format!("{key}\u{1f}{occurrence}");
+            *occurrence += 1;
+            identity
+        })
+        .collect()
+}
+fn resolved_row_key(identity: &str, rows: &BTreeMap<String, ResolvedRow>) -> String {
+    let (key, occurrence) = identity.rsplit_once('\u{1f}').unwrap_or((identity, "0"));
+    if !rows.contains_key(key) {
+        key.into()
+    } else {
+        format!("{key}\u{1f}{occurrence}")
+    }
 }

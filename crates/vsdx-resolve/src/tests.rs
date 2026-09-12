@@ -29,6 +29,17 @@ fn cell(name: &str, value: &str) -> Cell {
     }
 }
 
+fn formula_cell(name: &str, formula: &str) -> Cell {
+    Cell {
+        name: name.into(),
+        formula: Some(formula.into()),
+        value: None,
+        unit: None,
+        del: false,
+        other_attrs: vec![],
+    }
+}
+
 fn deleted_cell(name: &str) -> Cell {
     Cell {
         name: name.into(),
@@ -266,6 +277,17 @@ fn found<'a>(shape: &'a crate::ResolvedShape, name: &str) -> (&'a str, Provenanc
     }
 }
 
+fn found_row<'a>(
+    section: &'a crate::ResolvedSection,
+    row_key: &str,
+    name: &str,
+) -> (&'a str, Provenance) {
+    match section.rows[row_key].cells.get(name) {
+        Some(Lookup::Found(value)) => (value.cell.value.as_deref().unwrap(), value.provenance),
+        value => panic!("expected {row_key}.{name} to be found, got {value:?}"),
+    }
+}
+
 fn add_page(package: &mut VsdxPackage, value: Shape) {
     package.page_part_ids.insert("page".into(), 1);
     package.page_contents.insert(
@@ -293,12 +315,116 @@ fn add_master(package: &mut VsdxPackage, id: u32, value: Shape) {
     );
 }
 
+fn add_master_shapes(package: &mut VsdxPackage, id: u32, values: Vec<Shape>) {
+    let path = format!("master{id}");
+    package.master_part_ids.insert(path.clone(), id);
+    package.master_contents.insert(
+        path,
+        sheet(
+            None,
+            vec![SheetChild::Shapes(
+                values
+                    .into_iter()
+                    .map(vsdx_parse::ShapesChild::Shape)
+                    .collect(),
+            )],
+        ),
+    );
+}
+
+#[test]
+fn master_without_master_shape_inherits_from_master_root() {
+    let mut package = package();
+    let mut local = shape(10, vec![]);
+    local.master = Some(5);
+    add_page(&mut package, local);
+    add_master_shapes(
+        &mut package,
+        5,
+        vec![
+            shape(50, vec![ShapeChild::Cell(cell("PinX", "root"))]),
+            shape(51, vec![ShapeChild::Cell(cell("PinX", "other"))]),
+        ],
+    );
+
+    let resolved = Resolver::new(&package).resolve_shape("page", 10).unwrap();
+    assert_eq!(found(&resolved, "PinX"), ("root", Provenance::Master));
+}
+
+#[test]
+fn master_ignores_master_shape_and_inherits_from_master_root() {
+    let mut package = package();
+    let mut local = shape(10, vec![]);
+    local.master = Some(5);
+    local.master_shape = Some(51);
+    add_page(&mut package, local);
+    add_master_shapes(
+        &mut package,
+        5,
+        vec![
+            shape(50, vec![ShapeChild::Cell(cell("PinX", "root"))]),
+            shape(51, vec![ShapeChild::Cell(cell("PinX", "specified"))]),
+        ],
+    );
+
+    let resolved = Resolver::new(&package).resolve_shape("page", 10).unwrap();
+    assert_eq!(found(&resolved, "PinX"), ("root", Provenance::Master));
+}
+
+#[test]
+fn master_shape_inherits_from_the_enclosing_masters_subshape() {
+    let mut package = package();
+    let mut group = shape(
+        10,
+        vec![ShapeChild::Shapes(vec![vsdx_parse::ShapesChild::Shape(
+            shape(11, vec![]),
+        )])],
+    );
+    group.master = Some(5);
+    let ShapeChild::Shapes(children) = &mut group.children[0] else {
+        panic!("expected group children");
+    };
+    let vsdx_parse::ShapesChild::Shape(local) = &mut children[0] else {
+        panic!("expected local subshape");
+    };
+    local.master_shape = Some(51);
+    add_page(&mut package, group);
+    add_master_shapes(
+        &mut package,
+        5,
+        vec![shape(
+            50,
+            vec![ShapeChild::Shapes(vec![vsdx_parse::ShapesChild::Shape(
+                shape(51, vec![ShapeChild::Cell(cell("PinX", "subshape"))]),
+            )])],
+        )],
+    );
+
+    let resolved = Resolver::new(&package).resolve_shape("page", 11).unwrap();
+    assert_eq!(
+        found(&resolved, "PinX"),
+        ("subshape", Provenance::MasterShape)
+    );
+}
+
+#[test]
+fn missing_master_reports_a_diagnostic() {
+    let mut package = package();
+    let mut local = shape(10, vec![]);
+    local.master = Some(5);
+    add_page(&mut package, local);
+
+    assert_eq!(
+        Resolver::new(&package).resolve_shape("page", 10),
+        Err(ResolveError::MissingMaster(5))
+    );
+}
+
 #[test]
 fn master_inheritance_walks_deeply_and_local_overrides() {
     let mut package = package();
     let mut local = shape(10, vec![]);
     local.master = Some(1);
-    local.master_shape = Some(1);
     add_page(&mut package, local);
     let mut first = shape(1, vec![]);
     first.master = Some(2);
@@ -321,14 +447,13 @@ fn master_inheritance_walks_deeply_and_local_overrides() {
     assert_eq!(found(&resolved, "PinX"), ("furthest", Provenance::Master));
     let mut direct = shape(12, vec![]);
     direct.master = Some(3);
-    direct.master_shape = Some(3);
     add_page(&mut package, direct);
     assert_eq!(
         found(
             &Resolver::new(&package).resolve_shape("page", 12).unwrap(),
             "PinY"
         ),
-        ("master-shape", Provenance::MasterShape)
+        ("master-shape", Provenance::Master)
     );
 
     let mut local = shape(11, vec![ShapeChild::Cell(cell("PinX", "local"))]);
@@ -408,17 +533,391 @@ fn style_slices_and_based_on_chains_resolve_independently() {
 }
 
 #[test]
+fn inh_skips_each_inherited_layer_until_a_concrete_cell() {
+    let mut package = package();
+    let mut local = shape(1, vec![ShapeChild::Cell(formula_cell("PinX", "Inh"))]);
+    local.master = Some(1);
+    add_page(&mut package, local);
+    let mut master = shape(1, vec![ShapeChild::Cell(formula_cell("PinX", "Inh"))]);
+    master.master = Some(2);
+    add_master(&mut package, 1, master);
+    add_master(
+        &mut package,
+        2,
+        shape(2, vec![ShapeChild::Cell(cell("PinX", "4"))]),
+    );
+    let resolved = Resolver::new(&package).resolve_shape("page", 1).unwrap();
+    assert_eq!(found(&resolved, "PinX"), ("4", Provenance::Master));
+
+    package.style_sheets = vec![
+        Sheet {
+            id: Some(1),
+            children: vec![SheetChild::Cell(formula_cell("LineWeight", "Inh"))],
+            other_attrs: vec![("BasedOn".into(), "2".into())],
+        },
+        sheet(Some(2), vec![SheetChild::Cell(cell("LineWeight", "3"))]),
+    ];
+    let mut styled = shape(3, vec![ShapeChild::Cell(formula_cell("LineWeight", "Inh"))]);
+    styled.line_style = Some(1);
+    add_page(&mut package, styled);
+    let resolved = Resolver::new(&package).resolve_shape("page", 3).unwrap();
+    assert_eq!(found(&resolved, "LineWeight"), ("3", Provenance::StyleLine));
+
+    let unresolved = shape(4, vec![ShapeChild::Cell(formula_cell("PinY", "Inh"))]);
+    add_page(&mut package, unresolved);
+    let resolved = Resolver::new(&package).resolve_shape("page", 4).unwrap();
+    match &resolved.cells["PinY"] {
+        Lookup::Found(cell) => assert_eq!(cell.cell.formula.as_deref(), Some("Inh")),
+        value => panic!("expected unresolved Inh, got {value:?}"),
+    }
+
+    let defaulted = shape(5, vec![ShapeChild::Cell(formula_cell("LocPinX", "Inh"))]);
+    add_page(&mut package, defaulted);
+    let resolved = Resolver::new(&package).resolve_shape("page", 5).unwrap();
+    match &resolved.cells["LocPinX"] {
+        Lookup::Found(cell) => {
+            assert_eq!(cell.cell.formula.as_deref(), Some("Width * 0.5"));
+            assert_eq!(cell.provenance, Provenance::Default);
+        }
+        value => panic!("expected documented default, got {value:?}"),
+    }
+
+    let concrete = shape(6, vec![ShapeChild::Cell(formula_cell("LocPinX", "Inh"))]);
+    add_page(&mut package, concrete);
+    package
+        .document_sheet
+        .get_or_insert_with(|| sheet(None, vec![]))
+        .children
+        .push(SheetChild::Cell(cell("LocPinX", "7")));
+    let resolved = Resolver::new(&package).resolve_shape("page", 6).unwrap();
+    assert_eq!(found(&resolved, "LocPinX"), ("7", Provenance::Document));
+}
+
+#[test]
+fn inherited_master_cell_beats_documented_default() {
+    let mut package = package();
+    let mut local = shape(1, vec![ShapeChild::Cell(formula_cell("LocPinX", "Inh"))]);
+    local.master = Some(1);
+    add_page(&mut package, local);
+    add_master(
+        &mut package,
+        1,
+        shape(1, vec![ShapeChild::Cell(cell("LocPinX", "master"))]),
+    );
+
+    let resolved = Resolver::new(&package).resolve_shape("page", 1).unwrap();
+    assert_eq!(found(&resolved, "LocPinX"), ("master", Provenance::Master));
+}
+
+#[test]
+fn geometry_rows_without_ix_all_realize_in_source_order() {
+    let package = parse_vsdx(include_bytes!(
+        "../../vsdx-parse/tests/fixtures/geometry-anonymous-rows.vsdx"
+    ))
+    .unwrap();
+    let page = &package.page_part_paths[0];
+    let resolved = Resolver::new(&package).resolve_shape(page, 1).unwrap();
+    let section = &resolved.sections["Geometry"];
+    assert_eq!(section.row_order.len(), 2);
+    let geometry = crate::realize_geometry(section);
+    assert_eq!(
+        geometry.commands,
+        vec![
+            ooxml_drawingml::GeometryPathCommand::Move { x: 1.0, y: 2.0 },
+            ooxml_drawingml::GeometryPathCommand::Line { x: 3.0, y: 4.0 },
+        ]
+    );
+}
+
+#[test]
+fn geometry_rows_with_duplicate_ix_all_realize_in_source_order() {
+    let package = parse_vsdx(include_bytes!(
+        "../../vsdx-parse/tests/fixtures/geometry-duplicate-ix-rows.vsdx"
+    ))
+    .unwrap();
+    let page = &package.page_part_paths[0];
+    let resolved = Resolver::new(&package).resolve_shape(page, 1).unwrap();
+    let section = &resolved.sections["Geometry"];
+    assert_eq!(section.row_order.len(), 2);
+    let geometry = crate::realize_geometry(section);
+    assert_eq!(
+        geometry.commands,
+        vec![
+            ooxml_drawingml::GeometryPathCommand::Move { x: 1.0, y: 2.0 },
+            ooxml_drawingml::GeometryPathCommand::Line { x: 3.0, y: 4.0 },
+        ]
+    );
+}
+
+#[test]
+fn section_rows_inherit_by_name_or_ix_and_preserve_duplicate_occurrences() {
+    let mut package = package();
+    let mut local = shape(
+        1,
+        vec![ShapeChild::Section(section(
+            "Geometry",
+            vec![row(1, vec![cell("X", "local-one")])],
+        ))],
+    );
+    local.master = Some(1);
+    add_page(&mut package, local);
+    add_master(
+        &mut package,
+        1,
+        shape(
+            1,
+            vec![ShapeChild::Section(section(
+                "Geometry",
+                vec![
+                    row(0, vec![cell("X", "master-zero")]),
+                    row(1, vec![cell("X", "master-one")]),
+                ],
+            ))],
+        ),
+    );
+    let resolved = Resolver::new(&package).resolve_shape("page", 1).unwrap();
+    let geometry = &resolved.sections["Geometry"];
+    assert_eq!(geometry.row_order, vec!["IX:1", "IX:0"]);
+    assert_eq!(
+        found_row(geometry, "IX:1", "X"),
+        ("local-one", Provenance::Local)
+    );
+    assert_eq!(
+        found_row(geometry, "IX:0", "X"),
+        ("master-zero", Provenance::Master)
+    );
+
+    let mut reordered = shape(
+        2,
+        vec![ShapeChild::Section(section(
+            "Geometry",
+            vec![
+                row(0, vec![cell("X", "local-zero")]),
+                row(1, vec![cell("X", "local-one")]),
+            ],
+        ))],
+    );
+    reordered.master = Some(2);
+    add_page(&mut package, reordered);
+    add_master(
+        &mut package,
+        2,
+        shape(
+            2,
+            vec![ShapeChild::Section(section(
+                "Geometry",
+                vec![
+                    row(1, vec![cell("X", "master-one")]),
+                    row(0, vec![cell("X", "master-zero")]),
+                ],
+            ))],
+        ),
+    );
+    let resolved = Resolver::new(&package).resolve_shape("page", 2).unwrap();
+    let geometry = &resolved.sections["Geometry"];
+    assert_eq!(
+        found_row(geometry, "IX:0", "X"),
+        ("local-zero", Provenance::Local)
+    );
+    assert_eq!(
+        found_row(geometry, "IX:1", "X"),
+        ("local-one", Provenance::Local)
+    );
+
+    let mut named = row(0, vec![cell("X", "local")]);
+    named.name = Some("TextPosition".into());
+    let mut local = shape(
+        3,
+        vec![ShapeChild::Section(section("Character", vec![named]))],
+    );
+    local.master = Some(3);
+    add_page(&mut package, local);
+    let mut named = row(7, vec![cell("X", "master")]);
+    named.name = Some("TextPosition".into());
+    add_master(
+        &mut package,
+        3,
+        shape(
+            3,
+            vec![ShapeChild::Section(section("Character", vec![named]))],
+        ),
+    );
+    let resolved = Resolver::new(&package).resolve_shape("page", 3).unwrap();
+    assert_eq!(
+        found_row(&resolved.sections["Character"], "N:TextPosition", "X"),
+        ("local", Provenance::Local)
+    );
+}
+
+#[test]
+fn unequal_duplicate_and_anonymous_rows_preserve_each_occurrence() {
+    for anonymous in [false, true] {
+        let mut first_package = package();
+        let mut local_row = row(0, vec![cell("X", "local-first")]);
+        let mut master_second = row(0, vec![cell("X", "master-second")]);
+        if anonymous {
+            local_row.index = None;
+            master_second.index = None;
+        }
+        let mut local = shape(
+            1,
+            vec![ShapeChild::Section(section("Geometry", vec![local_row]))],
+        );
+        local.master = Some(1);
+        add_page(&mut first_package, local);
+        let mut master_first = row(0, vec![cell("X", "master-first")]);
+        if anonymous {
+            master_first.index = None;
+        }
+        add_master(
+            &mut first_package,
+            1,
+            shape(
+                1,
+                vec![ShapeChild::Section(section(
+                    "Geometry",
+                    vec![master_first, master_second],
+                ))],
+            ),
+        );
+        let first_section = &Resolver::new(&first_package)
+            .resolve_shape("page", 1)
+            .unwrap()
+            .sections["Geometry"];
+        assert_eq!(first_section.row_order.len(), 2);
+        assert_eq!(
+            found_row(first_section, &first_section.row_order[0], "X").0,
+            "local-first"
+        );
+        assert_eq!(
+            found_row(first_section, &first_section.row_order[1], "X").0,
+            "master-second"
+        );
+
+        let mut package = package();
+        let mut first = row(0, vec![cell("X", "local-first")]);
+        let mut second = row(0, vec![cell("X", "local-second")]);
+        if anonymous {
+            first.index = None;
+            second.index = None;
+        }
+        let mut local = shape(
+            1,
+            vec![ShapeChild::Section(section(
+                "Geometry",
+                vec![first, second],
+            ))],
+        );
+        local.master = Some(1);
+        add_page(&mut package, local);
+        let mut master = row(0, vec![cell("X", "master-first")]);
+        if anonymous {
+            master.index = None;
+        }
+        add_master(
+            &mut package,
+            1,
+            shape(
+                1,
+                vec![ShapeChild::Section(section("Geometry", vec![master]))],
+            ),
+        );
+        let section = &Resolver::new(&package)
+            .resolve_shape("page", 1)
+            .unwrap()
+            .sections["Geometry"];
+        assert_eq!(section.row_order.len(), 2);
+        assert_eq!(
+            found_row(section, &section.row_order[0], "X").0,
+            "local-first"
+        );
+        assert_eq!(
+            found_row(section, &section.row_order[1], "X").0,
+            "local-second"
+        );
+    }
+}
+
+#[test]
+fn inh_section_cells_skip_to_master_and_text_style() {
+    let mut package = package();
+    let mut local = shape(
+        1,
+        vec![ShapeChild::Section(section(
+            "Geometry",
+            vec![row(0, vec![formula_cell("X", "Inh")])],
+        ))],
+    );
+    local.master = Some(1);
+    add_master(
+        &mut package,
+        1,
+        shape(
+            1,
+            vec![ShapeChild::Section(section(
+                "Geometry",
+                vec![row(0, vec![cell("X", "4")])],
+            ))],
+        ),
+    );
+    package.style_sheets = vec![sheet(
+        Some(2),
+        vec![SheetChild::Section(section(
+            "Character",
+            vec![row(0, vec![cell("Font", "3")])],
+        ))],
+    )];
+    let mut styled = shape(
+        2,
+        vec![ShapeChild::Section(section(
+            "Character",
+            vec![row(0, vec![formula_cell("Font", "Inh")])],
+        ))],
+    );
+    styled.text_style = Some(2);
+    package.page_part_ids.insert("page".into(), 1);
+    package.page_contents.insert(
+        "page".into(),
+        sheet(
+            None,
+            vec![SheetChild::Shapes(vec![
+                vsdx_parse::ShapesChild::Shape(local),
+                vsdx_parse::ShapesChild::Shape(styled),
+            ])],
+        ),
+    );
+
+    let resolver = Resolver::new(&package);
+    let geometry = resolver.resolve_shape("page", 1).unwrap();
+    match &geometry.sections["Geometry"].rows["IX:0"].cells["X"] {
+        Lookup::Found(value) => {
+            assert_eq!(value.cell.value.as_deref(), Some("4"));
+            assert_eq!(value.provenance, Provenance::Master);
+        }
+        value => panic!("expected inherited geometry cell, got {value:?}"),
+    }
+    let character = resolver.resolve_shape("page", 2).unwrap();
+    match &character.sections["Character"].rows["IX:0"].cells["Font"] {
+        Lookup::Found(value) => {
+            assert_eq!(value.cell.value.as_deref(), Some("3"));
+            assert_eq!(value.provenance, Provenance::StyleText);
+        }
+        value => panic!("expected inherited character cell, got {value:?}"),
+    }
+}
+
+#[test]
 fn deletions_block_inheritance_while_absence_inherits() {
     let mut package = package();
     let mut master = shape(
-        1,
+        100,
         vec![
             ShapeChild::Cell(cell("PinX", "master")),
             ShapeChild::Section(section("Geometry", vec![row(0, vec![cell("X", "1")])])),
         ],
     );
     master.master = None;
-    add_master(&mut package, 1, master);
+    add_master_shapes(&mut package, 1, vec![master]);
     for (id, local) in [
         (1, shape(1, vec![ShapeChild::Cell(deleted_cell("PinX"))])),
         (
@@ -615,6 +1114,55 @@ fn text_markers_fields_and_style_rows_are_merged() {
 }
 
 #[test]
+fn text_uses_effective_page_or_document_rows_and_master_stream() {
+    let mut package = package();
+    package.page_sheets.insert(
+        1,
+        sheet(
+            Some(1),
+            vec![SheetChild::Section(section(
+                "Character",
+                vec![row(0, vec![cell("Font", "page")])],
+            ))],
+        ),
+    );
+    package.document_sheet = Some(sheet(
+        None,
+        vec![SheetChild::Section(section(
+            "Paragraph",
+            vec![row(0, vec![cell("IndLeft", "document")])],
+        ))],
+    ));
+    let mut local = shape(1, vec![]);
+    local.master = Some(7);
+    add_page(&mut package, local.clone());
+    add_master(
+        &mut package,
+        7,
+        shape(
+            7,
+            vec![ShapeChild::Text(vec![
+                TextToken::CharacterRun(0),
+                TextToken::Literal("master text".into()),
+                TextToken::ParagraphRun(0),
+            ])],
+        ),
+    );
+    let page = package.page_sheets.get(&1).unwrap();
+    let resolved = Resolver::new(&package).resolve_shape("page", 1).unwrap();
+    let tokens = Resolver::new(&package)
+        .resolve_text_in_context(&local, page, &resolved)
+        .unwrap();
+    assert!(
+        matches!(tokens[0], ResolvedTextToken::CharacterRun { ref properties, .. } if matches!(&properties["Font"], Lookup::Found(cell) if cell.cell.value.as_deref() == Some("page")))
+    );
+    assert_eq!(tokens[1], ResolvedTextToken::Literal("master text".into()));
+    assert!(
+        matches!(tokens[2], ResolvedTextToken::ParagraphRun { ref properties, .. } if matches!(&properties["IndLeft"], Lookup::Found(cell) if cell.cell.value.as_deref() == Some("document")))
+    );
+}
+
+#[test]
 fn style_references_supplied_by_a_master_are_consulted() {
     let mut package = package();
     package.style_sheets = vec![
@@ -692,6 +1240,37 @@ fn nested_group_members_and_nested_master_shapes_resolve() {
         found(&resolved, "PinY"),
         ("nested-master", Provenance::MasterShape)
     );
+}
+
+#[test]
+fn section_references_use_one_based_indices_and_user_values() {
+    let mut package = package();
+    let scratch = row(0, vec![cell("X", "3")]);
+    let mut user = row(0, vec![cell("Value", "4")]);
+    user.name = Some("ScaleFactor".into());
+    let character = row(0, vec![cell("Case", "5")]);
+    let shape = shape(
+        1,
+        vec![
+            ShapeChild::Section(section("Scratch", vec![scratch])),
+            ShapeChild::Section(section("User", vec![user])),
+            ShapeChild::Section(section("Character", vec![character])),
+        ],
+    );
+    add_page(&mut package, shape);
+    let resolved = Resolver::new(&package).resolve_shape("page", 1).unwrap();
+    assert!(matches!(
+        resolved.cell("Scratch.X1"),
+        Some(Lookup::Found(_))
+    ));
+    assert!(matches!(
+        resolved.cell("User.ScaleFactor"),
+        Some(Lookup::Found(_))
+    ));
+    assert!(matches!(
+        resolved.cell("Character.Case"),
+        Some(Lookup::Found(_))
+    ));
 }
 
 #[test]

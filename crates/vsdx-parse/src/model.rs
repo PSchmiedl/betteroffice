@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use ooxml_drawingml::Theme;
 use serde::{Deserialize, Serialize};
 
 use crate::{Relationship, Sheet, XmlRecord};
@@ -13,6 +14,8 @@ pub struct VsdxPackage {
     pub page_part_paths: Vec<String>,
     pub master_part_paths: Vec<String>,
     pub theme_part_paths: Vec<String>,
+    #[serde(default)]
+    pub themes: BTreeMap<u32, Theme>,
     pub windows_part_path: Option<String>,
     pub relationships: BTreeMap<String, Vec<Relationship>>,
     pub document_sheet: Option<Sheet>,
@@ -21,7 +24,9 @@ pub struct VsdxPackage {
     pub face_names: Vec<XmlRecord>,
     pub page_sheets: BTreeMap<u32, Sheet>,
     pub master_sheets: BTreeMap<u32, Sheet>,
+    /// Catalogued Page ID for each page-content part.
     pub page_part_ids: BTreeMap<String, u32>,
+    /// Catalogued Master ID for each master-content part.
     pub master_part_ids: BTreeMap<String, u32>,
     pub page_contents: BTreeMap<String, Sheet>,
     pub master_contents: BTreeMap<String, Sheet>,
@@ -43,6 +48,13 @@ impl VsdxPackage {
         };
         part.bytes = bytes;
         true
+    }
+
+    pub fn add_part(&mut self, path: impl Into<String>, bytes: Vec<u8>) {
+        self.parts.push(PackagePart {
+            path: path.into(),
+            bytes,
+        });
     }
 }
 
