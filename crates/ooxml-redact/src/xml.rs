@@ -35,6 +35,7 @@ pub(crate) fn redact_xml_with_styles(
         styles,
         current_style: None,
         cell_type: None,
+        custom_property: 0,
     };
     let mut skipped_depth = 0;
 
@@ -171,6 +172,7 @@ struct RewriteState<'a> {
     styles: &'a StyleMap,
     current_style: Option<String>,
     cell_type: Option<String>,
+    custom_property: usize,
 }
 
 fn rewrite_start(
@@ -183,6 +185,20 @@ fn rewrite_start(
     let path = state.path;
     let schema = schema_node(path, reader, start.name());
     let word = format == Format::Docx && word_node(reader, start.name());
+    let custom_property = path == "docprops/custom.xml"
+        && element == "property"
+        && matches!(reader.resolver().resolve_element(start.name()).0,
+            ResolveResult::Bound(ns) if matches!(ns.as_ref(),
+                b"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
+                | b"http://purl.oclc.org/ooxml/officeDocument/customProperties"));
+    if custom_property {
+        state.custom_property += 1;
+    }
+    let modern_comment = format == Format::Docx
+        && element == "commentExtensible"
+        && matches!(reader.resolver().resolve_element(start.name()).0,
+            ResolveResult::Bound(ns) if ns.as_ref()
+                == b"http://schemas.microsoft.com/office/word/2018/wordml/cex");
     let mut attributes = Vec::new();
     for attribute in start.attributes() {
         let attribute = attribute.map_err(|error| xml_error(path, error))?;
@@ -245,6 +261,16 @@ fn rewrite_start(
         let replacement =
             if external && is_unqualified(&key) && local.eq_ignore_ascii_case("Target") {
                 Some("https://example.com".to_owned())
+            } else if custom_property && key == "name" {
+                Some(format!("RedactedProperty{}", state.custom_property))
+            } else if word && local == "date" && word_attribute(reader, &key)
+                || modern_comment
+                    && local == "dateUtc"
+                    && matches!(reader.resolver().resolve_attribute(QName(key.as_bytes())).0,
+                        ResolveResult::Bound(ns) if ns.as_ref()
+                            == b"http://schemas.microsoft.com/office/word/2018/wordml/cex")
+            {
+                Some("1970-01-01T00:00:00Z".to_owned())
             } else if style_replacement.is_some() {
                 style_replacement
             } else if instance && local == "nil" {
