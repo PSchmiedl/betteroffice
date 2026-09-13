@@ -67,9 +67,9 @@ impl<'a> Resolver<'a> {
             shape_type: None,
             master: None,
             master_shape: None,
-            line_style: None,
-            fill_style: None,
-            text_style: None,
+            line_style: style_attribute(sheet, "LineStyle"),
+            fill_style: style_attribute(sheet, "FillStyle"),
+            text_style: style_attribute(sheet, "TextStyle"),
             children: sheet
                 .children
                 .iter()
@@ -93,21 +93,27 @@ impl<'a> Resolver<'a> {
             .page_contents
             .get(page_part)
             .ok_or_else(|| ResolveError::MissingPage(page_part.into()))?;
+        let page = self
+            .package
+            .page_part_ids
+            .get(page_part)
+            .and_then(|id| self.package.page_sheets.get(id))
+            .unwrap_or(page_contents);
         let mut shapes = BTreeMap::new();
         for shape in page_contents.shapes() {
-            self.resolve_page_shape_tree(page_part, shape, &mut shapes)?;
+            self.resolve_page_shape_tree(shape, page, &mut shapes)?;
         }
         Ok(shapes)
     }
     fn resolve_page_shape_tree(
         &self,
-        page_part: &str,
         shape: &Shape,
+        page: &Sheet,
         shapes: &mut BTreeMap<u32, ResolvedShape>,
     ) -> Result<(), ResolveError> {
-        shapes.insert(shape.id, self.resolve_shape(page_part, shape.id)?);
+        shapes.insert(shape.id, self.resolve_shape_ref(shape, page)?);
         for child in shape.shapes() {
-            self.resolve_page_shape_tree(page_part, child, shapes)?;
+            self.resolve_page_shape_tree(child, page, shapes)?;
         }
         Ok(())
     }
@@ -208,12 +214,16 @@ impl<'a> Resolver<'a> {
                     .map(|s| s as &dyn HasSections),
             )
         {
-            sections.extend(source.sections().map(|s| s.name.clone()));
+            sections.extend(
+                source
+                    .sections()
+                    .map(|s| (s.name.clone(), s.index.unwrap_or(0))),
+            );
         }
-        for section in sections {
+        for (section, index) in sections {
             out.sections.insert(
-                section.clone(),
-                self.resolve_section(shape, &masters, &styles, page, &section),
+                crate::section_key(&section, Some(index)),
+                self.resolve_section(shape, &masters, &styles, page, &section, index),
             );
         }
         Ok(out)
@@ -250,8 +260,6 @@ impl<'a> Resolver<'a> {
             let Some(sheet) = self.package.master_contents.get(path) else {
                 return Err(ResolveError::MissingMaster(master_id));
             };
-            // MS-VSDX 2.2.2: an own MasterShape narrows within its own Master's root;
-            // an inherited one may name any shape in the master.
             let (next, provenance) = if own_master {
                 let root = sheet.shapes().next();
                 match master_shape.and_then(|id| root.and_then(|root| find_shape_in(root, id))) {
@@ -391,30 +399,43 @@ impl<'a> Resolver<'a> {
         styles: &[(Provenance, Vec<&'a Sheet>)],
         page: &Sheet,
         name: &str,
+        index: u32,
     ) -> ResolvedSection {
-        let mut sources: Vec<(Provenance, Option<&Section>)> =
-            vec![(Provenance::Local, shape.sections().find(|s| s.name == name))];
-        sources.extend(
-            masters
-                .iter()
-                .map(|(p, s)| (*p, s.sections().find(|v| v.name == name))),
-        );
+        let mut sources: Vec<(Provenance, Option<&Section>)> = vec![(
+            Provenance::Local,
+            shape
+                .sections()
+                .find(|s| s.name == name && s.index.unwrap_or(0) == index),
+        )];
+        sources.extend(masters.iter().map(|(p, s)| {
+            (
+                *p,
+                s.sections()
+                    .find(|v| v.name == name && v.index.unwrap_or(0) == index),
+            )
+        }));
         if (name == "Character" || name == "Paragraph" || name == "Tabs" || name == "Field")
             && let Some((p, chain)) = styles.iter().find(|(p, _)| *p == Provenance::StyleText)
         {
-            sources.extend(
-                chain
-                    .iter()
-                    .map(|s| (*p, s.sections().find(|v| v.name == name))),
-            );
+            sources.extend(chain.iter().map(|s| {
+                (
+                    *p,
+                    s.sections()
+                        .find(|v| v.name == name && v.index.unwrap_or(0) == index),
+                )
+            }));
         }
-        sources.push((Provenance::Page, page.sections().find(|s| s.name == name)));
+        sources.push((
+            Provenance::Page,
+            page.sections()
+                .find(|s| s.name == name && s.index.unwrap_or(0) == index),
+        ));
         sources.push((
             Provenance::Document,
-            self.package
-                .document_sheet
-                .as_ref()
-                .and_then(|s| s.sections().find(|s| s.name == name)),
+            self.package.document_sheet.as_ref().and_then(|s| {
+                s.sections()
+                    .find(|s| s.name == name && s.index.unwrap_or(0) == index)
+            }),
         ));
         if let Some(position) = sources
             .iter()
@@ -423,6 +444,9 @@ impl<'a> Resolver<'a> {
             if position == 0 {
                 return ResolvedSection {
                     name: name.into(),
+                    index: sources
+                        .iter()
+                        .find_map(|(_, section)| section.and_then(|section| section.index)),
                     deleted: true,
                     ..Default::default()
                 };
@@ -440,6 +464,10 @@ impl<'a> Resolver<'a> {
         }
         let mut out = ResolvedSection {
             name: name.into(),
+            index: sources
+                .iter()
+                .find_map(|(_, section)| section.and_then(|section| section.index)),
+            unsupported_controls: unsupported_geometry_controls(name, &sources),
             ..Default::default()
         };
         for key in keys {
@@ -524,6 +552,64 @@ impl<'a> Resolver<'a> {
     }
 }
 
+fn unsupported_geometry_controls(
+    name: &str,
+    sources: &[(Provenance, Option<&Section>)],
+) -> Vec<String> {
+    if name != "Geometry" {
+        return Vec::new();
+    }
+    let mut unsupported = Vec::new();
+    for control in ["NoFill", "NoLine", "NoShow"] {
+        for (_, section) in sources {
+            let Some(section) = section else { continue };
+            let Some(cell) = section.children.iter().find_map(|child| match child {
+                vsdx_parse::SectionChild::Unknown(cell)
+                    if cell.name.rsplit(':').next() == Some("Cell")
+                        && cell
+                            .attributes
+                            .iter()
+                            .any(|(key, value)| key == "N" && value == control) =>
+                {
+                    Some(cell)
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            let attribute = |name: &str| {
+                cell.attributes
+                    .iter()
+                    .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+            };
+            if attribute("F").is_some_and(|formula| formula.eq_ignore_ascii_case("Inh")) {
+                continue;
+            }
+            if attribute("Del") == Some("1") {
+                break;
+            }
+            let formula = attribute("F").or_else(|| attribute("V"));
+            let zero = formula.is_some_and(|formula| {
+                formula.eq_ignore_ascii_case("FALSE")
+                    || vsdx_formula::evaluate_number(
+                        formula,
+                        vsdx_formula::Limits {
+                            max_depth: 256,
+                            max_nodes: 8192,
+                            max_tokens: 16384,
+                        },
+                        &mut |_| None,
+                    ) == Some(0.0)
+            });
+            if !zero {
+                unsupported.push(control.to_owned());
+            }
+            break;
+        }
+    }
+    unsupported
+}
+
 /// Documented transform defaults: https://learn.microsoft.com/en-us/office/client-developer/visio/cells-visio-shapesheet-reference
 fn documented_display_defaults() -> BTreeMap<String, Cell> {
     [
@@ -586,6 +672,13 @@ fn based_on(sheet: &Sheet) -> Option<u32> {
         .other_attrs
         .iter()
         .find(|(name, _)| name == "BasedOn")
+        .and_then(|(_, value)| value.parse().ok())
+}
+fn style_attribute(sheet: &Sheet, attribute: &str) -> Option<u32> {
+    sheet
+        .other_attrs
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(attribute))
         .and_then(|(_, value)| value.parse().ok())
 }
 /// Classifies style-owned cells per MS-VSDX 2.2.5; Geometry never inherits styles.

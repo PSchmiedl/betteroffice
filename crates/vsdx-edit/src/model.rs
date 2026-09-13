@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
-use vsdx_parse::{CellLocator, CellRow, CellSheet, SemanticCellEdit};
+use vsdx_parse::{CellLocator, CellRow, CellSheet};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,8 +36,11 @@ pub struct CellSnapshot {
         deserialize_with = "deserialize_cell_locator"
     )]
     pub locator: CellLocator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_type: Option<String>,
     pub name: String,
     pub formula: Option<String>,
+    #[serde(default)]
     pub value: Option<String>,
 }
 
@@ -85,28 +88,9 @@ pub struct ShapeReceipt {
     pub to_index: Option<u32>,
 }
 
-/// A shape that exists only in the session, so a save must insert it into the package.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddedShape {
-    pub page_id: String,
-    pub source_page_id: u32,
-    pub shape_id: String,
-    pub name: Option<String>,
-    pub cells: Vec<CellSnapshot>,
-}
-
-/// The whole of a session's divergence from its package, partitioned by how a save applies it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SessionExport {
-    pub cell_edits: Vec<SemanticCellEdit>,
-    pub added_shapes: Vec<AddedShape>,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeDraft {
-    pub source_id: u32,
     pub name: Option<String>,
     pub cells: Vec<CellSnapshot>,
 }
@@ -132,6 +116,8 @@ struct SnapshotCellLocator {
     sheet: SnapshotCellSheet,
     shape_id: Option<u32>,
     section: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    section_index: Option<u32>,
     row: Option<SnapshotCellRow>,
     cell_name: String,
 }
@@ -146,6 +132,7 @@ impl From<&CellLocator> for SnapshotCellLocator {
             },
             shape_id: locator.shape_id,
             section: locator.section.clone(),
+            section_index: locator.section_index,
             row: locator.row.as_ref().map(|row| match row {
                 CellRow::Index(id) => SnapshotCellRow::Index(*id),
                 CellRow::Name(name) => SnapshotCellRow::Name(name.clone()),
@@ -165,6 +152,7 @@ impl From<SnapshotCellLocator> for CellLocator {
             },
             shape_id: locator.shape_id,
             section: locator.section,
+            section_index: locator.section_index,
             row: locator.row.map(|row| match row {
                 SnapshotCellRow::Index(id) => CellRow::Index(id),
                 SnapshotCellRow::Name(name) => CellRow::Name(name),

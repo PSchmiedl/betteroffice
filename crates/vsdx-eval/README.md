@@ -19,10 +19,10 @@ theme are present.
 The following residual categories are intentionally outside this profile:
 
 - Event cells (937): event and recalculation plumbing is not display evaluation.
-- `Inh` in raw catalog sheets (500): catalog sheets have no inheritance graph, so
-  resolving these values would manufacture results.
-- Missing `DocLangID` (325): locale-sensitive evaluation is not attempted without
-  the required document language context.
+- `Inh` has no concrete inherited value (825): catalog sheets have no inheritance
+  graph, so resolving these values would manufacture results, and inheritance chains
+  that exhaust before reaching a concrete value — including the `DocLangID` locale
+  cells — have nothing to return.
 - `THEMEVAL` without host context or a theme (306): theme values require both to be
   meaningful.
 - `SHADE` and `LUMDIFF`: their Visio semantics are undocumented, so they remain
@@ -36,9 +36,9 @@ The corpus harness compares evaluated formulas with Visio's cell `@V` cache,
 interpreting `@V` using its `@U` display unit before comparison. Numeric agreement
 requires both equal canonical magnitudes and equal dimensions. Those cache values
 may be stale; the reported agreement rate is an imperfect compatibility signal,
-not proof of exact Visio compatibility. Evaluator coverage is 3,679/6,992 corpus
-formulas (52.62%). Of those evaluated formulas, 3,670 have a comparable Visio
-cached value and 100.00% agree; nine are excluded because their caches are stale.
+not proof of exact Visio compatibility. Coverage and agreement must be measured
+against the current engine revision and the exact corpus; no current percentages
+are claimed here because the private corpus is not available in every checkout.
 
 The oracle excludes only nine demonstrated stale cache encodings, pinned to their
 corpus source parts and shapes: four `LineWeight` `F="Inh"` values from a prior

@@ -10,6 +10,7 @@ export class VsdxDocument {
     canRedo(): boolean;
     canUndo(): boolean;
     clearUpdateObservation(): void;
+    deleteShapeJson(args: string): string;
     /**
      * Returns `[2]` after overflow; discard queued observations and resync from a state vector.
      */
@@ -25,6 +26,7 @@ export class VsdxDocument {
     reorderPageJson(args: string): string;
     reorderShapeJson(args: string): string;
     resizeShapeJson(args: string): string;
+    save(): Uint8Array;
     setCellFormulaJson(args: string): string;
     snapshotJson(): string;
     startUpdateObservation(): void;
@@ -64,6 +66,7 @@ export interface InitOutput {
     readonly vsdxdocument_canUndo: (a: number) => number;
     readonly vsdxdocument_clearUpdateObservation: (a: number) => void;
     readonly vsdxdocument_clientId: (a: number) => number;
+    readonly vsdxdocument_deleteShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_drainUpdateEvent: (a: number) => [number, number];
     readonly vsdxdocument_encodeDiff: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_encodeStateAsUpdate: (a: number) => [number, number];
@@ -76,6 +79,7 @@ export interface InitOutput {
     readonly vsdxdocument_reorderPageJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_reorderShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_resizeShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly vsdxdocument_save: (a: number) => [number, number, number, number];
     readonly vsdxdocument_setCellFormulaJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_snapshotJson: (a: number) => [number, number, number, number];
     readonly vsdxdocument_startUpdateObservation: (a: number) => [number, number];

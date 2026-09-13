@@ -8,7 +8,7 @@ use crate::patch::{
 use crate::relationships::{Relationship, parse_relationships, relationship_types};
 use crate::sheet::{parse_records, parse_sheet};
 use crate::xml::{ParseBudget, XmlElement, XmlNode, parse_xml};
-use crate::{CellAttribute, ParseLimits, Shape, Sheet, VsdxError};
+use crate::{CellAttribute, ConnectsChild, ParseLimits, Shape, Sheet, SheetChild, VsdxError};
 use ooxml_drawingml::Theme;
 
 /// Identifies the ShapeSheet containing a semantic cell.
@@ -32,11 +32,12 @@ pub struct CellLocator {
     pub sheet: CellSheet,
     pub shape_id: Option<u32>,
     pub section: Option<String>,
+    pub section_index: Option<u32>,
     pub row: Option<CellRow>,
     pub cell_name: String,
 }
 
-/// A semantic cell edit. `formula` and `value` independently select attributes to write.
+/// A formula edit with a fresh cache; None removes the old cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticCellEdit {
     pub locator: CellLocator,
@@ -59,9 +60,13 @@ pub enum MutationGesture {
     Delete,
 }
 
-/// A page-local structural change applied atomically with any cell edits.
+/// A structural change applied atomically with any cell edits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StructuralEdit {
+    /// Reorders the complete page catalog and its page relationships.
+    ReorderPages {
+        page_ids: Vec<u32>,
+    },
     /// Inserts a complete Shape fragment using the next unused page-local ID.
     AddShape {
         page_id: u32,
@@ -81,22 +86,29 @@ pub enum StructuralEdit {
 
 type PendingInsertion = (crate::SourceSpan, u8, Vec<(CellAttribute, String)>);
 
+struct CellRemoval {
+    part_path: String,
+    cell_span: crate::SourceSpan,
+    attribute: CellAttribute,
+}
+
 struct NewCell {
     part_path: String,
     owner_span: crate::SourceSpan,
     name: String,
     formula: String,
-    value: String,
+    value: Option<String>,
 }
 
 struct NewContainerCell {
     part_path: String,
     owner_span: crate::SourceSpan,
     section: Option<String>,
+    section_index: Option<u32>,
     row: Option<CellRow>,
     name: String,
     formula: String,
-    value: String,
+    value: Option<String>,
 }
 
 pub fn parse_vsdx(data: &[u8]) -> Result<VsdxPackage, VsdxError> {
@@ -206,6 +218,29 @@ pub fn parse_vsdx_with_limits(data: &[u8], limits: &ParseLimits) -> Result<VsdxP
             .get(masters_part_path.as_deref().unwrap_or(""))
             .map(Vec::as_slice),
     )?;
+    let catalog = xml_parts.get(pages_part_path.as_deref().unwrap_or(""));
+    let mut page_positions = HashMap::new();
+    let mut page_names = BTreeMap::new();
+    for (position, page) in catalog
+        .into_iter()
+        .flat_map(|root| root.children_named("Page"))
+        .enumerate()
+    {
+        let Some(id) = page.attribute("ID").and_then(|id| id.parse::<u32>().ok()) else {
+            continue;
+        };
+        page_positions.insert(id, position);
+        if let Some(name) = page.attribute("Name").or_else(|| page.attribute("NameU")) {
+            page_names.insert(id, name.to_owned());
+        }
+    }
+    page_part_paths.sort_by_key(|path| {
+        page_part_ids
+            .get(path)
+            .and_then(|id| page_positions.get(id))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
     let page_contents = parse_part_sheets(&page_part_paths, &mut xml_parts, &mut budget)?;
     let master_contents = parse_part_sheets(&master_part_paths, &mut xml_parts, &mut budget)?;
     let themes = theme_part_paths
@@ -256,6 +291,7 @@ pub fn parse_vsdx_with_limits(data: &[u8], limits: &ParseLimits) -> Result<VsdxP
         page_sheets,
         master_sheets,
         page_part_ids,
+        page_names,
         master_part_ids,
         page_contents,
         master_contents,
@@ -440,20 +476,22 @@ pub fn write_vsdx(package: &VsdxPackage) -> Result<Vec<u8>, VsdxError> {
 }
 
 /// Applies Cell@V and Cell@F attribute edits without mutating `package`.
+#[cfg(test)]
 pub(crate) fn save_cell_edits(
     package: &VsdxPackage,
     edits: &[CellEdit],
 ) -> Result<Vec<u8>, VsdxError> {
-    save_cell_edits_with_new_cells(package, edits, &[], &[])
+    save_cell_edits_with_new_cells(package, edits, &[], &[], &[])
 }
 
 fn save_cell_edits_with_new_cells(
     package: &VsdxPackage,
     edits: &[CellEdit],
+    removals: &[CellRemoval],
     new_cells: &[NewCell],
     new_container_cells: &[NewContainerCell],
 ) -> Result<Vec<u8>, VsdxError> {
-    if edits.len() > MAX_PATCH_EDITS {
+    if edits.len() + removals.len() > MAX_PATCH_EDITS {
         return Err(VsdxError::PatchLimit { kind: "editCount" });
     }
     let mut replacement_bytes = 0_usize;
@@ -511,7 +549,7 @@ fn save_cell_edits_with_new_cells(
                     message: "Cell has no attribute quote style".to_owned(),
                 })?;
             let entry = insertions
-                .entry((part.path.as_str(), cell.span))
+                .entry((part.path.as_str(), cell.start_tag))
                 .or_insert_with(|| {
                     let end = cell.start_tag.end().expect("scanner span cannot overflow");
                     let offset = if part.bytes[end - 2] == b'/' {
@@ -534,7 +572,61 @@ fn save_cell_edits_with_new_cells(
             entry.2.push((edit.attribute, edit.value.clone()));
         }
     }
-    for ((path, _), (span, quote, attributes)) in insertions {
+    let mut removal_spans: BTreeMap<(&str, crate::SourceSpan), SpanEdit> = BTreeMap::new();
+    for removal in removals {
+        if !is_shapesheet_part(package, &removal.part_path) {
+            return Err(VsdxError::InvalidCellEdit {
+                part: removal.part_path.clone(),
+                message: "part is not an authoritative ShapeSheet part".to_owned(),
+            });
+        }
+        let part = package
+            .parts
+            .iter()
+            .find(|part| part.path == removal.part_path)
+            .ok_or_else(|| VsdxError::InvalidCellEdit {
+                part: removal.part_path.clone(),
+                message: "part does not exist".to_owned(),
+            })?;
+        let cell = part
+            .spans
+            .iter()
+            .find(|span| {
+                span.name
+                    .rsplit_once(':')
+                    .map_or(span.name.as_str(), |(_, name)| name)
+                    == "Cell"
+                    && span.span == removal.cell_span
+            })
+            .ok_or_else(|| VsdxError::InvalidCellEdit {
+                part: removal.part_path.clone(),
+                message: "span is not an existing Cell".to_owned(),
+            })?;
+        let Some(attribute) = cell.attributes.get(removal.attribute.name()) else {
+            continue;
+        };
+        let mut start = attribute.name.offset;
+        while start > 0 && part.bytes[start - 1].is_ascii_whitespace() {
+            start -= 1;
+        }
+        let end = attribute
+            .value
+            .end()
+            .and_then(|end| end.checked_add(1))
+            .ok_or(VsdxError::InvalidSpan)?;
+        let length = end.checked_sub(start).ok_or(VsdxError::InvalidSpan)?;
+        removal_spans.insert(
+            (part.path.as_str(), cell.start_tag),
+            SpanEdit {
+                span: crate::SourceSpan {
+                    offset: start,
+                    length,
+                },
+                replacement: Vec::new(),
+            },
+        );
+    }
+    for ((path, start_tag), (span, quote, attributes)) in insertions {
         let mut replacement = Vec::new();
         for (attribute, value) in attributes {
             replacement.push(b' ');
@@ -547,7 +639,16 @@ fn save_cell_edits_with_new_cells(
         replacement_bytes = replacement_bytes
             .checked_add(replacement.len())
             .ok_or(VsdxError::PatchLimit { kind: "editBytes" })?;
+        if let Some(removal) = removal_spans.get_mut(&(path, start_tag))
+            && removal.span.end() == Some(span.offset)
+        {
+            removal.replacement.extend(replacement);
+            continue;
+        }
         validated.push((path, SpanEdit { span, replacement }));
+    }
+    for ((path, _), removal) in removal_spans {
+        validated.push((path, removal));
     }
     for new_cell in new_cells {
         let part = package
@@ -603,7 +704,11 @@ fn save_cell_edits_with_new_cells(
         replacement.push(quote);
         replacement.extend_from_slice(&escape_attribute_value(&new_cell.name, quote)?);
         replacement.push(quote);
-        for (name, value) in [("F", &new_cell.formula), ("V", &new_cell.value)] {
+        let mut attributes: Vec<(&str, &str)> = vec![("F", &new_cell.formula)];
+        if let Some(value) = &new_cell.value {
+            attributes.push(("V", value));
+        }
+        for (name, value) in attributes {
             replacement.push(b' ');
             replacement.extend_from_slice(name.as_bytes());
             replacement.push(b'=');
@@ -659,6 +764,10 @@ fn save_cell_edits_with_new_cells(
         if let Some(section) = &new_cell.section {
             replacement.extend_from_slice(b"<Section N=");
             push_quoted(&mut replacement, section, quote)?;
+            if let Some(index) = new_cell.section_index {
+                replacement.extend_from_slice(b" IX=");
+                push_quoted(&mut replacement, &index.to_string(), quote)?;
+            }
             replacement.push(b'>');
         }
         if let Some(row) = &new_cell.row {
@@ -678,8 +787,10 @@ fn save_cell_edits_with_new_cells(
         push_quoted(&mut replacement, &new_cell.name, quote)?;
         replacement.extend_from_slice(b" F=");
         push_quoted(&mut replacement, &new_cell.formula, quote)?;
-        replacement.extend_from_slice(b" V=");
-        push_quoted(&mut replacement, &new_cell.value, quote)?;
+        if let Some(value) = &new_cell.value {
+            replacement.extend_from_slice(b" V=");
+            push_quoted(&mut replacement, value, quote)?;
+        }
         replacement.extend_from_slice(b"/>");
         if new_cell.row.is_some() {
             replacement.extend_from_slice(b"</Row>");
@@ -703,13 +814,26 @@ fn save_cell_edits_with_new_cells(
         part_edits.entry(path).or_default().push(edit);
     }
     let mut output = package.clone();
-    for (path, edits) in part_edits {
+    for (path, mut edits) in part_edits {
+        edits.sort_by_key(|edit| edit.span.offset);
+        let mut merged: Vec<SpanEdit> = Vec::with_capacity(edits.len());
+        for edit in edits {
+            if let Some(previous) = merged.last_mut()
+                && previous.span.offset == edit.span.offset
+                && previous.span.length == 0
+                && edit.span.length == 0
+            {
+                previous.replacement.extend(edit.replacement);
+                continue;
+            }
+            merged.push(edit);
+        }
         let part = output
             .parts
             .iter_mut()
             .find(|part| part.path == path)
             .expect("validated source part");
-        part.bytes = apply_span_edits(&part.bytes, &edits)?;
+        part.bytes = apply_span_edits(&part.bytes, &merged)?;
     }
     let bytes = write_vsdx(&output)?;
     parse_vsdx(&bytes)?;
@@ -722,13 +846,14 @@ pub fn save_semantic_cell_edits(
     edits: &[SemanticCellEdit],
 ) -> Result<Vec<u8>, VsdxError> {
     let mut lexical = Vec::new();
+    let mut removals = Vec::new();
     let mut new_cells = Vec::new();
     let mut new_container_cells = Vec::new();
     for edit in edits {
-        let (Some(formula), Some(value)) = (&edit.formula, &edit.value) else {
+        let Some(formula) = &edit.formula else {
             return Err(VsdxError::InvalidCellEdit {
                 part: format!("{:?}", edit.locator.sheet),
-                message: "semantic edits require both a formula and its evaluated cache".to_owned(),
+                message: "semantic edits require a formula".to_owned(),
             });
         };
         match resolve_cell_locator(package, &edit.locator)? {
@@ -739,36 +864,50 @@ pub fn save_semantic_cell_edits(
                     attribute: CellAttribute::Formula,
                     value: formula.clone(),
                 });
-                lexical.push(CellEdit {
-                    part_path,
-                    cell_span,
-                    attribute: CellAttribute::Value,
-                    value: value.clone(),
-                });
+                match &edit.value {
+                    Some(value) => lexical.push(CellEdit {
+                        part_path,
+                        cell_span,
+                        attribute: CellAttribute::Value,
+                        value: value.clone(),
+                    }),
+                    None => removals.push(CellRemoval {
+                        part_path,
+                        cell_span,
+                        attribute: CellAttribute::Value,
+                    }),
+                }
             }
             LocalCell::New(part_path, owner_span) => new_cells.push(NewCell {
                 part_path,
                 owner_span,
                 name: edit.locator.cell_name.clone(),
                 formula: formula.clone(),
-                value: value.clone(),
+                value: edit.value.clone(),
             }),
             LocalCell::NewContainer(part_path, owner_span, section, row) => new_container_cells
                 .push(NewContainerCell {
                     part_path,
                     owner_span,
                     section,
+                    section_index: edit.locator.section_index,
                     row,
                     name: edit.locator.cell_name.clone(),
                     formula: formula.clone(),
-                    value: value.clone(),
+                    value: edit.value.clone(),
                 }),
         }
     }
     if new_cells.is_empty() && new_container_cells.is_empty() {
-        save_cell_edits(package, &lexical)
+        save_cell_edits_with_new_cells(package, &lexical, &removals, &[], &[])
     } else {
-        save_cell_edits_with_new_cells(package, &lexical, &new_cells, &new_container_cells)
+        save_cell_edits_with_new_cells(
+            package,
+            &lexical,
+            &removals,
+            &new_cells,
+            &new_container_cells,
+        )
     }
 }
 
@@ -777,12 +916,26 @@ pub fn save_structural_edits(
     package: &VsdxPackage,
     edits: &[StructuralEdit],
 ) -> Result<Vec<u8>, VsdxError> {
+    let page_reorders = edits
+        .iter()
+        .filter_map(|edit| match edit {
+            StructuralEdit::ReorderPages { page_ids } => Some(page_ids.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if page_reorders.len() > 1 {
+        return Err(VsdxError::InvalidCellEdit {
+            part: "pages".to_owned(),
+            message: "multiple page reorder edits are not supported".to_owned(),
+        });
+    }
     let mut by_part: BTreeMap<String, Vec<&StructuralEdit>> = BTreeMap::new();
     for edit in edits {
         let page_id = match edit {
             StructuralEdit::AddShape { page_id, .. }
             | StructuralEdit::DeleteShape { page_id, .. }
             | StructuralEdit::ReorderShape { page_id, .. } => page_id,
+            StructuralEdit::ReorderPages { .. } => continue,
         };
         let path = package
             .page_part_ids
@@ -815,7 +968,10 @@ pub fn save_structural_edits(
                 bytes: bytes.clone(),
                 spans: scan_element_spans(&bytes)?,
             };
-            let shapes = page_shapes(&current).expect("validated Shapes container");
+            let shapes = page_shapes(&current).ok_or_else(|| VsdxError::InvalidCellEdit {
+                part: path.clone(),
+                message: "page has no Shapes container after structural edit".to_owned(),
+            })?;
             let replacement = match edit {
                 StructuralEdit::AddShape { shape_xml, .. } => {
                     add_shape(&current, shapes, shape_xml)?
@@ -828,6 +984,7 @@ pub fn save_structural_edits(
                     before_shape_id,
                     ..
                 } => reorder_shape(&current, shapes, *shape_id, *before_shape_id)?,
+                StructuralEdit::ReorderPages { .. } => unreachable!(),
             };
             bytes = apply_span_edits(&bytes, &replacement)?;
         }
@@ -835,13 +992,230 @@ pub fn save_structural_edits(
             .parts
             .iter_mut()
             .find(|part| part.path == path)
-            .expect("validated source part");
+            .ok_or_else(|| VsdxError::InvalidCellEdit {
+                part: path.clone(),
+                message: "output part does not exist".to_owned(),
+            })?;
         target.bytes = bytes;
+    }
+    if let Some(page_ids) = page_reorders.first() {
+        reorder_pages(&mut output, package, page_ids)?;
     }
     let bytes = write_vsdx(&output)?;
     let reparsed = parse_vsdx(&bytes)?;
     validate_structure(&reparsed)?;
     Ok(bytes)
+}
+
+fn reorder_pages(
+    output: &mut VsdxPackage,
+    package: &VsdxPackage,
+    page_ids: &[u32],
+) -> Result<(), VsdxError> {
+    let expected = package
+        .page_part_paths
+        .iter()
+        .map(|path| package.page_part_ids.get(path).copied())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| VsdxError::InvalidCellEdit {
+            part: "pages".to_owned(),
+            message: "page catalog is missing a page ID".to_owned(),
+        })?;
+    let expected_ids = expected.iter().copied().collect::<HashSet<_>>();
+    if page_ids.len() != expected.len()
+        || page_ids.iter().copied().collect::<HashSet<_>>() != expected_ids
+    {
+        return Err(VsdxError::InvalidCellEdit {
+            part: "pages".to_owned(),
+            message: "page reorder must contain every page exactly once".to_owned(),
+        });
+    }
+    let pages_path =
+        package
+            .pages_part_path
+            .as_deref()
+            .ok_or_else(|| VsdxError::InvalidCellEdit {
+                part: "pages".to_owned(),
+                message: "package has no page catalog".to_owned(),
+            })?;
+    let catalog = package
+        .parts
+        .iter()
+        .find(|part| part.path == pages_path)
+        .ok_or_else(|| VsdxError::InvalidCellEdit {
+            part: pages_path.to_owned(),
+            message: "page catalog part does not exist".to_owned(),
+        })?;
+    let pages = catalog
+        .spans
+        .iter()
+        .find(|span| local_name(&span.name) == "Pages")
+        .ok_or_else(|| VsdxError::InvalidCellEdit {
+            part: pages_path.to_owned(),
+            message: "page catalog has no Pages container".to_owned(),
+        })?;
+    let page_entries = catalog
+        .spans
+        .iter()
+        .filter(|span| {
+            local_name(&span.name) == "Page"
+                && immediate_parent(catalog, span.span)
+                    .is_some_and(|parent| parent.span == pages.span)
+        })
+        .collect::<Vec<_>>();
+    let mut ordered_pages = Vec::with_capacity(page_ids.len());
+    let mut relationship_ids = Vec::with_capacity(page_ids.len());
+    for id in page_ids {
+        let page = page_entries
+            .iter()
+            .copied()
+            .find(|page| attribute_equals(&catalog.bytes, page, "ID", &id.to_string()))
+            .ok_or_else(|| VsdxError::InvalidCellEdit {
+                part: pages_path.to_owned(),
+                message: format!("page {id} does not exist in the catalog"),
+            })?;
+        let relationship_id = catalog
+            .spans
+            .iter()
+            .find(|span| {
+                local_name(&span.name) == "Rel"
+                    && immediate_parent(catalog, span.span)
+                        .is_some_and(|parent| parent.span == page.span)
+            })
+            .and_then(|rel| {
+                rel.attributes
+                    .get("r:id")
+                    .or_else(|| rel.attributes.get("id"))
+                    .and_then(|attribute| attribute_value(&catalog.bytes, attribute))
+            })
+            .or_else(|| {
+                page.attributes
+                    .get("r:id")
+                    .or_else(|| page.attributes.get("id"))
+                    .and_then(|attribute| attribute_value(&catalog.bytes, attribute))
+            })
+            .ok_or_else(|| VsdxError::InvalidCellEdit {
+                part: pages_path.to_owned(),
+                message: format!("page {id} has no relationship"),
+            })?
+            .into_owned();
+        ordered_pages.push(page);
+        relationship_ids.push(relationship_id);
+    }
+    let mut catalog_output = catalog.clone();
+    catalog_output.bytes = apply_span_edits(
+        &catalog.bytes,
+        &[reorder_selected_children(
+            catalog,
+            pages,
+            &page_entries,
+            &ordered_pages,
+        )?],
+    )?;
+    replace_part(output, catalog_output)?;
+
+    let rels_path = relationship_path(pages_path);
+    let mut rels = package
+        .parts
+        .iter()
+        .find(|part| part.path == rels_path)
+        .cloned()
+        .ok_or_else(|| VsdxError::InvalidCellEdit {
+            part: rels_path.clone(),
+            message: "page relationships part does not exist".to_owned(),
+        })?;
+    rels.spans = scan_element_spans(&rels.bytes)?;
+    let relationships = rels
+        .spans
+        .iter()
+        .find(|span| local_name(&span.name) == "Relationships")
+        .ok_or_else(|| VsdxError::InvalidCellEdit {
+            part: rels_path.clone(),
+            message: "page relationships have no container".to_owned(),
+        })?;
+    let entries = rels
+        .spans
+        .iter()
+        .filter(|span| {
+            local_name(&span.name) == "Relationship"
+                && immediate_parent(&rels, span.span)
+                    .is_some_and(|parent| parent.span == relationships.span)
+        })
+        .collect::<Vec<_>>();
+    let page_entries = entries
+        .iter()
+        .copied()
+        .filter(|entry| {
+            entry
+                .attributes
+                .get("Id")
+                .and_then(|attribute| attribute_value(&rels.bytes, attribute))
+                .is_some_and(|id| relationship_ids.iter().any(|expected| expected == &id))
+        })
+        .collect::<Vec<_>>();
+    let ordered_relationships = relationship_ids
+        .iter()
+        .map(|id| {
+            page_entries
+                .iter()
+                .copied()
+                .find(|entry| attribute_equals(&rels.bytes, entry, "Id", id))
+                .ok_or_else(|| VsdxError::InvalidCellEdit {
+                    part: rels_path.clone(),
+                    message: format!("page relationship {id} does not exist"),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    rels.bytes = apply_span_edits(
+        &rels.bytes,
+        &[reorder_selected_children(
+            &rels,
+            relationships,
+            &page_entries,
+            &ordered_relationships,
+        )?],
+    )?;
+    replace_part(output, rels)
+}
+
+fn reorder_selected_children(
+    part: &PackagePart,
+    container: &crate::ElementSpan,
+    children: &[&crate::ElementSpan],
+    ordered: &[&crate::ElementSpan],
+) -> Result<SpanEdit, VsdxError> {
+    if children.len() != ordered.len() {
+        return Err(VsdxError::InvalidSpan);
+    }
+    let mut replacement = Vec::new();
+    let mut cursor = container.span.offset;
+    for (child, desired) in children.iter().zip(ordered) {
+        replacement.extend_from_slice(&part.bytes[cursor..child.span.offset]);
+        replacement.extend_from_slice(
+            &part.bytes[desired.span.offset..desired.span.end().ok_or(VsdxError::InvalidSpan)?],
+        );
+        cursor = child.span.end().ok_or(VsdxError::InvalidSpan)?;
+    }
+    replacement.extend_from_slice(
+        &part.bytes[cursor..container.span.end().ok_or(VsdxError::InvalidSpan)?],
+    );
+    Ok(SpanEdit {
+        span: container.span,
+        replacement,
+    })
+}
+
+fn replace_part(output: &mut VsdxPackage, replacement: PackagePart) -> Result<(), VsdxError> {
+    let part = output
+        .parts
+        .iter_mut()
+        .find(|part| part.path == replacement.path)
+        .ok_or_else(|| VsdxError::InvalidCellEdit {
+            part: replacement.path.clone(),
+            message: "output part does not exist".to_owned(),
+        })?;
+    *part = replacement;
+    Ok(())
 }
 
 fn shape_children<'a>(
@@ -897,18 +1271,35 @@ fn add_shape(
             message: "new shape fragments cannot contain relationship references".to_owned(),
         });
     }
-    let next_id = all_shape_spans(part, shapes)
+    let requested_shape_id = root
+        .attributes
+        .get("ID")
+        .and_then(|attribute| attribute_value(fragment, attribute))
+        .and_then(|id| id.parse().ok());
+    let new_shape_id = requested_shape_id.unwrap_or(
+        all_shape_spans(part, shapes)
+            .iter()
+            .filter_map(|shape| shape_id(part, shape))
+            .max()
+            .map_or(Ok(1), |id| {
+                id.checked_add(1).ok_or_else(|| VsdxError::InvalidCellEdit {
+                    part: part.path.clone(),
+                    message: "shape ID space is exhausted".to_owned(),
+                })
+            })?,
+    );
+    if all_shape_spans(part, shapes)
         .iter()
         .filter_map(|shape| shape_id(part, shape))
-        .max()
-        .map_or(Ok(1), |id| {
-            id.checked_add(1).ok_or_else(|| VsdxError::InvalidCellEdit {
-                part: part.path.clone(),
-                message: "shape ID space is exhausted".to_owned(),
-            })
-        })?;
+        .any(|shape_id| shape_id == new_shape_id)
+    {
+        return Err(VsdxError::InvalidCellEdit {
+            part: part.path.clone(),
+            message: "shape ID is already in use".to_owned(),
+        });
+    }
     let mut new_shape = fragment.to_vec();
-    let id = next_id.to_string().into_bytes();
+    let id = new_shape_id.to_string().into_bytes();
     if let Some(attribute) = root.attributes.get("ID") {
         new_shape = apply_span_edits(
             &new_shape,
@@ -932,7 +1323,7 @@ fn add_shape(
             &new_shape,
             &[SpanEdit {
                 span: crate::SourceSpan { offset, length: 0 },
-                replacement: format!(" ID='{next_id}'").into_bytes(),
+                replacement: format!(" ID='{new_shape_id}'").into_bytes(),
             }],
         )?;
     }
@@ -966,6 +1357,12 @@ fn delete_shape(
     shapes: &crate::ElementSpan,
     shape_id_to_delete: u32,
 ) -> Result<Vec<SpanEdit>, VsdxError> {
+    let shapes = shape_container(part, shapes, shape_id_to_delete).ok_or_else(|| {
+        VsdxError::InvalidCellEdit {
+            part: part.path.clone(),
+            message: format!("shape {shape_id_to_delete} does not exist"),
+        }
+    })?;
     let children = shape_children(part, shapes);
     let deleted_shape = *children
         .iter()
@@ -983,17 +1380,42 @@ fn delete_shape(
     })?];
     if let Some(connects) = direct_child(part, "Connects", None) {
         replacements.push(container_without(part, connects, "Connect", |connect| {
-            ["FromSheet", "ToSheet"].iter().any(|name| {
-                connect
-                    .attributes
-                    .get(*name)
-                    .and_then(|attribute| attribute_value(&part.bytes, attribute))
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .is_some_and(|id| deleted.contains(&id))
-            })
+            references_deleted_shape(
+                ["FromSheet", "ToSheet"].iter().filter_map(|name| {
+                    connect
+                        .attributes
+                        .get(*name)
+                        .and_then(|attribute| attribute_value(&part.bytes, attribute))
+                        .and_then(|value| value.parse::<u32>().ok())
+                }),
+                &deleted,
+            )
         })?);
     }
     Ok(replacements)
+}
+
+pub fn remove_connects_referencing_shapes(sheet: &mut Sheet, deleted: &HashSet<u32>) {
+    for child in &mut sheet.children {
+        let SheetChild::Connects(connects) = child else {
+            continue;
+        };
+        connects.retain(|connect| match connect {
+            ConnectsChild::Connect(connect) => {
+                !references_deleted_shape([connect.from_sheet, connect.to_sheet], deleted)
+            }
+            ConnectsChild::Unknown(_) => true,
+        });
+    }
+}
+
+fn references_deleted_shape(
+    referenced_shape_ids: impl IntoIterator<Item = u32>,
+    deleted: &HashSet<u32>,
+) -> bool {
+    referenced_shape_ids
+        .into_iter()
+        .any(|shape_id| deleted.contains(&shape_id))
 }
 
 fn reorder_shape(
@@ -1002,6 +1424,11 @@ fn reorder_shape(
     moving_id: u32,
     before_id: Option<u32>,
 ) -> Result<Vec<SpanEdit>, VsdxError> {
+    let shapes =
+        shape_container(part, shapes, moving_id).ok_or_else(|| VsdxError::InvalidCellEdit {
+            part: part.path.clone(),
+            message: format!("shape {moving_id} does not exist"),
+        })?;
     let children = shape_children(part, shapes);
     let moving = children
         .iter()
@@ -1042,6 +1469,22 @@ fn reorder_shape(
         span: shapes.span,
         replacement,
     }])
+}
+
+fn shape_container<'a>(
+    part: &'a PackagePart,
+    page_shapes: &'a crate::ElementSpan,
+    id: u32,
+) -> Option<&'a crate::ElementSpan> {
+    std::iter::once(page_shapes)
+        .chain(part.spans.iter().filter(|span| {
+            local_name(&span.name) == "Shapes" && contains(page_shapes.span, span.span)
+        }))
+        .find(|shapes| {
+            shape_children(part, shapes)
+                .iter()
+                .any(|shape| shape_id(part, shape) == Some(id))
+        })
 }
 
 fn direct_child<'a>(
@@ -1216,6 +1659,22 @@ enum LocalCell {
     NewContainer(String, crate::SourceSpan, Option<String>, Option<CellRow>),
 }
 
+fn section_matches_locator(
+    part: &PackagePart,
+    section: &crate::ElementSpan,
+    name: &str,
+    index: Option<u32>,
+) -> bool {
+    attribute_equals(&part.bytes, section, "N", name)
+        && section
+            .attributes
+            .get("IX")
+            .and_then(|attribute| attribute_value(&part.bytes, attribute))
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0)
+            == index.unwrap_or(0)
+}
+
 fn resolve_cell_locator(
     package: &VsdxPackage,
     locator: &CellLocator,
@@ -1281,7 +1740,9 @@ fn resolve_cell_locator(
             };
             let section_matches = match (&locator.section, nearest("Section")) {
                 (None, None) => true,
-                (Some(name), Some(section)) => attribute_equals(&part.bytes, section, "N", name),
+                (Some(name), Some(section)) => {
+                    section_matches_locator(part, section, name, locator.section_index)
+                }
                 _ => false,
             };
             let row_matches = match (&locator.row, nearest("Row")) {
@@ -1308,7 +1769,7 @@ fn resolve_cell_locator(
         if let Some(existing_row) = part.spans.iter().find(|candidate| {
             local_name(&candidate.name) == "Row"
                 && nearest_parent(part, candidate.span, "Section").is_some_and(|section| {
-                    attribute_equals(&part.bytes, section, "N", section_name)
+                    section_matches_locator(part, section, section_name, locator.section_index)
                 })
                 && shape_matches(candidate)
                 && match row {
@@ -1322,7 +1783,7 @@ fn resolve_cell_locator(
         }
         if let Some(section) = part.spans.iter().find(|candidate| {
             local_name(&candidate.name) == "Section"
-                && attribute_equals(&part.bytes, candidate, "N", section_name)
+                && section_matches_locator(part, candidate, section_name, locator.section_index)
                 && shape_matches(candidate)
         }) {
             return Ok(LocalCell::NewContainer(
@@ -1376,7 +1837,9 @@ fn resolve_cell_locator(
                 nearest_parent(part, owner.span, "Section"),
             ) {
                 (None, None) => true,
-                (Some(name), Some(section)) => attribute_equals(&part.bytes, section, "N", name),
+                (Some(name), Some(section)) => {
+                    section_matches_locator(part, section, name, locator.section_index)
+                }
                 _ => false,
             };
             let row_matches = match (&locator.row, Some(owner)) {
@@ -1469,10 +1932,11 @@ fn load_relationships<'a>(
 ) -> Result<&'a [Relationship], VsdxError> {
     if !relationships.contains_key(source) {
         let path = relationship_path(source);
-        let parsed = match parts.get(path.as_str()) {
-            Some(bytes) => parse_relationships(bytes, &path, source, budget)?,
-            None => Vec::new(),
-        };
+        let parsed = parts
+            .get(path.as_str())
+            .map(|bytes| parse_relationships(bytes, &path, source, budget))
+            .transpose()?
+            .unwrap_or_default();
         relationships.insert(source.to_owned(), parsed);
     }
     Ok(relationships
@@ -1514,6 +1978,35 @@ fn targets_by_type(relationships: &[Relationship], kind: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn opens_parts_that_carry_no_relationship_part() {
+        let content_types = ("[Content_Types].xml".to_owned(), br#"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Override PartName='/visio/document.xml' ContentType='application/vnd.ms-visio.drawing.main+xml'/></Types>"#.to_vec());
+        let root_rels = ("_rels/.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/document' Target='visio/document.xml'/></Relationships>"#.to_vec());
+        let document = (
+            "visio/document.xml".to_owned(),
+            b"<VisioDocument/>".to_vec(),
+        );
+        let bare =
+            rezip_parts(&[content_types.clone(), root_rels.clone(), document.clone()]).unwrap();
+        let parsed = parse_vsdx(&bare).unwrap();
+        assert_eq!(parsed.pages_part_path, None);
+        assert!(parsed.page_part_paths.is_empty());
+
+        let catalog = rezip_parts(&[
+            content_types,
+            root_rels,
+            document,
+            ("visio/_rels/document.xml.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/pages' Target='pages/pages.xml'/></Relationships>"#.to_vec()),
+            ("visio/pages/pages.xml".to_owned(), b"<Pages/>".to_vec()),
+        ]).unwrap();
+        let parsed = parse_vsdx(&catalog).unwrap();
+        assert_eq!(
+            parsed.pages_part_path.as_deref(),
+            Some("visio/pages/pages.xml")
+        );
+        assert!(parsed.page_part_paths.is_empty());
+    }
+
     use super::*;
     use crate::sheet::serialize_sheet;
     use crate::xml::{XmlNode, parse_xml};
@@ -1598,6 +2091,7 @@ mod tests {
                     sheet: CellSheet::Page(page_id),
                     shape_id: Some(1),
                     section: None,
+                    section_index: None,
                     row: None,
                     cell_name: "Width".to_owned(),
                 },
@@ -1610,6 +2104,109 @@ mod tests {
         let saved = parse_vsdx(&saved).unwrap();
         let after = saved.part_bytes(&path).unwrap();
         assert_eq!(after, b"<PageContents><Shapes><Shape ID='1'><Cell N='Other' V='1'/><Cell N='Width' F='4' V='4'/></Shape></Shapes></PageContents>");
+    }
+
+    #[test]
+    fn formula_only_edits_drop_existing_caches_and_save_uncached_cells() {
+        let source = b"<PageContents><Shapes><Shape ID='1'><Cell N='FOnly' F='a'/><Cell N='Both' F='b' V='2'/><Cell N='VOnly' V='3'/></Shape></Shapes></PageContents>";
+        let (package, path) = package_with_page_xml(source);
+        let page_id = package.page_part_ids[&path];
+        let edit = |name: &str| SemanticCellEdit {
+            locator: CellLocator {
+                sheet: CellSheet::Page(page_id),
+                shape_id: Some(1),
+                section: None,
+                section_index: None,
+                row: None,
+                cell_name: name.to_owned(),
+            },
+            gesture: MutationGesture::CellEdit,
+            formula: Some("9".to_owned()),
+            value: None,
+        };
+        let saved =
+            save_semantic_cell_edits(&package, &[edit("FOnly"), edit("Both"), edit("VOnly")])
+                .unwrap();
+        assert_eq!(
+            parse_vsdx(&saved).unwrap().part_bytes(&path).unwrap(),
+            b"<PageContents><Shapes><Shape ID='1'><Cell N='FOnly' F='9'/><Cell N='Both' F='9'/><Cell N='VOnly' F='9'/></Shape></Shapes></PageContents>"
+        );
+    }
+
+    #[test]
+    fn inserts_formula_only_cells_without_a_cache() {
+        let source = b"<PageContents><Shapes><Shape ID='1'><Cell N='Other' V='1'/></Shape></Shapes></PageContents>";
+        let (package, path) = package_with_page_xml(source);
+        let page_id = package.page_part_ids[&path];
+        let saved = save_semantic_cell_edits(
+            &package,
+            &[SemanticCellEdit {
+                locator: CellLocator {
+                    sheet: CellSheet::Page(page_id),
+                    shape_id: Some(1),
+                    section: None,
+                    section_index: None,
+                    row: None,
+                    cell_name: "Width".to_owned(),
+                },
+                gesture: MutationGesture::CellEdit,
+                formula: Some("4".to_owned()),
+                value: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            parse_vsdx(&saved).unwrap().part_bytes(&path).unwrap(),
+            b"<PageContents><Shapes><Shape ID='1'><Cell N='Other' V='1'/><Cell N='Width' F='4'/></Shape></Shapes></PageContents>"
+        );
+        let saved = save_semantic_cell_edits(
+            &package,
+            &[SemanticCellEdit {
+                locator: CellLocator {
+                    sheet: CellSheet::Page(page_id),
+                    shape_id: Some(1),
+                    section: Some("User".to_owned()),
+                    section_index: None,
+                    row: Some(CellRow::Name("New".to_owned())),
+                    cell_name: "Value".to_owned(),
+                },
+                gesture: MutationGesture::CellEdit,
+                formula: Some("4".to_owned()),
+                value: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            parse_vsdx(&saved).unwrap().part_bytes(&path).unwrap(),
+            b"<PageContents><Shapes><Shape ID='1'><Cell N='Other' V='1'/><Section N='User'><Row N='New'><Cell N='Value' F='4'/></Row></Section></Shape></Shapes></PageContents>"
+        );
+    }
+
+    #[test]
+    fn semantic_edits_require_a_formula() {
+        let source = b"<PageContents><Shapes><Shape ID='1'><Cell N='Width' V='1'/></Shape></Shapes></PageContents>";
+        let (package, path) = package_with_page_xml(source);
+        let page_id = package.page_part_ids[&path];
+        let error = save_semantic_cell_edits(
+            &package,
+            &[SemanticCellEdit {
+                locator: CellLocator {
+                    sheet: CellSheet::Page(page_id),
+                    shape_id: Some(1),
+                    section: None,
+                    section_index: None,
+                    row: None,
+                    cell_name: "Width".to_owned(),
+                },
+                gesture: MutationGesture::CellEdit,
+                formula: None,
+                value: Some("4".to_owned()),
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, VsdxError::InvalidCellEdit { ref message, .. } if message == "semantic edits require a formula")
+        );
     }
 
     #[test]
@@ -1973,6 +2570,7 @@ mod tests {
                 sheet: CellSheet::Page(page_id),
                 shape_id: Some(1),
                 section: Some(section.to_owned()),
+                section_index: None,
                 row: Some(row),
                 cell_name: "Value".to_owned(),
             },
@@ -2120,6 +2718,7 @@ mod tests {
                     sheet: CellSheet::Page(*package.page_part_ids.get(&path).unwrap()),
                     shape_id: Some(1),
                     section: None,
+                    section_index: None,
                     row: None,
                     cell_name: "A&B".to_owned(),
                 },
@@ -2131,6 +2730,7 @@ mod tests {
                     sheet: CellSheet::Page(*package.page_part_ids.get(&path).unwrap()),
                     shape_id: Some(1),
                     section: Some("A&B".to_owned()),
+                    section_index: None,
                     row: Some(CellRow::Index(0)),
                     cell_name: "SectionCell".to_owned(),
                 },
@@ -2142,6 +2742,7 @@ mod tests {
                     sheet: CellSheet::Page(*package.page_part_ids.get(&path).unwrap()),
                     shape_id: Some(1),
                     section: None,
+                    section_index: None,
                     row: None,
                     cell_name: "IdCell".to_owned(),
                 },
@@ -2488,6 +3089,58 @@ mod tests {
             [("visio/masters/master2.xml".into(), 15)].into()
         );
     }
+    #[test]
+    fn threads_the_caller_expanded_data_ceiling_into_extraction() {
+        let mut parts = unzip_parts(include_bytes!("../tests/fixtures/foundation.vsdx")).unwrap();
+        parts.push((
+            "visio/media/filler.bin".to_owned(),
+            vec![0; 8 * 1024 * 1024],
+        ));
+        let source = rezip_parts(&parts).unwrap();
+        assert!(source.len() < 1024 * 1024, "fixture must stay compressible");
+        assert!(matches!(
+            parse_vsdx_with_limits(
+                &source,
+                &ParseLimits {
+                    max_expanded_bytes: 1024 * 1024,
+                    ..ParseLimits::default()
+                }
+            ),
+            Err(VsdxError::Container(message)) if message.contains("inflated size exceeds")
+        ));
+        assert!(parse_vsdx_with_limits(&source, &ParseLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn rejects_page_catalog_entries_that_cannot_resolve() {
+        let package = rezip_parts(&[
+            ("[Content_Types].xml".to_owned(), br#"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Override PartName='/visio/document.xml' ContentType='application/vnd.ms-visio.drawing.main+xml'/></Types>"#.to_vec()),
+            ("_rels/.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/document' Target='visio/document.xml'/></Relationships>"#.to_vec()),
+            ("visio/document.xml".to_owned(), b"<VisioDocument/>".to_vec()),
+            ("visio/_rels/document.xml.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/pages' Target='pages/pages.xml'/></Relationships>"#.to_vec()),
+            ("visio/pages/pages.xml".to_owned(), br#"<Pages><Page ID='1' r:id='rId1'/></Pages>"#.to_vec()),
+        ]).unwrap();
+        assert!(matches!(
+            parse_vsdx(&package),
+            Err(VsdxError::InvalidRelationship { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_master_catalog_entries_that_cannot_resolve() {
+        let package = rezip_parts(&[
+            ("[Content_Types].xml".to_owned(), br#"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Override PartName='/visio/document.xml' ContentType='application/vnd.ms-visio.drawing.main+xml'/></Types>"#.to_vec()),
+            ("_rels/.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/document' Target='visio/document.xml'/></Relationships>"#.to_vec()),
+            ("visio/document.xml".to_owned(), b"<VisioDocument/>".to_vec()),
+            ("visio/_rels/document.xml.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/masters' Target='masters/masters.xml'/></Relationships>"#.to_vec()),
+            ("visio/masters/masters.xml".to_owned(), br#"<Masters><Master ID='1' r:id='rId1'/></Masters>"#.to_vec()),
+        ]).unwrap();
+        assert!(matches!(
+            parse_vsdx(&package),
+            Err(VsdxError::InvalidRelationship { .. })
+        ));
+    }
+
     use std::path::PathBuf;
 
     #[test]
@@ -2920,28 +3573,6 @@ mod tests {
     }
 
     #[test]
-    fn threads_the_caller_expanded_data_ceiling_into_extraction() {
-        let mut parts = unzip_parts(include_bytes!("../tests/fixtures/foundation.vsdx")).unwrap();
-        parts.push((
-            "visio/media/filler.bin".to_owned(),
-            vec![0; 8 * 1024 * 1024],
-        ));
-        let source = rezip_parts(&parts).unwrap();
-        assert!(source.len() < 1024 * 1024, "fixture must stay compressible");
-        assert!(matches!(
-            parse_vsdx_with_limits(
-                &source,
-                &ParseLimits {
-                    max_expanded_bytes: 1024 * 1024,
-                    ..ParseLimits::default()
-                }
-            ),
-            Err(VsdxError::Container(message)) if message.contains("inflated size exceeds")
-        ));
-        assert!(parse_vsdx_with_limits(&source, &ParseLimits::default()).is_ok());
-    }
-
-    #[test]
     fn enforces_exact_package_wide_sheet_budgets() {
         let source = rezip_parts(&[
             ("[Content_Types].xml".to_owned(), br#"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Override PartName='/visio/document.xml' ContentType='application/vnd.ms-visio.drawing.main+xml'/></Types>"#.to_vec()),
@@ -2952,6 +3583,7 @@ mod tests {
             ("visio/pages/_rels/pages.xml.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/page' Target='page1.xml'/></Relationships>"#.to_vec()),
             ("visio/pages/page1.xml".to_owned(), br#"<PageContents><Cell N='PageCell'/><Section N='PageSection'><Row IX='0'><Cell N='PageRowCell'/></Row></Section><Shapes><Shape ID='1'><Cell N='ShapeCell'/><Section N='ShapeSection'><Row IX='0'><Cell N='ShapeRowCell0'/></Row><Row IX='1'><Cell N='ShapeRowCell1'/></Row></Section><Shapes><Shape ID='2'><Cell N='NestedShapeCell'/></Shape></Shapes></Shape></Shapes></PageContents>"#.to_vec()),
         ]).unwrap();
+        // Fixture totals: 10 cells, 4 sections, 5 rows, 2 shapes.
         let limits_for = |kind: &str, value: usize| match kind {
             "cells" => ParseLimits {
                 max_cells: value,
@@ -3016,62 +3648,22 @@ mod tests {
     }
 
     #[test]
-    fn opens_parts_that_carry_no_relationship_part() {
-        let content_types = ("[Content_Types].xml".to_owned(), br#"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Override PartName='/visio/document.xml' ContentType='application/vnd.ms-visio.drawing.main+xml'/></Types>"#.to_vec());
-        let root_rels = ("_rels/.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/document' Target='visio/document.xml'/></Relationships>"#.to_vec());
-        let document = (
-            "visio/document.xml".to_owned(),
-            b"<VisioDocument/>".to_vec(),
-        );
-        let bare =
-            rezip_parts(&[content_types.clone(), root_rels.clone(), document.clone()]).unwrap();
-        let parsed = parse_vsdx(&bare).unwrap();
-        assert_eq!(parsed.pages_part_path, None);
-        assert!(parsed.page_part_paths.is_empty());
-
-        let catalog = rezip_parts(&[
-            content_types,
-            root_rels,
-            document,
-            ("visio/_rels/document.xml.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/pages' Target='pages/pages.xml'/></Relationships>"#.to_vec()),
-            ("visio/pages/pages.xml".to_owned(), b"<Pages/>".to_vec()),
-        ]).unwrap();
-        let parsed = parse_vsdx(&catalog).unwrap();
-        assert_eq!(
-            parsed.pages_part_path.as_deref(),
-            Some("visio/pages/pages.xml")
-        );
-        assert!(parsed.page_part_paths.is_empty());
-    }
-
-    #[test]
-    fn rejects_page_catalog_entries_that_cannot_resolve() {
+    fn a_missing_companion_rels_file_yields_an_empty_relationship_set() {
         let package = rezip_parts(&[
             ("[Content_Types].xml".to_owned(), br#"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Override PartName='/visio/document.xml' ContentType='application/vnd.ms-visio.drawing.main+xml'/></Types>"#.to_vec()),
             ("_rels/.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/document' Target='visio/document.xml'/></Relationships>"#.to_vec()),
             ("visio/document.xml".to_owned(), b"<VisioDocument/>".to_vec()),
-            ("visio/_rels/document.xml.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/pages' Target='pages/pages.xml'/></Relationships>"#.to_vec()),
-            ("visio/pages/pages.xml".to_owned(), br#"<Pages><Page ID='1' r:id='rId1'/></Pages>"#.to_vec()),
-        ]).unwrap();
-        assert!(matches!(
-            parse_vsdx(&package),
-            Err(VsdxError::InvalidRelationship { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_master_catalog_entries_that_cannot_resolve() {
-        let package = rezip_parts(&[
-            ("[Content_Types].xml".to_owned(), br#"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Override PartName='/visio/document.xml' ContentType='application/vnd.ms-visio.drawing.main+xml'/></Types>"#.to_vec()),
-            ("_rels/.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/document' Target='visio/document.xml'/></Relationships>"#.to_vec()),
-            ("visio/document.xml".to_owned(), b"<VisioDocument/>".to_vec()),
-            ("visio/_rels/document.xml.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/masters' Target='masters/masters.xml'/></Relationships>"#.to_vec()),
-            ("visio/masters/masters.xml".to_owned(), br#"<Masters><Master ID='1' r:id='rId1'/></Masters>"#.to_vec()),
-        ]).unwrap();
-        assert!(matches!(
-            parse_vsdx(&package),
-            Err(VsdxError::InvalidRelationship { .. })
-        ));
+            ("visio/_rels/document.xml.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/pages' Target='pages/pages.xml'/><Relationship Id='r2' Type='http://schemas.microsoft.com/visio/2010/relationships/masters' Target='masters/masters.xml'/></Relationships>"#.to_vec()),
+            ("visio/pages/pages.xml".to_owned(), br#"<Pages><Page ID='1'/></Pages>"#.to_vec()),
+            ("visio/pages/_rels/pages.xml.rels".to_owned(), br#"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='r1' Type='http://schemas.microsoft.com/visio/2010/relationships/page' Target='page1.xml'/></Relationships>"#.to_vec()),
+            ("visio/pages/page1.xml".to_owned(), b"<PageContents/>".to_vec()),
+            // No `visio/masters/_rels/masters.xml.rels` companion part: a Masters part with no
+            // masters legitimately has no relationships file at all.
+            ("visio/masters/masters.xml".to_owned(), b"<Masters/>".to_vec()),
+        ])
+        .unwrap();
+        let parsed = parse_vsdx(&package).unwrap();
+        assert_eq!(parsed.master_part_paths, Vec::<String>::new());
     }
 
     #[test]

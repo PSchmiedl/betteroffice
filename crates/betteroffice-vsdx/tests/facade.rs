@@ -121,6 +121,7 @@ fn edit(
             sheet: CellSheet::Page(page_id),
             shape_id: Some(shape_id),
             section: None,
+            section_index: None,
             row: None,
             cell_name: name.to_owned(),
         },
@@ -406,7 +407,6 @@ fn setatref_redirects_to_page_and_document_sheets_without_touching_the_source() 
 fn mixed_mutation_failures_never_produce_a_partial_package() {
     for (failing, formula) in [
         ("<Cell N='PinX' F='GUARD(1)' V='1'/>", "4"),
-        ("<Cell N='PinX' V='1'/>", "Unknown(1)"),
         ("<Cell N='PinX' F='SETATREF(Target,1)' V='1'/>", "4"),
     ] {
         let (source, diagram, page_id) = diagram_with_page(&format!(
@@ -443,6 +443,7 @@ fn saves_a_semantic_cell_edit_without_source_spans() {
                 sheet: CellSheet::Page(page_id),
                 shape_id: Some(1),
                 section: None,
+                section_index: None,
                 row: None,
                 cell_name: "Both".to_owned(),
             },
@@ -460,6 +461,72 @@ fn saves_a_semantic_cell_edit_without_source_spans() {
                 && cell.value.as_deref() == Some("42")
         })
     }));
+}
+
+#[test]
+fn unevaluable_formula_edits_drop_the_stale_cache() {
+    let (_, diagram, page_id) = diagram_with_page(
+        "<PageContents><Shapes><Shape ID='1'><Cell N='PinX' F='1' V='1'/></Shape></Shapes></PageContents>",
+    );
+    let saved = diagram
+        .save_cell_edits(&[edit(
+            page_id,
+            1,
+            "PinX",
+            "Unknown(1)",
+            MutationGesture::MoveX,
+        )])
+        .unwrap();
+    let after = parts(&saved);
+    assert_eq!(
+        std::str::from_utf8(&after["visio/pages/page1.xml"]).unwrap(),
+        "<PageContents><Shapes><Shape ID='1'><Cell N='PinX' F='Unknown(1)'/></Shape></Shapes></PageContents>"
+    );
+    let reopened = Diagram::open(&saved).unwrap();
+    let page = reopened.pages().next().unwrap();
+    let shape = page.shapes().next().unwrap();
+    let cell = shape
+        .model()
+        .cells()
+        .find(|cell| cell.name == "PinX")
+        .unwrap();
+    assert_eq!(cell.formula.as_deref(), Some("Unknown(1)"));
+    assert_eq!(cell.value.as_deref(), None);
+}
+
+#[test]
+fn session_formula_edits_recompute_or_drop_caches() {
+    let source = include_bytes!("../../vsdx-parse/tests/fixtures/foundation.vsdx");
+    let session = DiagramSession::open(source, 7).unwrap();
+    let context = EditCtx::local("test");
+    session
+        .set_cell_formula(&context, "page:1", "page:1:shape:1", "FOnly", "42")
+        .unwrap();
+    session
+        .set_cell_formula(&context, "page:1", "page:1:shape:1", "Both", "Width*3")
+        .unwrap();
+    assert!(session.save().is_ok());
+    let saved = Diagram::open(source)
+        .unwrap()
+        .save_session(&session)
+        .unwrap();
+    let reopened = Diagram::open(&saved).unwrap();
+    let page = reopened.pages().next().unwrap();
+    let shape = page.shapes().next().unwrap();
+    let fonly = shape
+        .model()
+        .cells()
+        .find(|cell| cell.name == "FOnly")
+        .unwrap();
+    assert_eq!(fonly.formula.as_deref(), Some("42"));
+    assert_eq!(fonly.value.as_deref(), Some("42"));
+    let both = shape
+        .model()
+        .cells()
+        .find(|cell| cell.name == "Both")
+        .unwrap();
+    assert_eq!(both.formula.as_deref(), Some("Width*3"));
+    assert_eq!(both.value.as_deref(), None);
 }
 
 #[test]
@@ -506,6 +573,37 @@ fn mixed_cell_and_structural_edits_are_atomic() {
             .part_bytes("visio/pages/page1.xml")
             .unwrap(),
         parts(&locked_source)["visio/pages/page1.xml"]
+    );
+}
+
+#[test]
+fn structural_deletion_is_authorized_against_a_lock_the_same_batch_sets() {
+    let (source, diagram, page_id) = diagram_with_page(
+        "<PageContents><Shapes><Shape ID='1'><Cell N='LockDelete' V='0'/></Shape></Shapes></PageContents>",
+    );
+    assert!(
+        diagram
+            .save_edits(
+                &[edit(
+                    page_id,
+                    1,
+                    "LockDelete",
+                    "1",
+                    MutationGesture::CellEdit
+                )],
+                &[StructuralEdit::DeleteShape {
+                    page_id,
+                    shape_id: 1,
+                }],
+            )
+            .is_err()
+    );
+    assert_eq!(
+        diagram
+            .package()
+            .part_bytes("visio/pages/page1.xml")
+            .unwrap(),
+        parts(&source)["visio/pages/page1.xml"]
     );
 }
 
@@ -654,10 +752,12 @@ fn draft_cell(
     row: Option<CellRow>,
 ) -> CellSnapshot {
     CellSnapshot {
+        row_type: None,
         locator: CellLocator {
             sheet: CellSheet::Page(1),
             shape_id: Some(99),
             section: section.map(str::to_owned),
+            section_index: None,
             row,
             cell_name: name.to_owned(),
         },
@@ -679,7 +779,6 @@ fn session_added_shapes_reach_the_saved_package() {
             &EditCtx::local("a"),
             &page,
             &ShapeDraft {
-                source_id: 99,
                 name: Some("Added".to_owned()),
                 cells: vec![
                     draft_cell("Width", "5", None, None),
@@ -715,30 +814,6 @@ fn session_added_shapes_reach_the_saved_package() {
 }
 
 #[test]
-fn session_added_shapes_do_not_leak_into_cell_edits() {
-    let (source, _, _) = diagram_with_page(
-        "<PageContents><Shapes><Shape ID='1'><Cell N='Width' V='1'/></Shape></Shapes></PageContents>",
-    );
-    let session = DiagramSession::open(&source, 7).unwrap();
-    let page = session.snapshot().unwrap().pages[0].id.clone();
-    session
-        .add_shape(
-            &EditCtx::local("a"),
-            &page,
-            &ShapeDraft {
-                source_id: 99,
-                name: None,
-                cells: vec![draft_cell("Width", "5", None, None)],
-            },
-        )
-        .unwrap();
-    let export = session.export().unwrap();
-    assert!(export.cell_edits.is_empty());
-    assert_eq!(export.added_shapes.len(), 1);
-    assert_eq!(export.added_shapes[0].cells.len(), 1);
-}
-
-#[test]
 fn added_shape_drafts_evaluate_against_their_own_cells() {
     let (source, diagram, _) = diagram_with_page(
         "<PageContents><Shapes><Shape ID='1'><Cell N='Width' V='1'/></Shape></Shapes></PageContents>",
@@ -750,7 +825,6 @@ fn added_shape_drafts_evaluate_against_their_own_cells() {
             &EditCtx::local("a"),
             &page,
             &ShapeDraft {
-                source_id: 99,
                 name: Some("Added".to_owned()),
                 cells: vec![
                     draft_cell("Width", "5", None, None),

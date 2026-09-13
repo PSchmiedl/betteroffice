@@ -78,6 +78,11 @@ enum Tok {
     End,
     Invalid(String),
 }
+struct ParsedExpr {
+    expression: Expr,
+    depth: usize,
+}
+
 struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     current: Tok,
@@ -106,7 +111,7 @@ impl<'a> Parser<'a> {
                 message: "unexpected token".into(),
             });
         }
-        Ok(expr)
+        Ok(expr.expression)
     }
     fn node(&mut self) -> Result<(), Diagnostic> {
         self.nodes += 1;
@@ -156,12 +161,17 @@ impl<'a> Parser<'a> {
                     Tok::Op(Op::Gt)
                 }
             }
-            '"' => Tok::String(
-                self.chars
-                    .by_ref()
-                    .take_while(|value| *value != '"')
-                    .collect(),
-            ),
+            '"' => {
+                let mut value = String::new();
+                loop {
+                    match self.chars.next() {
+                        Some('"') if self.chars.next_if_eq(&'"').is_some() => value.push('"'),
+                        Some('"') => break Tok::String(value),
+                        Some(character) => value.push(character),
+                        None => break Tok::Invalid("unterminated formula string".into()),
+                    }
+                }
+            }
             value if value.is_ascii_digit() || value == '.' => self.number(value),
             value => {
                 let mut ident = value.to_string();
@@ -226,20 +236,20 @@ impl<'a> Parser<'a> {
         number *= scale;
         Tok::Number(number, unit)
     }
-    fn cmp(&mut self) -> Result<Expr, Diagnostic> {
+    fn cmp(&mut self) -> Result<ParsedExpr, Diagnostic> {
         self.chain(Self::add, &[Op::Eq, Op::Ne, Op::Lt, Op::Le, Op::Gt, Op::Ge])
     }
-    fn add(&mut self) -> Result<Expr, Diagnostic> {
+    fn add(&mut self) -> Result<ParsedExpr, Diagnostic> {
         self.chain(Self::mul, &[Op::Add, Op::Sub])
     }
-    fn mul(&mut self) -> Result<Expr, Diagnostic> {
+    fn mul(&mut self) -> Result<ParsedExpr, Diagnostic> {
         self.chain(Self::pow, &[Op::Mul, Op::Div])
     }
     fn chain(
         &mut self,
-        parse: fn(&mut Self) -> Result<Expr, Diagnostic>,
+        parse: fn(&mut Self) -> Result<ParsedExpr, Diagnostic>,
         allowed: &[Op],
-    ) -> Result<Expr, Diagnostic> {
+    ) -> Result<ParsedExpr, Diagnostic> {
         let mut left = parse(self)?;
         while let Tok::Op(op) = self.current {
             if !allowed.contains(&op) {
@@ -247,11 +257,16 @@ impl<'a> Parser<'a> {
             }
             self.next();
             self.node()?;
-            left = Expr::Binary(Box::new(left), op, Box::new(parse(self)?));
+            let right = parse(self)?;
+            let depth = self.ast_depth(left.depth.max(right.depth))?;
+            left = ParsedExpr {
+                expression: Expr::Binary(Box::new(left.expression), op, Box::new(right.expression)),
+                depth,
+            };
         }
         Ok(left)
     }
-    fn pow(&mut self) -> Result<Expr, Diagnostic> {
+    fn pow(&mut self) -> Result<ParsedExpr, Diagnostic> {
         let left = self.primary()?;
         if self.current == Tok::Op(Op::Pow) {
             self.next();
@@ -259,12 +274,29 @@ impl<'a> Parser<'a> {
             let right = self.pow()?;
             self.depth -= 1;
             self.node()?;
-            Ok(Expr::Binary(Box::new(left), Op::Pow, Box::new(right)))
+            let depth = self.ast_depth(left.depth.max(right.depth))?;
+            Ok(ParsedExpr {
+                expression: Expr::Binary(
+                    Box::new(left.expression),
+                    Op::Pow,
+                    Box::new(right.expression),
+                ),
+                depth,
+            })
         } else {
             Ok(left)
         }
     }
-    fn primary(&mut self) -> Result<Expr, Diagnostic> {
+    fn ast_depth(&self, children: usize) -> Result<usize, Diagnostic> {
+        let depth = children.saturating_add(1);
+        if depth > self.limits.max_depth {
+            return Err(Diagnostic {
+                message: "formula depth limit exceeded".into(),
+            });
+        }
+        Ok(depth)
+    }
+    fn primary(&mut self) -> Result<ParsedExpr, Diagnostic> {
         if self.depth >= self.limits.max_depth {
             return Err(Diagnostic {
                 message: "formula depth limit exceeded".into(),
@@ -274,12 +306,18 @@ impl<'a> Parser<'a> {
             Tok::Number(number, unit) => {
                 self.next();
                 self.node()?;
-                Ok(Expr::Number(number, unit))
+                Ok(ParsedExpr {
+                    expression: Expr::Number(number, unit),
+                    depth: 1,
+                })
             }
             Tok::String(value) => {
                 self.next();
                 self.node()?;
-                Ok(Expr::String(value))
+                Ok(ParsedExpr {
+                    expression: Expr::String(value),
+                    depth: 1,
+                })
             }
             Tok::Op(Op::Sub) => {
                 self.next();
@@ -287,13 +325,20 @@ impl<'a> Parser<'a> {
                 let value = self.primary()?;
                 self.depth -= 1;
                 self.node()?;
-                Ok(Expr::Unary(Box::new(value)))
+                let depth = self.ast_depth(value.depth)?;
+                Ok(ParsedExpr {
+                    expression: Expr::Unary(Box::new(value.expression)),
+                    depth,
+                })
             }
             Tok::Ident(name) => {
                 self.next();
                 if self.current != Tok::L {
                     self.node()?;
-                    return Ok(Expr::Reference(name));
+                    return Ok(ParsedExpr {
+                        expression: Expr::Reference(name),
+                        depth: 1,
+                    });
                 }
                 self.depth += 1;
                 self.next();
@@ -315,7 +360,14 @@ impl<'a> Parser<'a> {
                 self.next();
                 self.depth -= 1;
                 self.node()?;
-                Ok(Expr::Call(name, args))
+                let depth = self.ast_depth(args.iter().map(|arg| arg.depth).max().unwrap_or(0))?;
+                Ok(ParsedExpr {
+                    expression: Expr::Call(
+                        name,
+                        args.into_iter().map(|arg| arg.expression).collect(),
+                    ),
+                    depth,
+                })
             }
             Tok::L => {
                 self.depth += 1;
@@ -359,6 +411,7 @@ struct NumberEngine<'a, F> {
     limits: Limits,
     resolve: &'a mut F,
     active: HashSet<String>,
+    remaining_steps: usize,
 }
 
 impl<'a, F: FnMut(&str) -> Option<String>> NumberEngine<'a, F> {
@@ -367,6 +420,7 @@ impl<'a, F: FnMut(&str) -> Option<String>> NumberEngine<'a, F> {
             limits,
             resolve,
             active: HashSet::new(),
+            remaining_steps: limits.max_nodes,
         }
     }
 
@@ -375,6 +429,7 @@ impl<'a, F: FnMut(&str) -> Option<String>> NumberEngine<'a, F> {
     }
 
     fn evaluate_at(&mut self, expr: &Expr, depth: usize) -> Option<f64> {
+        self.remaining_steps = self.remaining_steps.checked_sub(1)?;
         if depth > self.limits.max_depth {
             return None;
         }
@@ -406,5 +461,57 @@ impl<'a, F: FnMut(&str) -> Option<String>> NumberEngine<'a, F> {
             _ => None,
         }
         .filter(|value| value.is_finite())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> Limits {
+        Limits {
+            max_depth: 256,
+            max_nodes: 8192,
+            max_tokens: 16384,
+        }
+    }
+
+    #[test]
+    fn operator_chains_respect_the_ast_depth_limit() {
+        let limits = Limits {
+            max_depth: 4,
+            ..limits()
+        };
+        for formula in ["1+2+3+4+5", "1*2*3*4*5", "1+2*3^4^5", "ABS(1+2+3+4)"] {
+            assert!(parse(formula, limits).is_err(), "{formula}");
+        }
+        for formula in ["1+2+3+4", "1*2*3*4", "ABS(1+2+3)"] {
+            assert!(parse(formula, limits).is_ok(), "{formula}");
+        }
+    }
+
+    #[test]
+    fn strings_require_a_closing_quote_and_decode_escaped_quotes() {
+        assert!(parse("\"unterminated", limits()).is_err());
+        assert_eq!(
+            parse("\"a\"\"b\"", limits()).unwrap(),
+            Expr::String("a\"b".into())
+        );
+    }
+
+    #[test]
+    fn repeated_references_share_an_evaluation_budget() {
+        let mut calls = 0;
+        let result = evaluate_number("N0", limits(), &mut |name| {
+            calls += 1;
+            let index: usize = name.strip_prefix('N')?.parse().ok()?;
+            Some(if index == 30 {
+                "1".into()
+            } else {
+                format!("N{0}+N{0}", index + 1)
+            })
+        });
+        assert_eq!(result, None);
+        assert!(calls < limits().max_nodes);
     }
 }

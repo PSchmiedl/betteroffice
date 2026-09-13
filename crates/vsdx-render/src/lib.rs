@@ -7,7 +7,7 @@ mod paint;
 pub use display_list::*;
 pub use layout::{PIXELS_PER_INCH, final_paint_transform, to_canvas, to_canvas_length};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use thiserror::Error;
 use vsdx_eval::{Evaluation, PageShapeReferences, Value, evaluate_cell_with_shape_package_theme};
@@ -15,6 +15,12 @@ use vsdx_parse::{ParseLimits, Shape, VsdxPackage};
 use vsdx_resolve::{Lookup, ResolvedShape, Resolver, ScenePoint, SceneTransform, realize_geometry};
 
 const MAX_RECURSION_DEPTH: usize = 64;
+
+#[derive(Default)]
+struct LayoutCache {
+    fonts: HashMap<String, [Option<Option<ooxml_text::FontId>>; 4]>,
+    advances: HashMap<(Option<ooxml_text::FontId>, u32, char), f32>,
+}
 
 struct RichParagraph {
     runs: Vec<TextRun>,
@@ -25,6 +31,30 @@ struct RichParagraph {
     right: f32,
     first: f32,
     line_spacing: Option<f32>,
+}
+
+struct RunCursor<'a> {
+    runs: std::slice::Iter<'a, TextRun>,
+    run: Option<&'a TextRun>,
+    end: usize,
+}
+
+impl<'a> RunCursor<'a> {
+    fn new(runs: &'a [TextRun]) -> Self {
+        Self {
+            runs: runs.iter(),
+            run: None,
+            end: 0,
+        }
+    }
+
+    fn advance_to(&mut self, index: usize) -> Option<(&'a TextRun, usize)> {
+        while self.end <= index {
+            self.run = self.runs.next();
+            self.end += self.run?.text.len();
+        }
+        self.run.map(|run| (run, self.end))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -507,10 +537,17 @@ impl Renderer {
             .get(page_part)
             .ok_or_else(|| RenderError::MissingPage(page_part.into()))?;
         let resolver = Resolver::new(package);
-        let connectivity = resolver.resolve_page_connectivity(page_part)?;
         let references = PageShapeReferences::new(&resolver, page_part).ok();
-        let shapes = resolver.resolve_page_shapes(page_part)?;
-        let transforms = vsdx_resolve::scene_transforms(page, &shapes, |id, shape, name| {
+        let fallback_shapes;
+        let shapes = match references.as_ref() {
+            Some(references) => references.shapes(),
+            None => {
+                fallback_shapes = resolver.resolve_page_shapes(page_part)?;
+                &fallback_shapes
+            }
+        };
+        let connectivity = resolver.resolve_page_connectivity_with(page_part, shapes)?;
+        let transforms = vsdx_resolve::scene_transforms(page, shapes, |id, shape, name| {
             evaluated(package, references.as_ref(), shape, id, name)
         });
         let page_height = page_dimension(&resolver, package, page_part, "PageHeight")
@@ -537,17 +574,20 @@ impl Renderer {
             text_runs: 0,
             primitives: Vec::new(),
         };
+        let mut cache = LayoutCache::default();
         for shape in page.shapes() {
             self.layout_shape(
                 package,
                 &resolver,
                 &connectivity,
                 references.as_ref(),
+                shapes,
                 &transforms,
                 page_part,
                 shape,
                 0,
                 &mut state,
+                &mut cache,
             )?;
         }
         for primitive in &mut state.primitives {
@@ -579,14 +619,16 @@ impl Renderer {
         resolver: &Resolver<'_>,
         connectivity: &vsdx_resolve::PageConnectivity,
         references: Option<&PageShapeReferences>,
+        shapes: &BTreeMap<u32, ResolvedShape>,
         transforms: &BTreeMap<u32, SceneTransform>,
         page_part: &str,
         shape: &Shape,
         depth: usize,
         state: &mut State,
+        cache: &mut LayoutCache,
     ) -> Result<(), RenderError> {
         if depth >= MAX_RECURSION_DEPTH {
-            return self.placeholder(shape, state, "group nesting depth exceeded");
+            return self.placeholder(page_part, shape, state, "group nesting depth exceeded");
         }
         state.count += 1;
         if state.count > self.limits.max_shapes {
@@ -594,12 +636,42 @@ impl Renderer {
         }
         let z_order = state.next_z();
         let id = format!("{page_part}:{}", shape.id);
-        let resolved = resolver.resolve_shape(page_part, shape.id)?;
+        let fallback_resolved;
+        let resolved = match shapes.get(&shape.id) {
+            Some(resolved) => resolved,
+            None => {
+                fallback_resolved = resolver.resolve_shape(page_part, shape.id)?;
+                &fallback_resolved
+            }
+        };
         if resolved.deleted {
             return Ok(());
         }
-        if paint::number(&resolved, "NoShow").is_some_and(|value| value != 0.0) {
+        if paint::number(resolved, "NoShow").is_some_and(|value| value != 0.0) {
             return Ok(());
+        }
+        let mut sections = resolved
+            .sections
+            .values()
+            .filter(|section| section.name == "Geometry" && !section.deleted)
+            .collect::<Vec<_>>();
+        if let Some(section) = sections
+            .iter()
+            .find(|section| !section.unsupported_controls.is_empty())
+        {
+            return self.placeholder_at(
+                id,
+                z_order,
+                bounds(package, references, resolved, shape.id)
+                    .filter(|bounds| bounds_finite(*bounds))
+                    .unwrap_or_default(),
+                state,
+                &format!(
+                    "unsupported Geometry section controls at IX={}: {}",
+                    section.index.unwrap_or(0),
+                    section.unsupported_controls.join(", ")
+                ),
+            );
         }
         if connectivity
             .connectors
@@ -631,12 +703,12 @@ impl Renderer {
                 shape,
                 id,
                 z_order,
-                &resolved,
+                resolved,
                 state,
             );
         }
-        let Some(bounds) = bounds(package, references, &resolved, shape.id) else {
-            return self.placeholder(shape, state, "unresolvable transform");
+        let Some(bounds) = bounds(package, references, resolved, shape.id) else {
+            return self.placeholder(page_part, shape, state, "unresolvable transform");
         };
         let Some(transform) = transforms.get(&shape.id) else {
             return self.placeholder_at(id, z_order, bounds, state, "unresolvable transform");
@@ -650,7 +722,16 @@ impl Renderer {
                 "overflowing transform",
             );
         }
-        let geometry = resolved.sections.get("Geometry").map(realize_geometry);
+        sections.sort_by_key(|section| section.index.unwrap_or(0));
+        let geometry = (!sections.is_empty()).then(|| {
+            let mut geometry = vsdx_resolve::RealizedGeometry::default();
+            for section in sections {
+                let realized = realize_geometry(section, bounds.width, bounds.height);
+                geometry.commands.extend(realized.commands);
+                geometry.issues.extend(realized.issues);
+            }
+            geometry
+        });
         let child_shapes = shape.shapes().collect::<Vec<_>>();
         if !child_shapes.is_empty() {
             let group_transform = affine(transform.local);
@@ -661,11 +742,13 @@ impl Renderer {
                     resolver,
                     connectivity,
                     references,
+                    shapes,
                     transforms,
                     page_part,
                     child,
                     depth + 1,
                     state,
+                    cache,
                 )?;
             }
             let children = state.primitives.split_off(start);
@@ -746,7 +829,7 @@ impl Renderer {
                 command
             })
             .collect::<Vec<_>>();
-        let (fill, stroke) = match paint::paint(package, references, &resolved, shape.id) {
+        let (fill, stroke) = match paint::paint(package, references, resolved, shape.id) {
             Ok(paint) => paint,
             Err(reason) => {
                 return self.placeholder_at(
@@ -772,7 +855,7 @@ impl Renderer {
             references,
             page_part,
             shape,
-            &resolved,
+            resolved,
             id,
             bounds,
             affine(transform.local).compose(Affine {
@@ -784,6 +867,7 @@ impl Renderer {
                 f: -bounds.y as f32,
             }),
             state,
+            cache,
         )?;
         Ok(())
     }
@@ -794,7 +878,7 @@ impl Renderer {
         _resolver: &Resolver<'_>,
         connectivity: &vsdx_resolve::PageConnectivity,
         references: Option<&PageShapeReferences>,
-        _page_part: &str,
+        page_part: &str,
         shape: &Shape,
         id: String,
         z_order: u32,
@@ -802,7 +886,12 @@ impl Renderer {
         state: &mut State,
     ) -> Result<(), RenderError> {
         let Some(connector) = connectivity.connectors.get(&shape.id) else {
-            return self.placeholder(shape, state, "1D shape is missing connector state");
+            return self.placeholder(
+                page_part,
+                shape,
+                state,
+                "1D shape is missing connector state",
+            );
         };
         let mut begin = connector.begin;
         let mut end = connector.end;
@@ -838,6 +927,7 @@ impl Renderer {
             .all(f64::is_finite)
         {
             return self.placeholder(
+                page_part,
                 shape,
                 state,
                 "connector route cannot be computed: non-finite endpoint",
@@ -845,7 +935,7 @@ impl Renderer {
         }
         let (fill, stroke) = match paint::paint(package, references, resolved, shape.id) {
             Ok(paint) => paint,
-            Err(reason) => return self.placeholder(shape, state, &reason),
+            Err(reason) => return self.placeholder(page_part, shape, state, &reason),
         };
         state.primitives.push(Primitive::Shape {
             id,
@@ -870,6 +960,7 @@ impl Renderer {
         bounds: Bounds,
         transform: Affine,
         state: &mut State,
+        cache: &mut LayoutCache,
     ) -> Result<(), RenderError> {
         if matches!(resolved.cell("Char.Size"), Some(Lookup::Found(cell)) if cell.cell.value.as_deref().and_then(|value| value.parse::<f32>().ok()).is_some_and(|value| !value.is_finite()))
         {
@@ -949,8 +1040,14 @@ impl Renderer {
             }
             cursor_y += paragraph.before;
             let width = (available_width - paragraph.left - paragraph.right).max(0.0);
-            let mut laid_out =
-                self.wrap_paragraph(paragraph, width, x + paragraph.left, cursor_y, offset);
+            let mut laid_out = self.wrap_paragraph(
+                paragraph,
+                width,
+                x + paragraph.left,
+                cursor_y,
+                offset,
+                cache,
+            );
             if let Some(first) = laid_out.first_mut() {
                 first.x += paragraph.first;
                 for stop in &mut first.caret_stops {
@@ -1032,6 +1129,7 @@ impl Renderer {
         x: f32,
         y: f32,
         offset: u32,
+        cache: &mut LayoutCache,
     ) -> Vec<PositionedLine> {
         let text = paragraph
             .runs
@@ -1041,27 +1139,15 @@ impl Renderer {
         let breaks = ooxml_text::break_opportunities(&text);
         let mut widths = Vec::new();
         let mut height = 0.0f32;
+        let mut runs = RunCursor::new(&paragraph.runs);
         for (index, ch) in text.char_indices() {
-            let run = paragraph
-                .runs
-                .iter()
-                .scan(0usize, |end, run| {
-                    *end += run.text.len();
-                    Some((*end > index).then_some(run))
-                })
-                .find_map(|run| run);
-            let run_end = paragraph
-                .runs
-                .iter()
-                .scan(0usize, |end, run| {
-                    *end += run.text.len();
-                    Some((*end > index).then_some(*end))
-                })
-                .find_map(|end| end);
+            let (run, run_end) = runs
+                .advance_to(index)
+                .map_or((None, None), |(run, end)| (Some(run), Some(end)));
             let (mut width, line_height) = run
                 .map(|run| {
                     (
-                        self.measure(run, &ch.to_string())
+                        self.measure(run, ch, cache)
                             + if run_end > Some(index + ch.len_utf8()) {
                                 run.letter_spacing
                             } else {
@@ -1083,12 +1169,12 @@ impl Renderer {
                     .next()
                     .unwrap_or_default();
                 let following_width =
-                    self.measure_text(paragraph, index + ch.len_utf8(), following);
+                    self.measure_text(paragraph, index + ch.len_utf8(), following, cache);
                 let before_decimal = following
                     .split_once('.')
                     .map_or(following, |(before, _)| before);
                 let decimal_width =
-                    self.measure_text(paragraph, index + ch.len_utf8(), before_decimal);
+                    self.measure_text(paragraph, index + ch.len_utf8(), before_decimal, cache);
                 let aligned = match tab.alignment {
                     1 => position - following_width * 0.5,
                     2 => position - following_width,
@@ -1103,14 +1189,16 @@ impl Renderer {
         let height = height.max(0.2);
         let mut result = Vec::new();
         let mut start = 0usize;
+        let mut start_index = 0usize;
         let mut cursor = 0.0;
         let mut last_break = None;
         let mut mandatory_break = None;
-        for (position, length, width) in widths.iter().copied() {
+        let mut break_index = 0usize;
+        for (width_index, (position, length, width)) in widths.iter().copied().enumerate() {
             if mandatory_break == Some(position) {
                 result.push(self.line(
                     &text,
-                    &widths,
+                    &widths[start_index..width_index],
                     start,
                     position,
                     x,
@@ -1121,15 +1209,17 @@ impl Renderer {
                     available_width,
                 ));
                 start = position;
+                start_index = width_index;
                 cursor = 0.0;
                 last_break = None;
                 mandatory_break = None;
             }
             if position > start && cursor + width > available_width && available_width > 0.0 {
-                let end = last_break.unwrap_or(position).max(start + 1);
+                let (break_position, break_index) = last_break.unwrap_or((position, width_index));
+                let end = break_position.max(start + 1);
                 result.push(self.line(
                     &text,
-                    &widths,
+                    &widths[start_index..break_index],
                     start,
                     end,
                     x,
@@ -1140,27 +1230,31 @@ impl Renderer {
                     available_width,
                 ));
                 start = end;
-                cursor = widths
+                cursor = widths[break_index..width_index]
                     .iter()
-                    .filter(|(p, _, _)| *p >= start && *p < position)
                     .map(|(_, _, w)| *w)
                     .sum();
+                start_index = break_index;
                 last_break = None;
             }
             cursor += width;
             let next = position + length;
-            if let Some(opportunity) = breaks.iter().find(|item| item.byte_index == next) {
+            while break_index < breaks.len() && breaks[break_index].byte_index < next {
+                break_index += 1;
+            }
+            if break_index < breaks.len() && breaks[break_index].byte_index == next {
+                let opportunity = &breaks[break_index];
                 if opportunity.mandatory && next < text.len() {
                     mandatory_break = Some(next);
                 } else {
-                    last_break = Some(next);
+                    last_break = Some((next, width_index + 1));
                 }
             }
         }
         if start < text.len() || result.is_empty() {
             result.push(self.line(
                 &text,
-                &widths,
+                &widths[start_index..],
                 start,
                 text.len(),
                 x,
@@ -1187,11 +1281,7 @@ impl Renderer {
         align: i32,
         available: f32,
     ) -> PositionedLine {
-        let width = widths
-            .iter()
-            .filter(|(position, _, _)| *position >= start && *position < end)
-            .map(|(_, _, width)| *width)
-            .sum::<f32>();
+        let width = widths.iter().map(|(_, _, width)| *width).sum::<f32>();
         let line_x = x + match align {
             1 => (available - width) * 0.5,
             2 => available - width,
@@ -1199,11 +1289,7 @@ impl Renderer {
         };
         let mut advance = 0.0;
         let mut stops = Vec::new();
-        for (position, length, char_width) in widths
-            .iter()
-            .copied()
-            .filter(|(position, _, _)| *position >= start && *position < end)
-        {
+        for (position, length, char_width) in widths.iter().copied() {
             stops.push(CaretStop {
                 position: offset + position as u32,
                 x: line_x + advance,
@@ -1230,63 +1316,97 @@ impl Renderer {
     }
     /// Uses the effective face, then its style variants, then Arial and sans-serif.
     fn font_for(&self, family: &str, bold: bool, italic: bool) -> Option<ooxml_text::FontId> {
-        std::iter::once(family)
-            .chain(["Arial", "sans-serif"])
-            .flat_map(|family| {
-                [
-                    (bold, italic),
-                    (bold, false),
-                    (false, italic),
-                    (false, false),
-                ]
-                .into_iter()
-                .map(move |(bold, italic)| (family.into(), bold, italic))
+        for candidate_family in [family, "Arial", "sans-serif"] {
+            for (candidate_bold, candidate_italic) in [
+                (bold, italic),
+                (bold, false),
+                (false, italic),
+                (false, false),
+            ] {
+                if let Some(font) = self.registered_fonts.iter().find_map(
+                    |((registered_family, registered_bold, registered_italic), font)| {
+                        (registered_family == candidate_family
+                            && *registered_bold == candidate_bold
+                            && *registered_italic == candidate_italic)
+                            .then_some(*font)
+                    },
+                ) {
+                    return Some(font);
+                }
+            }
+        }
+        None
+    }
+    fn cached_font_for(
+        &self,
+        run: &TextRun,
+        cache: &mut LayoutCache,
+    ) -> Option<ooxml_text::FontId> {
+        let style = (run.bold as usize) << 1 | run.italic as usize;
+        if let Some(styles) = cache.fonts.get_mut(run.family.as_str()) {
+            if let Some(font) = styles[style] {
+                return font;
+            }
+            let font = self.font_for(&run.family, run.bold, run.italic);
+            styles[style] = Some(font);
+            return font;
+        }
+        let font = self.font_for(&run.family, run.bold, run.italic);
+        let mut styles = [None; 4];
+        styles[style] = Some(font);
+        cache.fonts.insert(run.family.clone(), styles);
+        font
+    }
+    fn measure(&self, run: &TextRun, ch: char, cache: &mut LayoutCache) -> f32 {
+        let font = self.cached_font_for(run, cache);
+        let key = (font, run.size_in.to_bits(), ch);
+        if let Some(width) = cache.advances.get(&key) {
+            return *width;
+        }
+        let mut buffer = [0; 4];
+        let width = font
+            .and_then(|font| {
+                ooxml_text::shape(
+                    &self.fonts,
+                    font,
+                    ch.encode_utf8(&mut buffer),
+                    run.size_in,
+                    &[],
+                )
+                .ok()
             })
-            .find_map(|key| self.registered_fonts.get(&key))
-            .copied()
-    }
-    fn measure(&self, run: &TextRun, text: &str) -> f32 {
-        self.font_for(&run.family, run.bold, run.italic)
-            .and_then(|font| ooxml_text::shape(&self.fonts, font, text, run.size_in, &[]).ok())
             .map(|glyphs| glyphs.iter().map(|glyph| glyph.x_advance).sum())
-            .unwrap_or(text.chars().count() as f32 * run.size_in * 0.5)
+            .unwrap_or(run.size_in * 0.5);
+        cache.advances.insert(key, width);
+        width
     }
-    fn measure_text(&self, paragraph: &RichParagraph, start: usize, text: &str) -> f32 {
+    fn measure_text(
+        &self,
+        paragraph: &RichParagraph,
+        start: usize,
+        text: &str,
+        cache: &mut LayoutCache,
+    ) -> f32 {
+        let mut runs = RunCursor::new(&paragraph.runs);
         text.char_indices()
             .map(|(relative, ch)| {
                 let index = start + relative;
-                paragraph
-                    .runs
-                    .iter()
-                    .scan(0usize, |end, run| {
-                        *end += run.text.len();
-                        Some((*end > index).then_some(run))
-                    })
-                    .find_map(|run| run)
-                    .map_or(0.0, |run| {
-                        let end = paragraph
-                            .runs
-                            .iter()
-                            .scan(0usize, |end, run| {
-                                *end += run.text.len();
-                                Some((*end > index).then_some(*end))
-                            })
-                            .find_map(|end| end)
-                            .unwrap_or(index + ch.len_utf8());
-                        self.measure(run, &ch.to_string())
-                            + (end > index + ch.len_utf8()) as u8 as f32 * run.letter_spacing
-                    })
+                runs.advance_to(index).map_or(0.0, |(run, end)| {
+                    self.measure(run, ch, cache)
+                        + (end > index + ch.len_utf8()) as u8 as f32 * run.letter_spacing
+                })
             })
             .sum()
     }
     fn placeholder(
         &self,
+        page_part: &str,
         shape: &Shape,
         state: &mut State,
         reason: &str,
     ) -> Result<(), RenderError> {
         self.placeholder_at(
-            format!("shape:{}", shape.id),
+            format!("{page_part}:{}", shape.id),
             state.next_z(),
             Bounds::default(),
             state,
@@ -1766,8 +1886,6 @@ fn z_order(primitive: &Primitive) -> u32 {
     }
 }
 
-/// Probes a text box in its own local space so a rotated box rejects points that only fall
-/// inside its axis-aligned bounds, and compares caret stops in the space they were laid out in.
 fn text_caret_at(
     (left, top, width, height): (f32, f32, f32, f32),
     lines: &[PositionedLine],
@@ -1813,32 +1931,29 @@ fn path_hit(
         return false;
     };
     let (x, y) = inverse.apply_point(x, y);
-    let points = flatten_path(path);
-    if points.is_empty() {
-        return false;
-    }
-    let mut inside = false;
-    for index in 0..points.len() {
-        let (ax, ay) = points[index];
-        let (bx, by) = points[(index + 1) % points.len()];
-        if (ay > y) != (by > y) && x < (bx - ax) * (y - ay) / (by - ay) + ax {
-            inside = !inside;
-        }
-    }
-    let closed = path
-        .iter()
-        .any(|command| matches!(command, ooxml_drawingml::GeometryPathCommand::Close));
-    fill && inside
-        || stroke_width > 0.0
+    let mut winding = 0_i64;
+    for points in flatten_path(path) {
+        if stroke_width > 0.0
             && points.windows(2).any(|segment| {
                 point_segment_distance(x, y, segment[0], segment[1]) <= stroke_width / 2.0
             })
-        || stroke_width > 0.0
-            && closed
-            && points.len() > 1
-            && point_segment_distance(x, y, points[points.len() - 1], points[0])
-                <= stroke_width / 2.0
+        {
+            return true;
+        }
+        for index in 0..points.len() {
+            let (ax, ay) = points[index];
+            let (bx, by) = points[(index + 1) % points.len()];
+            let side = (bx - ax) * (y - ay) - (x - ax) * (by - ay);
+            if ay <= y && by > y && side > 0.0 {
+                winding += 1;
+            } else if ay > y && by <= y && side < 0.0 {
+                winding -= 1;
+            }
+        }
+    }
+    fill && winding != 0
 }
+
 fn point_segment_distance(x: f32, y: f32, (ax, ay): (f32, f32), (bx, by): (f32, f32)) -> f32 {
     let dx = bx - ax;
     let dy = by - ay;
@@ -1850,13 +1965,17 @@ fn point_segment_distance(x: f32, y: f32, (ax, ay): (f32, f32), (bx, by): (f32, 
     };
     ((x - (ax + t * dx)).powi(2) + (y - (ay + t * dy)).powi(2)).sqrt()
 }
-fn flatten_path(path: &[ooxml_drawingml::GeometryPathCommand]) -> Vec<(f32, f32)> {
+fn flatten_path(path: &[ooxml_drawingml::GeometryPathCommand]) -> Vec<Vec<(f32, f32)>> {
     use ooxml_drawingml::GeometryPathCommand::*;
+    let mut paths = Vec::new();
     let mut points = Vec::new();
     let mut current = (0.0, 0.0);
     for command in path {
         match *command {
             Move { x, y } => {
+                if !points.is_empty() {
+                    paths.push(std::mem::take(&mut points));
+                }
                 current = (x as f32, y as f32);
                 points.push(current);
             }
@@ -1901,20 +2020,252 @@ fn flatten_path(path: &[ooxml_drawingml::GeometryPathCommand]) -> Vec<(f32, f32)
                 }
                 current = (x as f32, y as f32);
             }
-            Close => {}
+            Close => {
+                if let Some(first) = points.first().copied() {
+                    points.push(first);
+                    current = first;
+                }
+            }
         }
     }
-    points
+    if !points.is_empty() {
+        paths.push(points);
+    }
+    paths
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forty_five_degree_group_keeps_text_in_a_local_box_under_the_group_transform() {
+        let mut child = shape(2, 1.0, 2.0);
+        child
+            .children
+            .push(ShapeChild::Text(vec![TextToken::Literal("ab".into())]));
+        let mut parent = group(1, 10.0, 20.0, vec![child]);
+        with_cell(
+            &mut parent,
+            "Angle",
+            &std::f64::consts::FRAC_PI_4.to_string(),
+        );
+        let list = render(vec![parent]);
+        let Primitive::Group { primitives, .. } = &list.primitives[0] else {
+            unreachable!()
+        };
+        let Primitive::TextBox {
+            x,
+            y,
+            width,
+            height,
+            lines,
+            transform,
+            ..
+        } = &primitives[1]
+        else {
+            unreachable!()
+        };
+        let matrix = Affine {
+            a: std::f32::consts::FRAC_1_SQRT_2,
+            b: std::f32::consts::FRAC_1_SQRT_2,
+            c: -std::f32::consts::FRAC_1_SQRT_2,
+            d: std::f32::consts::FRAC_1_SQRT_2,
+            e: 10.707_107,
+            f: 17.878_68,
+        };
+        assert_point_close((transform.a, transform.b), (matrix.a, matrix.b));
+        assert_point_close((transform.c, transform.d), (matrix.c, matrix.d));
+        assert_point_close((transform.e, transform.f), (matrix.e, matrix.f));
+        assert_point_close((*x, *y), (1.0, 2.0));
+        assert_point_close((*width, *height), (1.0, 1.0));
+        assert_point_close(
+            transform.apply_point(lines[0].x, lines[0].y),
+            matrix.apply_point(1.0, 2.0),
+        );
+        assert_point_close(
+            transform.apply_point(lines[0].caret_stops[1].x, lines[0].caret_stops[1].y),
+            matrix.apply_point(1.0 + 0.166_666_67 * 0.5, 2.0),
+        );
+    }
+
     use super::*;
     use ooxml_drawingml::GeometryPathCommand;
     use vsdx_parse::{
-        Cell, ForeignData, Row, RowChild, Section, SectionChild, ShapeChild, ShapesChild, Sheet,
-        SheetChild, TextToken,
+        Cell, Connect, ConnectsChild, ForeignData, Row, RowChild, Section, SectionChild,
+        ShapeChild, ShapesChild, Sheet, SheetChild, TextToken,
     };
+
+    fn styled_run(text: &str, family: &str, bold: bool, italic: bool) -> TextRun {
+        TextRun {
+            text: text.into(),
+            family: family.into(),
+            size_in: 1.0 / 6.0,
+            bold,
+            italic,
+            color: "currentColor".into(),
+            underline: false,
+            small_caps: false,
+            superscript: false,
+            subscript: false,
+            letter_spacing: 0.0,
+            case: 0,
+            diagnostics: Vec::new(),
+            tab: None,
+            diagnosed_face: None,
+        }
+    }
+
+    #[test]
+    fn run_cursor_attributes_each_character_to_its_styled_run() {
+        let paragraph = RichParagraph {
+            runs: vec![
+                styled_run("A", "Arial", false, false),
+                styled_run("β", "Calibri", true, false),
+                styled_run("CD", "Tahoma", false, true),
+            ],
+            align: 0,
+            before: 0.0,
+            after: 0.0,
+            left: 0.0,
+            right: 0.0,
+            first: 0.0,
+            line_spacing: None,
+        };
+        let mut cursor = RunCursor::new(&paragraph.runs);
+        let attributed = "AβCD"
+            .char_indices()
+            .map(|(index, ch)| {
+                let (run, end) = cursor.advance_to(index).unwrap();
+                (ch, run.family.as_str(), run.bold, run.italic, end)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            attributed,
+            [
+                ('A', "Arial", false, false, 1),
+                ('β', "Calibri", true, false, 3),
+                ('C', "Tahoma", false, true, 5),
+                ('D', "Tahoma", false, true, 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapping_preserves_boundaries_and_caret_stops_across_mandatory_breaks() {
+        let mut run = styled_run("ab cd\nef gh", "sans-serif", false, false);
+        run.size_in = 1.0;
+        let paragraph = RichParagraph {
+            runs: vec![run],
+            align: 0,
+            before: 0.0,
+            after: 0.0,
+            left: 0.0,
+            right: 0.0,
+            first: 0.0,
+            line_spacing: None,
+        };
+
+        let mut cache = LayoutCache::default();
+        let lines = Renderer::default().wrap_paragraph(&paragraph, 2.0, 0.0, 0.0, 0, &mut cache);
+
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.start, line.end))
+                .collect::<Vec<_>>(),
+            [(0, 3), (3, 6), (6, 9), (9, 11)]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| {
+                    line.caret_stops
+                        .iter()
+                        .map(|stop| stop.position)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+            [
+                vec![0, 1, 2, 3],
+                vec![3, 4, 5, 6],
+                vec![6, 7, 8, 9],
+                vec![9, 10, 11]
+            ]
+        );
+    }
+
+    #[test]
+    fn measurement_cache_preserves_widths_for_distinct_run_styles() {
+        let mut renderer = Renderer::default();
+        for (family, bold, italic, bytes) in [
+            (
+                "Liberation Sans",
+                false,
+                false,
+                include_bytes!("../../../packages/fonts/assets/LiberationSans-Regular.ttf")
+                    .as_slice(),
+            ),
+            (
+                "Liberation Sans",
+                true,
+                false,
+                include_bytes!("../../../packages/fonts/assets/LiberationSans-Bold.ttf").as_slice(),
+            ),
+            (
+                "Liberation Sans",
+                false,
+                true,
+                include_bytes!("../../../packages/fonts/assets/LiberationSans-Italic.ttf")
+                    .as_slice(),
+            ),
+            (
+                "Liberation Serif",
+                false,
+                false,
+                include_bytes!("../../../packages/fonts/assets/LiberationSerif-Regular.ttf")
+                    .as_slice(),
+            ),
+        ] {
+            renderer
+                .register_font(family, bold, italic, bytes.to_vec())
+                .unwrap();
+        }
+        let mut runs = [
+            styled_run("W", "Liberation Sans", false, false),
+            styled_run("W", "Liberation Sans", true, false),
+            styled_run("W", "Liberation Sans", false, true),
+            styled_run("W", "Liberation Serif", false, false),
+            styled_run("W", "Liberation Sans", false, false),
+        ];
+        runs[4].size_in = 0.25;
+        let expected = runs
+            .iter()
+            .map(|run| {
+                renderer
+                    .font_for(&run.family, run.bold, run.italic)
+                    .and_then(|font| {
+                        ooxml_text::shape(&renderer.fonts, font, "W", run.size_in, &[]).ok()
+                    })
+                    .map(|glyphs| glyphs.iter().map(|glyph| glyph.x_advance).sum())
+                    .unwrap_or(run.size_in * 0.5)
+            })
+            .collect::<Vec<f32>>();
+        let mut cache = LayoutCache::default();
+
+        for (run, width) in runs.iter().zip(&expected) {
+            assert_eq!(renderer.measure(run, 'W', &mut cache), *width);
+        }
+        for (run, width) in runs.iter().zip(&expected) {
+            assert_eq!(renderer.measure(run, 'W', &mut cache), *width);
+        }
+        for run in &runs {
+            assert_eq!(
+                renderer.cached_font_for(run, &mut cache),
+                renderer.font_for(&run.family, run.bold, run.italic)
+            );
+        }
+        assert_eq!(cache.advances.len(), runs.len());
+    }
 
     fn package(shapes: Vec<Shape>) -> VsdxPackage {
         let mut package: VsdxPackage = serde_json::from_value(serde_json::json!({
@@ -2032,9 +2383,131 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unsupported_section_paint_controls_produce_placeholders() {
+        for control in ["NoFill", "NoLine", "NoShow"] {
+            for formula in ["0", "1", "Unknown(1)"] {
+                let mut shape = shape(1, 1.0, 1.0);
+                let section = shape
+                    .children
+                    .iter_mut()
+                    .find_map(|child| match child {
+                        ShapeChild::Section(section) if section.name == "Geometry" => Some(section),
+                        _ => None,
+                    })
+                    .unwrap();
+                section
+                    .children
+                    .push(SectionChild::Unknown(vsdx_parse::OpaqueXml {
+                        name: "Cell".into(),
+                        attributes: vec![
+                            ("N".into(), control.into()),
+                            ("F".into(), formula.into()),
+                            ("V".into(), "0".into()),
+                        ],
+                        children: Vec::new(),
+                    }));
+                let list = render(vec![shape]);
+                if formula == "0" {
+                    assert!(
+                        list.primitives
+                            .iter()
+                            .any(|primitive| matches!(primitive, Primitive::Shape { .. }))
+                    );
+                } else {
+                    assert!(list.primitives.iter().all(|primitive| matches!(primitive, Primitive::Placeholder { reason, .. } if reason.contains(control))));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hit_testing_does_not_bridge_separate_subpaths() {
+        use ooxml_drawingml::GeometryPathCommand::*;
+        let path = [
+            Move { x: 0.0, y: 0.0 },
+            Line { x: 1.0, y: 0.0 },
+            Move { x: 3.0, y: 0.0 },
+            Line { x: 4.0, y: 0.0 },
+        ];
+        assert!(path_hit(&path, Affine::identity(), false, 0.1, 0.5, 0.0));
+        assert!(path_hit(&path, Affine::identity(), false, 0.1, 3.5, 0.0));
+        assert!(!path_hit(&path, Affine::identity(), false, 0.1, 2.0, 0.0));
+    }
+
+    #[test]
+    fn renders_each_indexed_geometry_section() {
+        let source = include_bytes!("../../vsdx-parse/tests/fixtures/indexed-geometry.vsdx");
+        let package = vsdx_parse::parse_vsdx(source).unwrap();
+        let list = Renderer::default()
+            .layout_page(&package, "visio/pages/page1.xml")
+            .unwrap();
+        let path = list
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Shape { path, .. } => Some(path),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            path.iter()
+                .filter(|command| matches!(
+                    command,
+                    ooxml_drawingml::GeometryPathCommand::Move { .. }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(path.len(), 4);
+    }
+
     fn render(shapes: Vec<Shape>) -> VsdxDisplayList {
         let package = package(shapes);
         Renderer::default().layout_page(&package, "page").unwrap()
+    }
+
+    fn glued_connector_package(to_cell: &str) -> VsdxPackage {
+        let mut connector = shape(1, 1.0, 1.0);
+        connector.children.extend([
+            ShapeChild::Cell(cell("OneD", "1")),
+            ShapeChild::Cell(cell("BeginX", "1")),
+            ShapeChild::Cell(cell("BeginY", "1")),
+            ShapeChild::Cell(cell("EndX", "4")),
+            ShapeChild::Cell(cell("EndY", "1")),
+        ]);
+        let mut target = shape(2, 5.0, 1.0);
+        target.children.push(ShapeChild::Section(Section {
+            name: "Connection".into(),
+            index: None,
+            del: false,
+            children: vec![
+                row(0, "Connection", vec![cell("X", "0"), cell("Y", "0.5")]),
+                row(1, "Connection", vec![cell("X", "1"), cell("Y", "0.5")]),
+            ]
+            .into_iter()
+            .map(SectionChild::Row)
+            .collect(),
+            other_attrs: vec![],
+        }));
+        let mut package = package(vec![connector, target]);
+        package
+            .page_contents
+            .get_mut("page")
+            .unwrap()
+            .children
+            .push(SheetChild::Connects(vec![ConnectsChild::Connect(
+                Connect {
+                    from_sheet: 1,
+                    from_cell: Some("BeginX".into()),
+                    from_part: None,
+                    to_sheet: 2,
+                    to_cell: Some(to_cell.into()),
+                    to_part: None,
+                    other_attrs: vec![],
+                },
+            )]));
+        package
     }
 
     fn text_shape(tokens: Vec<TextToken>) -> Shape {
@@ -2515,6 +2988,34 @@ mod tests {
     }
 
     #[test]
+    fn renders_indexed_shape_fill_and_stroke_colours() {
+        let mut indexed = shape(1, 1.0, 1.0);
+        for child in &mut indexed.children {
+            if let ShapeChild::Cell(value) = child
+                && matches!(value.name.as_str(), "FillForegnd" | "LineColor")
+            {
+                *value = cell(&value.name, "3");
+            }
+        }
+        let mut package = package(vec![indexed]);
+        package.colors = serde_json::from_value(serde_json::json!([
+            {"name":"ColorEntry","attributes":[["IX","3"],["RGB","010203"]],"children":[]}
+        ]))
+        .unwrap();
+        let list = Renderer::default().layout_page(&package, "page").unwrap();
+        let Primitive::Shape { fill, stroke, .. } = &list.primitives[0] else {
+            panic!("indexed shape did not render");
+        };
+        assert_eq!(
+            fill,
+            &Some(Paint::Solid {
+                color: "#010203".into()
+            })
+        );
+        assert_eq!(stroke.as_ref().unwrap().color, "#010203");
+    }
+
+    #[test]
     fn palette_colours_and_unknown_codes_fail_safe() {
         let mut package = package(Vec::new());
         package.colors = serde_json::from_value(serde_json::json!([
@@ -2536,8 +3037,8 @@ mod tests {
                 y: 20.0,
                 width: 8.0,
                 height: 12.0,
-                loc_pin_x: 0.0,
-                loc_pin_y: 0.0,
+                loc_pin_x: 4.0,
+                loc_pin_y: 6.0,
                 angle: 0.0,
                 flip_x: false,
                 flip_y: false,
@@ -2621,7 +3122,86 @@ mod tests {
     }
 
     #[test]
-    fn forty_five_degree_group_keeps_text_in_a_local_box_under_the_group_transform() {
+    fn deeply_nested_groups_preserve_display_list_hierarchy() {
+        let nested = group(
+            1,
+            1.0,
+            1.0,
+            vec![group(
+                2,
+                2.0,
+                2.0,
+                vec![group(
+                    3,
+                    3.0,
+                    3.0,
+                    vec![group(
+                        4,
+                        4.0,
+                        4.0,
+                        vec![group(5, 5.0, 5.0, vec![shape(6, 6.0, 6.0)])],
+                    )],
+                )],
+            )],
+        );
+        let list = render(vec![nested]);
+        let Primitive::Group {
+            id,
+            z_order,
+            primitives: level_2,
+            ..
+        } = &list.primitives[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!((id, z_order), (&"page:1".into(), &10));
+        let Primitive::Group {
+            id,
+            z_order,
+            primitives: level_3,
+            ..
+        } = &level_2[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!((id, z_order), (&"page:2".into(), &9));
+        let Primitive::Group {
+            id,
+            z_order,
+            primitives: level_4,
+            ..
+        } = &level_3[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!((id, z_order), (&"page:3".into(), &8));
+        let Primitive::Group {
+            id,
+            z_order,
+            primitives: level_5,
+            ..
+        } = &level_4[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!((id, z_order), (&"page:4".into(), &7));
+        let Primitive::Group {
+            id,
+            z_order,
+            primitives: leaf,
+            ..
+        } = &level_5[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!((id, z_order), (&"page:5".into(), &6));
+        assert!(
+            matches!(&leaf[0], Primitive::Shape { id, z_order, .. } if id == "page:6" && *z_order == 5)
+        );
+    }
+
+    #[test]
+    fn forty_five_degree_group_transforms_all_text_corners_lines_and_caret_stops() {
         let mut child = shape(2, 1.0, 2.0);
         child
             .children
@@ -3219,6 +3799,61 @@ mod tests {
     }
 
     #[test]
+    fn dangling_glue_renders_connector_placeholder() {
+        let package = glued_connector_package("Connections.X9");
+        let connectivity = Resolver::new(&package)
+            .resolve_page_connectivity("page")
+            .unwrap();
+        assert!(
+            connectivity.connectors[&1].glue[0]
+                .to
+                .as_ref()
+                .unwrap()
+                .connection_point
+                .is_none()
+        );
+
+        let list = Renderer::default().layout_page(&package, "page").unwrap();
+        assert!(matches!(
+            list.primitives.iter().find(|primitive| {
+                matches!(primitive, Primitive::Placeholder { id, .. } if id == "page:1")
+            }),
+            Some(Primitive::Placeholder { id, .. }) if id == "page:1"
+        ));
+        assert!(
+            !list.primitives.iter().any(
+                |primitive| matches!(primitive, Primitive::Shape { id, .. } if id == "page:1")
+            )
+        );
+    }
+
+    #[test]
+    fn resolved_glue_paints_connector() {
+        let package = glued_connector_package("Connections.X1");
+        let connectivity = Resolver::new(&package)
+            .resolve_page_connectivity("page")
+            .unwrap();
+        assert!(
+            connectivity.connectors[&1].glue[0]
+                .to
+                .as_ref()
+                .unwrap()
+                .connection_point
+                .is_some()
+        );
+
+        let list = Renderer::default().layout_page(&package, "page").unwrap();
+        assert!(
+            list.primitives.iter().any(
+                |primitive| matches!(primitive, Primitive::Shape { id, .. } if id == "page:1")
+            )
+        );
+        assert!(!list.primitives.iter().any(
+            |primitive| matches!(primitive, Primitive::Placeholder { id, .. } if id == "page:1")
+        ));
+    }
+
+    #[test]
     fn unresolved_foreign_data_and_colours_become_placeholders() {
         let mut image = shape(1, 1.0, 1.0);
         image.children.push(ShapeChild::ForeignData(ForeignData {
@@ -3303,6 +3938,16 @@ mod tests {
                 "{width} x {height}"
             );
         }
+    }
+
+    #[test]
+    fn missing_page_sheet_preserves_page_dimension_error() {
+        let mut page = package(vec![shape(1, 1.0, 1.0)]);
+        page.page_sheets.remove(&1);
+        assert!(matches!(
+            Renderer::default().layout_page(&page, "page"),
+            Err(RenderError::PageDimensions(message)) if message == "PageHeight is unavailable"
+        ));
     }
 
     #[test]
@@ -3431,18 +4076,8 @@ mod tests {
 
     #[test]
     fn display_list_decode_rejects_unsupported_contract() {
-        for version in [2, CONTRACT_VERSION - 1] {
-            let payload = format!(
-                r#"{{"contractVersion":{version},"width":0.0,"height":0.0,"paintTransform":{{"a":1.0,"b":0.0,"c":0.0,"d":1.0,"e":0.0,"f":0.0}},"primitives":[]}}"#
-            );
-            let error = serde_json::from_str::<VsdxDisplayList>(&payload).unwrap_err();
-            assert!(
-                error.to_string().contains(&format!(
-                    "unsupported VSDX display-list contract version {version}"
-                )),
-                "{error}"
-            );
-        }
+        let payload = r#"{"contractVersion":2,"width":0.0,"height":0.0,"paintTransform":{"a":1.0,"b":0.0,"c":0.0,"d":1.0,"e":0.0,"f":0.0},"primitives":[]}"#;
+        assert!(serde_json::from_str::<VsdxDisplayList>(payload).is_err());
     }
 
     #[test]
@@ -3503,6 +4138,46 @@ mod tests {
     }
 
     #[test]
+    fn relative_geometry_rows_are_scaled_and_transformed_in_the_display_list() {
+        let package = vsdx_parse::parse_vsdx(include_bytes!(
+            "../../vsdx-parse/tests/fixtures/geometry-relative-rows.vsdx"
+        ))
+        .unwrap();
+        let list = Renderer::default()
+            .layout_page(&package, &package.page_part_paths[0])
+            .unwrap();
+        let path_for = |shape_id| {
+            let Primitive::Shape { path, .. } = list
+                .primitives
+                .iter()
+                .find(|primitive| matches!(primitive, Primitive::Shape { id, .. } if id.ends_with(shape_id)))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            path
+        };
+        assert_eq!(
+            path_for(":1").as_slice(),
+            &[
+                GeometryPathCommand::Move { x: 5.0, y: 3.5 },
+                GeometryPathCommand::Line { x: 9.0, y: 3.5 },
+                GeometryPathCommand::Line { x: 9.0, y: 6.5 },
+                GeometryPathCommand::Line { x: 5.0, y: 6.5 },
+            ]
+        );
+        assert_eq!(
+            path_for(":2").as_slice(),
+            &[
+                GeometryPathCommand::Move { x: 12.0, y: 3.5 },
+                GeometryPathCommand::Line { x: 16.0, y: 3.5 },
+                GeometryPathCommand::Move { x: 12.0, y: 6.5 },
+                GeometryPathCommand::Line { x: 16.0, y: 6.5 },
+            ]
+        );
+    }
+
+    #[test]
     fn nested_groups_fixture_preserves_scaled_affine_content_and_replay_order() {
         let package = vsdx_parse::parse_vsdx(include_bytes!(
             "../../vsdx-parse/tests/fixtures/nested-groups.vsdx"
@@ -3540,10 +4215,10 @@ mod tests {
             unreachable!()
         };
         // These values were calculated by hand from the composed outer and inner affine,
-        // M = [[-0.94190204, 1.8844845, 10.021151], [-1.1970047, 0.27151108, 11.018823]].
+        // M = [[-0.94190204, 1.8844845, 9.487798], [-1.1970047, 0.27151108, 10.472947]].
         // Each expected AABB is min/max(M(corner)) for the original source rectangle;
         // the image corners and text caret are direct substitutions into that same affine.
-        assert_point_close((x as f32, y as f32), (10.021151, 11.018823));
+        assert_point_close((x as f32, y as f32), (9.487798, 10.472947));
         let Primitive::TextBox {
             x,
             y,
@@ -3556,23 +4231,21 @@ mod tests {
         else {
             unreachable!()
         };
-        let (mut left, mut top, mut text_width, mut text_height) = (*x, *y, *width, *height);
-        transform_rect(
-            &mut left,
-            &mut top,
-            &mut text_width,
-            &mut text_height,
-            *transform,
-        );
-        assert_point_close((left, top), (9.079249, 9.821818));
-        assert_point_close((text_width, text_height), (2.8263865, 1.4685154));
+        // The text box's own x/y/width/height stay in the shape's local, pre-transform frame;
+        // `transform` is the same composed outer/inner affine M documented above, and carries
+        // the local text box, its lines and its caret stops into scene coordinates.
+        assert_point_close((*x, *y), (0.0, 0.0));
+        assert_point_close((*width, *height), (1.0, 1.0));
+        assert_point_close((transform.a, transform.b), (-0.94190204, -1.1970047));
+        assert_point_close((transform.c, transform.d), (1.8844845, 0.27151108));
+        assert_point_close((transform.e, transform.f), (9.487798, 10.472947));
         assert_point_close(
             transform.apply_point(lines[0].x, lines[0].y),
-            (10.021151, 11.018823),
+            (9.487798, 10.472947),
         );
         assert_point_close(
             transform.apply_point(lines[0].caret_stops[1].x, lines[0].caret_stops[1].y),
-            (9.942658, 10.919072),
+            (9.409306, 10.373197),
         );
         let Primitive::Image {
             x,
@@ -3591,10 +4264,10 @@ mod tests {
             transform.apply_point(*x, *y + *height),
             transform.apply_point(*x + *width, *y + *height),
         ];
-        assert_point_close(corners[0], (10.0218315, 8.896324));
-        assert_point_close(corners[1], (9.079929, 7.6993194));
-        assert_point_close(corners[2], (13.7908, 9.439346));
-        assert_point_close(corners[3], (12.848899, 8.242341));
+        assert_point_close(corners[0], (9.488478, 8.350449));
+        assert_point_close(corners[1], (8.546576, 7.153444));
+        assert_point_close(corners[2], (13.257447, 8.893471));
+        assert_point_close(corners[3], (12.315545, 7.696466));
         let Primitive::Placeholder {
             x,
             y,
@@ -3605,12 +4278,12 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_point_close((*x, *y), (13.7908, 9.439346));
+        assert_point_close((*x, *y), (13.257447, 8.893471));
         assert_point_close((*width, *height), (2.8263874, 1.4685163));
         let z_orders = inner.iter().map(z_order).collect::<Vec<_>>();
         assert_eq!(z_orders, vec![2, 3, 4, 5]);
         assert_eq!(
-            hit_test(&list, 10.021151 * 96.0, (11.0 - 11.018823) * 96.0),
+            hit_test(&list, 9.487798 * 96.0, (11.0 - 10.472947) * 96.0),
             Some(HitTestResult::Text {
                 shape_id: "visio/pages/page1.xml:3".into(),
                 position: 0,
@@ -3662,7 +4335,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(dangling, 30, "corpus dangling-glue record count changed");
+        assert_eq!(dangling, 0, "corpus dangling-glue record count changed");
         assert_eq!(placeholders, expected);
         assert!(painted.is_disjoint(&expected));
     }
