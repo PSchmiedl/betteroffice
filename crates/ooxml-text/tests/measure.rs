@@ -312,6 +312,69 @@ fn multi_run_line_takes_max_font_basis() {
 }
 
 #[test]
+fn wrapped_runs_only_contribute_metrics_to_the_lines_they_occupy() {
+    let preceding = json!({ "kind": "text", "text": "0".repeat(22) });
+    let small = measure(json!([preceding]), 200.0).unwrap();
+    let large = measure(
+        json!([{ "kind": "text", "text": "0", "fontSize": 24.0 }]),
+        200.0,
+    )
+    .unwrap();
+    for following in [
+        json!([{ "kind": "text", "text": "00", "fontSize": 24.0 }]),
+        json!([{ "kind": "text", "text": "0".repeat(20), "fontSize": 24.0 }]),
+        json!([{ "kind": "field", "fallback": "00", "fontSize": 24.0 }]),
+        json!([
+            { "kind": "tab", "fontSize": 24.0 },
+            { "kind": "text", "text": "00" }
+        ]),
+    ] {
+        let mut runs = vec![preceding.clone()];
+        runs.extend(following.as_array().unwrap().iter().cloned());
+        let measured = measure(json!(runs), 200.0).unwrap();
+        let lines = measured["lines"].as_array().unwrap();
+        assert!(lines.len() >= 2);
+        assert_eq!(spans(&measured)[0], (0, 0, 0, 22));
+        for metric in ["ascent", "descent", "lineHeight"] {
+            assert_eq!(
+                lines[0][metric], small["lines"][0][metric],
+                "{following}: {metric}"
+            );
+            for line in &lines[1..] {
+                assert_eq!(
+                    line[metric], large["lines"][0][metric],
+                    "{following}: {metric}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_runs_still_contribute_metrics_before_a_wrap() {
+    let measured = measure(
+        json!([
+            { "kind": "text", "text": "0".repeat(22) },
+            { "kind": "text", "text": "", "fontSize": 24.0 },
+            { "kind": "text", "text": "00" }
+        ]),
+        200.0,
+    )
+    .unwrap();
+    assert_eq!(spans(&measured), vec![(0, 0, 1, 0), (2, 0, 2, 2)]);
+    approx(
+        measured["lines"][0]["lineHeight"].as_f64().unwrap(),
+        2.0 * LH,
+        "empty 24pt run contributes to its line",
+    );
+    approx(
+        measured["lines"][1]["lineHeight"].as_f64().unwrap(),
+        LH,
+        "following line only contains 12pt text",
+    );
+}
+
+#[test]
 fn a_shorter_font_does_not_add_leading_below_a_taller_font() {
     let mut store = store();
     store.register(NOTO_NASKH_ARABIC.to_vec()).unwrap();
@@ -859,6 +922,60 @@ fn tab_advances_to_default_grid_stops() {
     );
 }
 
+#[test]
+fn automatic_tabs_resume_on_grid_multiples_after_custom_stops() {
+    for (stops, expected) in [
+        (json!([{ "val": "start", "pos": 1500.0 }]), 144.0),
+        (json!([{ "val": "start", "pos": 1440.0 }]), 144.0),
+        (
+            json!([
+                { "val": "start", "pos": 1500.0 },
+                { "val": "clear", "pos": 2160.0 }
+            ]),
+            192.0,
+        ),
+    ] {
+        let v = measure_with(
+            json!({
+                "kind": "paragraph",
+                "runs": [
+                    { "kind": "tab" },
+                    { "kind": "text", "text": "0" },
+                    { "kind": "tab" },
+                    { "kind": "text", "text": "0" }
+                ],
+                "attrs": { "tabs": stops }
+            }),
+            300.0,
+        )
+        .unwrap();
+        assert_eq!(spans(&v), vec![(0, 0, 3, 1)]);
+        approx(
+            v["lines"][0]["width"].as_f64().unwrap(),
+            expected + W0,
+            "automatic tab after custom stop",
+        );
+    }
+}
+
+#[test]
+fn paragraph_indent_does_not_shift_the_automatic_tab_grid() {
+    let v = measure_with(
+        json!({
+            "kind": "paragraph",
+            "runs": [{ "kind": "tab" }, { "kind": "text", "text": "0" }],
+            "attrs": { "indent": { "left": 10.0 } }
+        }),
+        200.0,
+    )
+    .unwrap();
+    approx(
+        v["lines"][0]["width"].as_f64().unwrap(),
+        48.0 - 10.0 + W0,
+        "automatic tab position is relative to the content area",
+    );
+}
+
 // 12. end and center anchor following text; decimal uses start; bar is zero
 #[test]
 fn tab_stop_alignment_semantics() {
@@ -947,9 +1064,8 @@ fn tab_falls_back_to_default_grid() {
     );
 }
 
-// 14. an over-edge stop clamps; a wrapped tab keeps its pre-wrap width
 #[test]
-fn tab_clamps_to_line_edge_and_wraps_when_full() {
+fn right_aligned_tab_clamps_to_line_edge() {
     // end stop at 200px on a 100px line: clamp to 100 − W0
     let v = measure_with(
         json!({
@@ -962,24 +1078,44 @@ fn tab_clamps_to_line_edge_and_wraps_when_full() {
     .unwrap();
     assert_eq!(spans(&v), vec![(0, 0, 1, 1)]);
     approx(v["lines"][0]["width"].as_f64().unwrap(), 100.0, "clamped");
+}
 
-    // 22 zeros fill 195.77px of a 200px line; the tab's 44.23px to the 240px
-    // grid line cannot fit or clamp (no room for the following zero), so the
-    // tab wraps carrying that width
-    let v = measure(
-        json!([
-            { "kind": "text", "text": "0000000000000000000000" },
-            { "kind": "tab" },
-            { "kind": "text", "text": "0" }
-        ]),
+#[test]
+fn wrapped_tabs_resolve_against_the_new_line_grid() {
+    for tab_count in 1..=3 {
+        let mut runs = vec![json!({ "kind": "text", "text": "0".repeat(22) })];
+        runs.extend((0..tab_count).map(|_| json!({ "kind": "tab" })));
+        runs.push(json!({ "kind": "text", "text": "0" }));
+        let v = measure(json!(runs), 200.0).unwrap();
+        assert_eq!(spans(&v), vec![(0, 0, 0, 22), (1, 0, tab_count + 1, 1)]);
+        approx(
+            v["lines"][1]["width"].as_f64().unwrap(),
+            tab_count as f64 * 48.0 + W0,
+            "wrapped tab advances from the new line origin",
+        );
+    }
+}
+
+#[test]
+fn wrapped_tab_uses_the_body_indent_instead_of_the_first_line_offset() {
+    let v = measure_with(
+        json!({
+            "kind": "paragraph",
+            "runs": [
+                { "kind": "text", "text": "0".repeat(17) },
+                { "kind": "tab" },
+                { "kind": "text", "text": "0" }
+            ],
+            "attrs": { "indent": { "left": 24.0, "firstLine": 24.0 } }
+        }),
         200.0,
     )
     .unwrap();
-    assert_eq!(spans(&v), vec![(0, 0, 0, 22), (1, 0, 2, 1)]);
+    assert_eq!(spans(&v), vec![(0, 0, 0, 17), (1, 0, 2, 1)]);
     approx(
         v["lines"][1]["width"].as_f64().unwrap(),
-        (240.0 - 22.0 * W0) + W0,
-        "wrapped tab keeps pre-wrap width",
+        24.0 + W0,
+        "new line tab advances from the body indent to the 48px stop",
     );
 }
 
