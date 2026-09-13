@@ -60,8 +60,9 @@ jobs:
         run: |
           bun scripts/create-demo-deck.ts
           bun scripts/create-demo-workbook.ts
+          bun scripts/create-demo-diagram.ts
           bun run --filter './apps/demo' check:seeds
-          git diff --exit-code -- apps/demo/public/betteroffice-demo.pptx apps/demo/public/showcase.xlsx
+          git diff --exit-code -- apps/demo/public/betteroffice-demo.pptx apps/demo/public/showcase.xlsx apps/demo/public/betteroffice-demo.vsdx
 
       - name: Check minimal Wasm features
         run: |

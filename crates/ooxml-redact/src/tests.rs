@@ -2599,3 +2599,120 @@ fn media_replacement_never_copies_source_bytes() {
     let (other, _) = redact_with_report(&media_package(&second), Format::Auto).unwrap();
     assert_eq!(parts, ooxml_opc::unzip_parts(&other).unwrap());
 }
+
+#[test]
+fn refuses_visio_with_uncovered_sensitive_surfaces() {
+    let source = package(vec![
+        (
+            "[Content_Types].xml",
+            xml(
+                r#"<Types><Override PartName="/visio/document.xml" ContentType="application/vnd.ms-visio.drawing.main+xml"/></Types>"#,
+            ),
+        ),
+        (
+            "visio/document.xml",
+            xml(
+                r#"<VisioDocument><CommentList><CommentEntry Author="SECRET_AUTHOR">SECRET_COMMENT</CommentEntry></CommentList></VisioDocument>"#,
+            ),
+        ),
+        (
+            "visio/pages/page1.xml",
+            xml(
+                r#"<PageContents><Shape ID="1" Name="SECRET_SHAPE" NameU="SECRET_SHAPE_UNIVERSAL"><Section N="Hyperlink"><Row N="Link"><Cell N="Address" V="https://SECRET_HOST"/></Row></Section><Section N="Field"><Row IX="0"><Cell N="Value" V="SECRET_FIELD"/></Row></Section></Shape></PageContents>"#,
+            ),
+        ),
+        (
+            "visio/data/recordsets.xml",
+            xml(
+                r#"<DataRecordSets><DataRecordSet Name="SECRET_DATABASE" Command="SELECT SECRET_COLUMN FROM SECRET_TABLE"/></DataRecordSets>"#,
+            ),
+        ),
+    ]);
+    assert!(
+        redact(&source, Format::Auto).is_err(),
+        "an incomplete Visio policy must never emit a supposedly redacted package"
+    );
+}
+
+#[test]
+fn rejects_visio_redaction_even_with_another_declared_format() {
+    for content_type in [
+        "application/vnd.ms-visio.drawing.main+xml",
+        "application/vnd.ms-visio.drawing.macroenabled.main+xml",
+    ] {
+        let source = package(vec![
+            (
+                "[Content_Types].xml",
+                xml(&format!(
+                    r#"<Types><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/visio/document.xml" ContentType="{content_type}"/></Types>"#
+                )),
+            ),
+            ("word/document.xml", xml("<document/>")),
+            ("visio/document.xml", xml("<VisioDocument/>")),
+        ]);
+        assert!(matches!(
+            detect_format(&source),
+            Err(RedactError::UnsupportedVisio)
+        ));
+        assert!(matches!(
+            redact(&source, Format::Docx),
+            Err(RedactError::UnsupportedVisio)
+        ));
+    }
+}
+
+#[test]
+fn rejects_visio_redaction_without_content_types() {
+    let source = package(vec![("visio/document.xml", xml("<VisioDocument/>"))]);
+    assert!(matches!(
+        redact(&source, Format::Auto),
+        Err(RedactError::UnsupportedVisio)
+    ));
+}
+
+#[test]
+fn still_redacts_office_packages_with_embedded_visio() {
+    for (source, format, path) in [
+        (docx_fixture(), Format::Docx, "word/embeddings/diagram.vsdx"),
+        (xlsx_fixture(), Format::Xlsx, "xl/embeddings/diagram.vsdx"),
+        (pptx_fixture(), Format::Pptx, "ppt/embeddings/diagram.vsdx"),
+    ] {
+        let embedded = package(vec![(
+            "visio/document.xml",
+            xml("<VisioDocument>EMBEDDED_SECRET</VisioDocument>"),
+        )]);
+        let mut parts = ooxml_opc::unzip_parts(&source).unwrap();
+        parts.push((path.to_owned(), embedded));
+        let (_, types) = parts
+            .iter_mut()
+            .find(|(name, _)| name == "[Content_Types].xml")
+            .unwrap();
+        *types = String::from_utf8(types.clone()).unwrap().replace("</Types>", &format!(r#"<Default Extension="vsdx" ContentType="application/vnd.ms-visio.drawing"/><Override PartName="/{path}" ContentType="application/vnd.ms-visio.drawing"/><!-- application/vnd.ms-visio.drawing.main+xml --></Types>"#)).into_bytes();
+        let source = ooxml_opc::rezip_parts(&parts).unwrap();
+        let output = redact(&source, format).unwrap();
+        let parts = ooxml_opc::unzip_parts(&output).unwrap();
+        assert!(
+            parts
+                .iter()
+                .all(|(part, data)| part != path || data.is_empty())
+        );
+    }
+}
+
+#[test]
+fn rejects_declared_visio_main_parts_outside_the_usual_directory() {
+    let source = package(vec![
+        (
+            "[Content_Types].xml",
+            xml(
+                r#"<Types><Override PartName="/diagram.xml" ContentType="application/vnd.ms-visio.drawing.main+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+            ),
+        ),
+        ("diagram.xml", xml("<VisioDocument/>")),
+        ("word/document.xml", xml("<document/>")),
+    ]);
+    assert!(matches!(
+        redact(&source, Format::Auto),
+        Err(RedactError::UnsupportedVisio)
+    ));
+}

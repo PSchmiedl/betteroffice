@@ -7,19 +7,18 @@ The VSDX engine processes Visio diagram packages. Support is under development; 
 
 | Crate | Purpose |
 | --- | --- |
-| `betteroffice-vsdx-edit` | Transactional editing and collaboration. |
 | `betteroffice-vsdx` | Native facade |
 | `betteroffice-vsdx-parse` | Package parsing and lossless XML |
 | `betteroffice-vsdx-resolve` | ShapeSheet inheritance |
 | `betteroffice-vsdx-eval` | Formula evaluation |
 | `betteroffice-vsdx-render` | Display lists |
+| `betteroffice-vsdx-edit` | Transactional editing and collaboration |
+| `betteroffice-vsdx-formula` | Bounded formula parsing |
 
-## TypeScript package
+`@betteroffice/vsdx` provides the Wasm engine and Canvas display-list painter. Initialize the Wasm module before opening a diagram.
 
-`@betteroffice/vsdx` opens, edits, renders, and saves Visio diagrams through WebAssembly.
+`@betteroffice/vsdx-react` provides the React editor. Its strings are supplied by `@betteroffice/vsdx-i18n`. Pass font bytes to the editor so layout and painting use the same faces.
 
-`betteroffice-vsdx-formula` provides bounded ShapeSheet formula parsing.
+The Python binding in `bindings/python-vsdx` reads pages, shapes, cells, and connections. It is held out of the PyPI release train. Build it from the repository with `python -m pip install ./bindings/python-vsdx`.
 
-The TypeScript package also provides a transport-independent collaboration provider.
-
-`@betteroffice/vsdx-react` provides the React editor, and `@betteroffice/vsdx-i18n` provides its translations. Supply matching font bytes for layout and painting.
+Visio redaction is not supported. The redaction CLI rejects VSDX files before writing or uploading output.

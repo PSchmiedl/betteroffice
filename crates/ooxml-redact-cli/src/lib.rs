@@ -169,6 +169,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn refuses_visio_before_producing_uploadable_bytes() {
+        let source = ooxml_opc::rezip_parts(&[(
+            "visio/document.xml".to_owned(),
+            br#"<VisioDocument><CommentList><CommentEntry Author="PRIVATE_AUTHOR">PRIVATE_COMMENT</CommentEntry></CommentList></VisioDocument>"#.to_vec(),
+        )]).unwrap();
+        let error = redact_local(&source).err().expect("Visio must be rejected");
+        assert!(error.contains("Visio redaction is not supported"));
+    }
+
     fn fixture() -> Vec<u8> {
         ooxml_opc::rezip_parts(&[
             (
