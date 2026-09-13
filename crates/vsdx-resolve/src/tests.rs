@@ -1,11 +1,14 @@
 use std::fs;
 
 use vsdx_parse::{
-    Cell, Row, RowChild, Section, SectionChild, Shape, ShapeChild, Sheet, SheetChild, TextToken,
-    VsdxPackage, parse_vsdx,
+    Cell, Connect, ConnectsChild, Row, RowChild, Section, SectionChild, Shape, ShapeChild, Sheet,
+    SheetChild, TextToken, VsdxPackage, parse_vsdx,
 };
 
-use crate::{Lookup, Provenance, ResolveError, ResolvedTextToken, Resolver};
+use crate::{
+    ConnectivityDiagnostic, ConnectorEndpoint, Lookup, Provenance, ResolveError, ResolvedTextToken,
+    Resolver,
+};
 
 fn package() -> VsdxPackage {
     serde_json::from_value(serde_json::json!({
@@ -112,6 +115,241 @@ fn deleted_row_with_cells(index: u32, cells: Vec<Cell>) -> Row {
         children: cells.into_iter().map(RowChild::Cell).collect(),
         other_attrs: vec![],
     }
+}
+
+#[test]
+fn resolves_glue_connection_points_and_part_fields() {
+    let mut package = package();
+    package.page_contents.insert(
+        "page".into(),
+        sheet(
+            None,
+            vec![
+                SheetChild::Shapes(vec![
+                    vsdx_parse::ShapesChild::Shape(shape(
+                        1,
+                        vec![
+                            ShapeChild::Cell(cell("OneD", "1")),
+                            ShapeChild::Cell(cell("BeginX", "1")),
+                            ShapeChild::Cell(cell("BeginY", "2")),
+                            ShapeChild::Cell(cell("EndX", "4")),
+                            ShapeChild::Cell(cell("EndY", "2")),
+                        ],
+                    )),
+                    vsdx_parse::ShapesChild::Shape(shape(
+                        2,
+                        vec![
+                            ShapeChild::Cell(cell("Width", "4")),
+                            ShapeChild::Cell(cell("Height", "2")),
+                            ShapeChild::Cell(cell("PinX", "10")),
+                            ShapeChild::Cell(cell("PinY", "5")),
+                            ShapeChild::Section(section(
+                                "Connection",
+                                vec![row(
+                                    1,
+                                    vec![
+                                        formula_cell("X", "Width*0.5"),
+                                        formula_cell("Y", "Height/2"),
+                                    ],
+                                )],
+                            )),
+                        ],
+                    )),
+                ]),
+                SheetChild::Connects(vec![ConnectsChild::Connect(Connect {
+                    from_sheet: 1,
+                    from_cell: Some("BeginX".into()),
+                    from_part: Some(9),
+                    to_sheet: 2,
+                    to_cell: Some("Connections.X1".into()),
+                    to_part: Some(100),
+                    other_attrs: vec![],
+                })]),
+            ],
+        ),
+    );
+    let connectivity = Resolver::new(&package)
+        .resolve_page_connectivity("page")
+        .unwrap();
+    let connector = connectivity.connectors.get(&1).unwrap();
+    assert_eq!(connector.begin.unwrap().x, 1.0);
+    assert_eq!(connector.glue[0].endpoint, ConnectorEndpoint::Begin);
+    assert_eq!(connector.glue[0].from_part, Some(9));
+    let target = connector.glue[0].to.as_ref().unwrap();
+    assert_eq!(target.part, Some(100));
+    assert_eq!(target.connection_point.as_ref().unwrap().position.x, 10.0);
+    assert_eq!(target.connection_point.as_ref().unwrap().position.y, 5.0);
+    assert_eq!(
+        target.connection_point.as_ref().unwrap().x_provenance,
+        crate::NumericProvenance::Formula
+    );
+    assert_eq!(
+        target.connection_point.as_ref().unwrap().y_provenance,
+        crate::NumericProvenance::Formula
+    );
+}
+
+#[test]
+fn glue_numeric_provenance_prefers_supported_formulas_and_falls_back_to_cached_values() {
+    let mut package = package();
+    package.page_contents.insert(
+        "page".into(),
+        sheet(
+            None,
+            vec![
+                SheetChild::Shapes(vec![
+                    vsdx_parse::ShapesChild::Shape(shape(
+                        1,
+                        vec![ShapeChild::Cell(cell("OneD", "1"))],
+                    )),
+                    vsdx_parse::ShapesChild::Shape(shape(
+                        2,
+                        vec![
+                            ShapeChild::Cell(cell("Width", "1")),
+                            ShapeChild::Cell(cell("Height", "1")),
+                            ShapeChild::Cell(cell("PinX", "0")),
+                            ShapeChild::Cell(cell("PinY", "0")),
+                            ShapeChild::Cell(cell("LocPinX", "0")),
+                            ShapeChild::Cell(cell("LocPinY", "0")),
+                            ShapeChild::Section(section(
+                                "Connection",
+                                vec![row(
+                                    1,
+                                    vec![
+                                        Cell {
+                                            name: "X".into(),
+                                            formula: Some("2+3".into()),
+                                            value: Some("99".into()),
+                                            unit: None,
+                                            del: false,
+                                            other_attrs: vec![],
+                                        },
+                                        Cell {
+                                            name: "Y".into(),
+                                            formula: Some("GUARD(4)".into()),
+                                            value: Some("7".into()),
+                                            unit: None,
+                                            del: false,
+                                            other_attrs: vec![],
+                                        },
+                                    ],
+                                )],
+                            )),
+                        ],
+                    )),
+                ]),
+                SheetChild::Connects(vec![ConnectsChild::Connect(Connect {
+                    from_sheet: 1,
+                    from_cell: Some("BeginX".into()),
+                    from_part: None,
+                    to_sheet: 2,
+                    to_cell: Some("Connections.X1".into()),
+                    to_part: None,
+                    other_attrs: vec![],
+                })]),
+            ],
+        ),
+    );
+    let connectivity = Resolver::new(&package)
+        .resolve_page_connectivity("page")
+        .unwrap();
+    let point = connectivity.connectors[&1].glue[0]
+        .to
+        .as_ref()
+        .unwrap()
+        .connection_point
+        .as_ref()
+        .unwrap();
+    assert_eq!(point.position, crate::ScenePoint { x: 5.0, y: 7.0 });
+    assert_eq!(point.x_provenance, crate::NumericProvenance::Formula);
+    assert_eq!(point.y_provenance, crate::NumericProvenance::CachedValue);
+}
+
+#[test]
+fn reports_dangling_connects_without_dropping_them() {
+    let mut package = package();
+    package.page_contents.insert(
+        "page".into(),
+        sheet(
+            None,
+            vec![
+                SheetChild::Shapes(vec![vsdx_parse::ShapesChild::Shape(shape(
+                    1,
+                    vec![ShapeChild::Cell(cell("OneD", "1"))],
+                ))]),
+                SheetChild::Connects(vec![ConnectsChild::Connect(Connect {
+                    from_sheet: 1,
+                    from_cell: Some("EndX".into()),
+                    from_part: None,
+                    to_sheet: 99,
+                    to_cell: Some("Connections.X7".into()),
+                    to_part: None,
+                    other_attrs: vec![],
+                })]),
+            ],
+        ),
+    );
+    let connectivity = Resolver::new(&package)
+        .resolve_page_connectivity("page")
+        .unwrap();
+    assert_eq!(connectivity.connectors.get(&1).unwrap().glue.len(), 1);
+    assert_eq!(
+        connectivity.diagnostics,
+        vec![ConnectivityDiagnostic::MissingToShape { shape_id: 99 }]
+    );
+}
+
+#[test]
+fn grouped_glue_connection_points_use_scene_transforms() {
+    let package = parse_vsdx(include_bytes!(
+        "../../vsdx-parse/tests/fixtures/grouped-glue.vsdx"
+    ))
+    .unwrap();
+    let page = &package.page_part_paths[0];
+    let connectivity = Resolver::new(&package)
+        .resolve_page_connectivity(page)
+        .unwrap();
+    let points = connectivity.connectors[&1]
+        .glue
+        .iter()
+        .filter(|glue| glue.to.as_ref().unwrap().cell.as_deref() != Some("PinX"))
+        .map(|glue| {
+            let target = glue.to.as_ref().unwrap();
+            (
+                target.shape_id,
+                target.connection_point.as_ref().unwrap().position,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    // Target 11: rotate the local (0.5, 0.5) by +90° and scale by 2 around (10, 10):
+    // (-1, 1) + (10, 10) = (9, 11). Target 21 scales (0.5, 0.5) by (2, 2) at
+    // (20, 10) = (21, 11). Target 32 is scaled by 2 in each nested group: (0.5, 0.5)
+    // becomes (2, 2), then the outer group's origin maps it to (32, 2).
+    assert_eq!(points[&11].x, 9.0);
+    assert_eq!(points[&11].y, 11.0);
+    assert_eq!(points[&21].x, 21.0);
+    assert_eq!(points[&21].y, 11.0);
+    assert_eq!(points[&32].x, 32.0);
+    assert_eq!(points[&32].y, 2.0);
+
+    let direct_pins = connectivity.connectors[&1]
+        .glue
+        .iter()
+        .filter(|glue| glue.to.as_ref().unwrap().cell.as_deref() == Some("PinX"))
+        .map(|glue| {
+            let target = glue.to.as_ref().unwrap();
+            (
+                target.shape_id,
+                target.connection_point.as_ref().unwrap().position,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    // A target pin is its local LocPin transformed through every containing group.
+    assert_eq!(direct_pins[&11], crate::ScenePoint { x: 10.0, y: 10.0 });
+    assert_eq!(direct_pins[&21], crate::ScenePoint { x: 20.0, y: 10.0 });
+    assert_eq!(direct_pins[&32], crate::ScenePoint { x: 30.0, y: 0.0 });
 }
 
 #[test]
@@ -1309,4 +1547,76 @@ fn corpus_shapes_resolve_without_silent_empty_results() {
             }
         }
     }
+}
+
+#[test]
+fn corpus_connectivity_accounts_for_every_glue_record() {
+    let Some(dir) = std::env::var_os("VSDX_CORPUS_DIR") else {
+        eprintln!("warning: VSDX_CORPUS_DIR is unset; skipping corpus connectivity test");
+        return;
+    };
+    let mut total = 0;
+    let mut resolved = 0;
+    let mut missing = 0;
+    for file in ["lichtsysteme.vsdx", "soundplan.vsdx"] {
+        let package =
+            parse_vsdx(&fs::read(std::path::Path::new(&dir).join(file)).unwrap()).unwrap();
+        let resolver = Resolver::new(&package);
+        for page in &package.page_part_paths {
+            let connectivity = resolver.resolve_page_connectivity(page).unwrap();
+            if file == "soundplan.vsdx" && page.ends_with("page1.xml") {
+                let glue = connectivity.connectors[&1306]
+                    .glue
+                    .iter()
+                    .find(|glue| {
+                        glue.endpoint == ConnectorEndpoint::Begin
+                            && glue.to.as_ref().is_some_and(|target| {
+                                target.shape_id == 1159 && target.cell.as_deref() == Some("PinX")
+                            })
+                    })
+                    .unwrap();
+                assert_eq!(
+                    glue.to
+                        .as_ref()
+                        .unwrap()
+                        .connection_point
+                        .as_ref()
+                        .unwrap()
+                        .position,
+                    crate::ScenePoint {
+                        x: 16.872_047_239_024_92,
+                        y: 16.281_496_360_318_24,
+                    }
+                );
+            }
+            for connector in connectivity.connectors.values() {
+                total += connector.glue.len();
+                resolved += connector
+                    .glue
+                    .iter()
+                    .filter(|glue| {
+                        glue.to
+                            .as_ref()
+                            .and_then(|target| target.connection_point.as_ref())
+                            .is_some()
+                    })
+                    .count();
+            }
+            missing += connectivity
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    matches!(
+                        diagnostic,
+                        ConnectivityDiagnostic::MissingConnectionPoint { .. }
+                    )
+                })
+                .count();
+        }
+    }
+    // Record 121 is soundplan.vsdx visio/pages/page1.xml's Connect FromSheet=1306,
+    // FromCell=BeginX, ToSheet=1159, ToCell=PinX. Its target's PinX/PinY resolve to
+    // (16.87204723902492, 16.28149636031824), so it is a valid direct-pin glue record;
+    // the remaining 30 records lack Connection rows.
+    assert_eq!((total, resolved, missing), (151, 121, 30));
 }

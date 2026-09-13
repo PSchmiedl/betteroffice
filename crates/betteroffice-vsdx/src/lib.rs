@@ -10,8 +10,8 @@ pub use vsdx_parse::StructuralEdit;
 use vsdx_parse::{Cell, ParseLimits, Shape, VsdxError, VsdxPackage};
 pub use vsdx_parse::{CellLocator, CellRow, CellSheet, MutationGesture, SemanticCellEdit};
 use vsdx_resolve::{
-    Lookup, Provenance, ResolveError, ResolvedCell, ResolvedRow, ResolvedSection, ResolvedShape,
-    Resolver,
+    Lookup, PageConnectivity, Provenance, ResolveError, ResolvedCell, ResolvedRow, ResolvedSection,
+    ResolvedShape, Resolver,
 };
 
 #[derive(Debug)]
@@ -358,7 +358,8 @@ impl PackageMutationContext<'_> {
                 let page = sheet_path(self.package, &locator.sheet).map_err(Error::Policy)?;
                 let references = vsdx_eval::PageShapeReferences::new(&resolver, &page)
                     .map_err(|error| Error::Policy(error.to_string()))?;
-                evaluate(
+                vsdx_eval::evaluate_cell(
+                    &locator_key(locator),
                     formula.trim_start_matches('='),
                     &references.for_shape(shape_id),
                     &ParseLimits::default(),
@@ -377,7 +378,8 @@ impl PackageMutationContext<'_> {
                     .as_ref()
                     .map(|sheet| resolver.resolve_sheet(sheet))
                     .transpose()?;
-                evaluate(
+                vsdx_eval::evaluate_cell(
+                    &locator_key(locator),
                     formula.trim_start_matches('='),
                     &DocumentReferences::new(&page, document.as_ref()),
                     &ParseLimits::default(),
@@ -388,7 +390,8 @@ impl PackageMutationContext<'_> {
                     resolver.resolve_sheet(self.package.document_sheet.as_ref().ok_or_else(
                         || Error::Policy("document sheet does not exist".to_owned()),
                     )?)?;
-                evaluate(
+                vsdx_eval::evaluate_cell(
+                    &locator_key(locator),
                     formula.trim_start_matches('='),
                     &DocumentReferences::new(&document, Some(&document)),
                     &ParseLimits::default(),
@@ -584,6 +587,9 @@ impl<'a> Page<'a> {
         self.diagram.package.page_contents[self.part]
             .shapes()
             .map(move |shape| ShapeView { page: self, shape })
+    }
+    pub fn connectivity(&self) -> Result<PageConnectivity> {
+        Ok(Resolver::new(&self.diagram.package).resolve_page_connectivity(self.part)?)
     }
 }
 

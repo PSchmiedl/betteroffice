@@ -301,10 +301,15 @@ name = "betteroffice-vsdx-eval"
 version = "0.1.0"
 dependencies = [
  "betteroffice-drawingml",
+ "betteroffice-vsdx-formula",
  "betteroffice-vsdx-parse",
  "betteroffice-vsdx-resolve",
  "thiserror",
 ]
+
+[[package]]
+name = "betteroffice-vsdx-formula"
+version = "0.1.0"
 
 [[package]]
 name = "betteroffice-vsdx-parse"
@@ -336,6 +341,7 @@ name = "betteroffice-vsdx-resolve"
 version = "0.1.0"
 dependencies = [
  "betteroffice-drawingml",
+ "betteroffice-vsdx-formula",
  "betteroffice-vsdx-parse",
  "serde",
  "serde_json",
@@ -1594,6 +1600,18 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vsdx-wasm"
+version = "0.0.0"
+dependencies = [
+ "betteroffice-vsdx-edit",
+ "betteroffice-vsdx-parse",
+ "betteroffice-vsdx-render",
+ "serde_json",
+ "wasm-bindgen",
+ "yrs",
+]
 
 [[package]]
 name = "wait-timeout"

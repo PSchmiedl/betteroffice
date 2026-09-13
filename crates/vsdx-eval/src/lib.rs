@@ -1,18 +1,13 @@
 //! Bounded ShapeSheet evaluation without cached-value fallback.
 
-mod ast;
 mod colour;
 #[path = "tests.rs"]
 mod corpus;
 mod eval;
 mod policy;
-mod tokenizer;
-mod units;
-
-pub use ast::{Expr, Op};
 pub use policy::{MutationContext, MutationOutcome, decide as decide_mutation};
-pub use units::Unit;
-use units::unit;
+use vsdx_formula::unit;
+pub use vsdx_formula::{Expr, Op, Unit};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -239,6 +234,9 @@ impl PageShapeReferences {
     pub fn shape(&self, id: u32) -> Option<&ResolvedShape> {
         self.shapes.get(&id)
     }
+    pub fn shapes(&self) -> &BTreeMap<u32, ResolvedShape> {
+        &self.shapes
+    }
 }
 
 pub struct ShapeReferences<'a> {
@@ -308,16 +306,18 @@ impl References for BTreeMap<String, String> {
 }
 
 pub fn parse(input: &str, limits: &ParseLimits) -> Result<Expr, Diagnostic> {
-    if input.trim().eq_ignore_ascii_case("No Formula") {
-        return Ok(Expr::Call("No Formula".into(), Vec::new()));
-    }
-    Parser::new(
+    let parsed = vsdx_formula::parse(
         input,
-        limits.max_formula_depth,
-        limits.max_formula_nodes,
-        limits.max_formula_tokens,
+        vsdx_formula::Limits {
+            max_depth: limits.max_formula_depth,
+            max_nodes: limits.max_formula_nodes,
+            max_tokens: limits.max_formula_tokens,
+        },
     )
-    .parse()
+    .map_err(|error| Diagnostic {
+        message: error.message,
+    })?;
+    Ok(parsed)
 }
 pub fn evaluate(input: &str, refs: &impl References, limits: &ParseLimits) -> Evaluation {
     evaluate_with_theme(input, refs, limits, None)
@@ -346,15 +346,40 @@ fn evaluate_cell_with_theme(
         return unsupported("TheText requires phase-4b text layout");
     }
     if input.trim().eq_ignore_ascii_case("Inh") {
-        return match refs.formula(name) {
-            Some(formula) if !formula.eq_ignore_ascii_case("Inh") => {
-                evaluate_with_theme_at(formula, refs, limits, theme, Some(name))
-            }
-            _ if refs.exhausted_inheritance(name) => err("Inh has no concrete inherited value"),
-            _ => unsupported("Inh requires an inheritance host"),
-        };
+        return normalize_host_cell_value(
+            name,
+            match refs.formula(name) {
+                Some(formula) if !formula.eq_ignore_ascii_case("Inh") => {
+                    evaluate_with_theme_at(formula, refs, limits, theme, Some(name))
+                }
+                _ if refs.exhausted_inheritance(name) => err("Inh has no concrete inherited value"),
+                _ => unsupported("Inh requires an inheritance host"),
+            },
+        );
     }
-    evaluate_with_theme_at(input, refs, limits, theme, Some(name))
+    normalize_host_cell_value(
+        name,
+        evaluate_with_theme_at(input, refs, limits, theme, Some(name)),
+    )
+}
+
+fn normalize_host_cell_value(name: &str, evaluation: Evaluation) -> Evaluation {
+    let Some(unit) = host_cell_unit(name) else {
+        return evaluation;
+    };
+    match evaluation {
+        Evaluation::Evaluated(Evaluated {
+            value: Value::Number(mut value),
+            guarded,
+        }) => {
+            value.unit = unit;
+            Evaluation::Evaluated(Evaluated {
+                value: Value::Number(value),
+                guarded,
+            })
+        }
+        other => other,
+    }
 }
 
 fn is_event_cell(name: &str) -> bool {
@@ -525,11 +550,13 @@ impl<R: References> Engine<'_, R> {
                         Ok(e) => {
                             let previous = self.sheet;
                             let previous_scope = self.scope;
+                            let previous_host = self.host.replace(lookup.to_owned());
                             self.sheet = sheet;
                             self.scope = scope;
                             let result = self.expr(&e, depth + 1);
                             self.sheet = previous;
                             self.scope = previous_scope;
+                            self.host = previous_host;
                             result
                         }
                         Err(e) => Evaluation::Error(e),
@@ -984,16 +1011,44 @@ fn number(number: f64, unit: Unit) -> Evaluation {
     numeric_result(number, unit, false)
 }
 fn cell_value(value: &str, unit_name: Option<&str>) -> Evaluation {
+    cell_value_with_default(value, unit_name, "")
+}
+
+#[cfg(test)]
+fn cell_value_for_cell(name: &str, value: &str, unit_name: Option<&str>) -> Evaluation {
+    cell_value_with_default(value, unit_name, name)
+}
+
+fn cell_value_with_default(value: &str, unit_name: Option<&str>, name: &str) -> Evaluation {
     if let Some(color) = parse_color(value) {
         return result(Value::Color(color), false);
     }
     let Ok(value) = value.parse::<f64>() else {
         return unsupported("cell value is not a supported display literal");
     };
-    let Some((unit, scale)) = unit(unit_name.unwrap_or("")) else {
+    let unit_name = unit_name.unwrap_or_else(|| default_cell_unit(name));
+    let Some((unit, scale)) = unit(unit_name) else {
         return unsupported("cell value has an unsupported unit");
     };
     number(value * scale, unit)
+}
+
+fn default_cell_unit(name: &str) -> &'static str {
+    match host_cell_unit(name) {
+        Some(Unit::Inches) => "DL",
+        Some(Unit::Radians) => "DA",
+        Some(Unit::Bool) => "BOOL",
+        _ => "",
+    }
+}
+
+fn host_cell_unit(name: &str) -> Option<Unit> {
+    match name.rsplit_once('!').map_or(name, |(_, name)| name) {
+        "Width" | "Height" | "LocPinX" | "LocPinY" => Some(Unit::Inches),
+        "Angle" => Some(Unit::Radians),
+        "FillGradientEnabled" | "FlipX" | "FlipY" | "LineGradientEnabled" => Some(Unit::Bool),
+        _ => None,
+    }
 }
 fn numeric_result(number: f64, unit: Unit, guarded: bool) -> Evaluation {
     if number.is_finite() {
@@ -1063,13 +1118,15 @@ fn tint(color: Color, amount: f64) -> Color {
     hls_to_rgb(hue, saturation, (luminosity + amount).clamp(0.0, 240.0))
 }
 fn mso_tint(color: Color, percentage: f64) -> Color {
-    let (hue, saturation, luminosity) = rgb_to_hls(color);
-    let luminosity = if percentage < 0.0 {
-        luminosity + (-percentage / 100.0) * (240.0 - luminosity)
-    } else {
-        luminosity * (1.0 - percentage / 100.0)
-    };
-    hls_to_rgb(hue, saturation, luminosity)
+    let target = if percentage < 0.0 { 0.0 } else { 255.0 };
+    let fraction = percentage.abs() / 100.0;
+    let channel = |value: u8| (f64::from(value) + (target - f64::from(value)) * fraction) as u8;
+    Color {
+        red: channel(color.red),
+        green: channel(color.green),
+        blue: channel(color.blue),
+        alpha: color.alpha,
+    }
 }
 fn rgb_to_hls(color: Color) -> (f64, f64, f64) {
     let red = f64::from(color.red) / 255.0;
@@ -1113,275 +1170,6 @@ fn hls_to_rgb(hue: f64, saturation: f64, luminosity: f64) -> Color {
         green: channel(green),
         blue: channel(blue),
         alpha: None,
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum Tok {
-    Number(f64, Unit),
-    String(String),
-    Ident(String),
-    Op(Op),
-    L,
-    R,
-    Comma,
-    End,
-    Invalid(String),
-}
-struct Parser<'a> {
-    chars: std::iter::Peekable<std::str::Chars<'a>>,
-    current: Tok,
-    depth: usize,
-    max: usize,
-    nodes: usize,
-    max_nodes: usize,
-    tokens: usize,
-    max_tokens: usize,
-}
-impl<'a> Parser<'a> {
-    fn new(s: &'a str, max: usize, max_nodes: usize, max_tokens: usize) -> Self {
-        let mut p = Self {
-            chars: s.chars().peekable(),
-            current: Tok::End,
-            depth: 0,
-            max,
-            nodes: 0,
-            max_nodes,
-            tokens: 0,
-            max_tokens,
-        };
-        p.next();
-        p
-    }
-    fn parse(mut self) -> Result<Expr, Diagnostic> {
-        let e = self.cmp()?;
-        if self.current != Tok::End {
-            return Err(Diagnostic {
-                message: "unexpected token".into(),
-            });
-        }
-        Ok(e)
-    }
-    fn node(&mut self) -> Result<(), Diagnostic> {
-        self.nodes += 1;
-        if self.nodes > self.max_nodes {
-            Err(Diagnostic {
-                message: "formula AST node limit exceeded".into(),
-            })
-        } else {
-            Ok(())
-        }
-    }
-    fn next(&mut self) {
-        self.current = self.lex()
-    }
-    fn lex(&mut self) -> Tok {
-        while self.chars.peek().is_some_and(|c| c.is_whitespace()) {
-            self.chars.next();
-        }
-        let Some(c) = self.chars.next() else {
-            return Tok::End;
-        };
-        self.tokens += 1;
-        if self.tokens > self.max_tokens {
-            return Tok::Invalid("formula token limit exceeded".into());
-        }
-        match c {
-            '(' => Tok::L,
-            ')' => Tok::R,
-            ',' => Tok::Comma,
-            '+' => Tok::Op(Op::Add),
-            '-' => Tok::Op(Op::Sub),
-            '*' => Tok::Op(Op::Mul),
-            '/' => Tok::Op(Op::Div),
-            '^' => Tok::Op(Op::Pow),
-            '=' => Tok::Op(Op::Eq),
-            '<' => {
-                if self.chars.next_if_eq(&'=').is_some() {
-                    Tok::Op(Op::Le)
-                } else if self.chars.next_if_eq(&'>').is_some() {
-                    Tok::Op(Op::Ne)
-                } else {
-                    Tok::Op(Op::Lt)
-                }
-            }
-            '>' => {
-                if self.chars.next_if_eq(&'=').is_some() {
-                    Tok::Op(Op::Ge)
-                } else {
-                    Tok::Op(Op::Gt)
-                }
-            }
-            '"' => {
-                let s = self.chars.by_ref().take_while(|x| *x != '"').collect();
-                Tok::String(s)
-            }
-            x if x.is_ascii_digit() || x == '.' => {
-                let mut s = x.to_string();
-                while self
-                    .chars
-                    .peek()
-                    .is_some_and(|x| x.is_ascii_digit() || *x == '.')
-                {
-                    s.push(self.chars.next().unwrap());
-                }
-                if self.chars.peek().is_some_and(|x| matches!(*x, 'e' | 'E')) {
-                    let mut exponent = self.chars.clone();
-                    exponent.next();
-                    let exponent_digit = match exponent.next() {
-                        Some('+' | '-') => exponent.next(),
-                        value => value,
-                    };
-                    if exponent_digit.is_some_and(|x| x.is_ascii_digit()) {
-                        s.push(self.chars.next().unwrap());
-                        if self.chars.peek().is_some_and(|x| matches!(*x, '+' | '-')) {
-                            s.push(self.chars.next().unwrap());
-                        }
-                        while self.chars.peek().is_some_and(|x| x.is_ascii_digit()) {
-                            s.push(self.chars.next().unwrap());
-                        }
-                    }
-                }
-                let mut n = s.parse().unwrap_or(f64::NAN);
-                while self.chars.peek().is_some_and(|x| x.is_whitespace()) {
-                    self.chars.next();
-                }
-                let mut u = String::new();
-                while self.chars.peek().is_some_and(|x| x.is_ascii_alphabetic()) {
-                    u.push(self.chars.next().unwrap());
-                }
-                let Some((unit, scale)) = unit(&u) else {
-                    return Tok::Invalid(format!("unknown unit suffix {u}"));
-                };
-                n *= scale;
-                Tok::Number(n, unit)
-            }
-            x => {
-                let mut s = x.to_string();
-                while self
-                    .chars
-                    .peek()
-                    .is_some_and(|x| x.is_ascii_alphanumeric() || matches!(*x, '.' | '!' | '_'))
-                {
-                    s.push(self.chars.next().unwrap());
-                }
-                Tok::Ident(s)
-            }
-        }
-    }
-    fn cmp(&mut self) -> Result<Expr, Diagnostic> {
-        let mut x = self.add()?;
-        while let Tok::Op(op @ (Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge)) = self.current
-        {
-            self.next();
-            self.node()?;
-            x = Expr::Binary(Box::new(x), op, Box::new(self.add()?));
-        }
-        Ok(x)
-    }
-    fn add(&mut self) -> Result<Expr, Diagnostic> {
-        let mut x = self.mul()?;
-        while let Tok::Op(op @ (Op::Add | Op::Sub)) = self.current {
-            self.next();
-            self.node()?;
-            x = Expr::Binary(Box::new(x), op, Box::new(self.mul()?));
-        }
-        Ok(x)
-    }
-    fn mul(&mut self) -> Result<Expr, Diagnostic> {
-        let mut x = self.pow()?;
-        while let Tok::Op(op @ (Op::Mul | Op::Div)) = self.current {
-            self.next();
-            self.node()?;
-            x = Expr::Binary(Box::new(x), op, Box::new(self.pow()?));
-        }
-        Ok(x)
-    }
-    fn pow(&mut self) -> Result<Expr, Diagnostic> {
-        let x = self.primary()?;
-        if self.current == Tok::Op(Op::Pow) {
-            self.next();
-            self.depth += 1;
-            let right = self.pow()?;
-            self.depth -= 1;
-            self.node()?;
-            Ok(Expr::Binary(Box::new(x), Op::Pow, Box::new(right)))
-        } else {
-            Ok(x)
-        }
-    }
-    fn primary(&mut self) -> Result<Expr, Diagnostic> {
-        if self.depth >= self.max {
-            return Err(Diagnostic {
-                message: "formula depth limit exceeded".into(),
-            });
-        }
-        match self.current.clone() {
-            Tok::Number(n, u) => {
-                self.next();
-                self.node()?;
-                Ok(Expr::Number(n, u))
-            }
-            Tok::String(s) => {
-                self.next();
-                self.node()?;
-                Ok(Expr::String(s))
-            }
-            Tok::Op(Op::Sub) => {
-                self.next();
-                self.depth += 1;
-                let value = self.primary()?;
-                self.depth -= 1;
-                self.node()?;
-                Ok(Expr::Unary(Box::new(value)))
-            }
-            Tok::Ident(s) => {
-                self.next();
-                if self.current == Tok::L {
-                    self.depth += 1;
-                    self.next();
-                    let mut a = Vec::new();
-                    if self.current != Tok::R {
-                        loop {
-                            a.push(self.cmp()?);
-                            if self.current != Tok::Comma {
-                                break;
-                            }
-                            self.next();
-                        }
-                    }
-                    if self.current != Tok::R {
-                        return Err(Diagnostic {
-                            message: "expected ')'".into(),
-                        });
-                    }
-                    self.next();
-                    self.depth -= 1;
-                    self.node()?;
-                    Ok(Expr::Call(s, a))
-                } else {
-                    self.node()?;
-                    Ok(Expr::Reference(s))
-                }
-            }
-            Tok::L => {
-                self.depth += 1;
-                self.next();
-                let x = self.cmp()?;
-                if self.current != Tok::R {
-                    return Err(Diagnostic {
-                        message: "expected ')'".into(),
-                    });
-                }
-                self.next();
-                self.depth -= 1;
-                Ok(x)
-            }
-            Tok::Invalid(message) => Err(Diagnostic { message }),
-            _ => Err(Diagnostic {
-                message: "expected expression".into(),
-            }),
-        }
     }
 }
 
@@ -1730,6 +1518,24 @@ mod tests {
     }
 
     #[test]
+    fn resolves_host_relative_theme_value_through_a_reference() {
+        let refs = BTreeMap::from([("FillForegnd".into(), "THEMEVAL()".into())]);
+        let theme = Theme::default();
+        assert!(matches!(
+            evaluate_cell_with_theme("LineColor", "FillForegnd", &refs, &limits(), Some(&theme)),
+            Evaluation::Evaluated(Evaluated {
+                value: Value::Color(Color {
+                    red: 68,
+                    green: 114,
+                    blue: 196,
+                    ..
+                }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn selects_a_theme_from_shape_indices() {
         let mut shape = ResolvedShape::default();
         shape.cells.insert(
@@ -1863,18 +1669,36 @@ mod tests {
         assert_eq!(
             color("MSOTINT(RGB(255,0,0),-50)", None),
             Color {
-                red: 255,
-                green: 128,
-                blue: 128,
+                red: 127,
+                green: 0,
+                blue: 0,
                 alpha: None
             }
         );
         assert_eq!(
             color("MSOTINT(RGB(255,0,0),50)", None),
             Color {
-                red: 128,
-                green: 0,
-                blue: 0,
+                red: 255,
+                green: 127,
+                blue: 127,
+                alpha: None
+            }
+        );
+        assert_eq!(
+            color("MSOTINT(RGB(0,0,0),5)", None),
+            Color {
+                red: 12,
+                green: 12,
+                blue: 12,
+                alpha: None
+            }
+        );
+        assert_eq!(
+            color("MSOTINT(RGB(255,255,255),-35)", None),
+            Color {
+                red: 165,
+                green: 165,
+                blue: 165,
                 alpha: None
             }
         );
@@ -1945,8 +1769,10 @@ mod tests {
     #[test]
     #[ignore = "requires the private VSDX_CORPUS_DIR corpus"]
     fn corpus_formulas_report_honest_evaluation() {
-        let directory = std::env::var("VSDX_CORPUS_DIR")
-            .expect("VSDX_CORPUS_DIR must name the required VSDX corpus directory");
+        let Some(directory) = std::env::var_os("VSDX_CORPUS_DIR") else {
+            eprintln!("SKIPPED CORPUS FORMULA REGRESSION: VSDX_CORPUS_DIR is unset");
+            return;
+        };
         let directory = std::path::PathBuf::from(directory);
         let files = ["lichtsysteme.vsdx", "soundplan.vsdx"];
         for file in files {
@@ -1976,32 +1802,48 @@ mod tests {
             {
                 let refs = sheet_references(sheet);
                 let refs = DocumentReferences::new(&refs, document.as_ref());
-                for (name, formula) in sheet_formulas(sheet) {
-                    measurement.record(
+                for (name, cell) in sheet_formula_cells(sheet) {
+                    let formula = cell.formula.as_deref().unwrap();
+                    let evaluation = evaluate_cell_with_package_theme(
+                        &name,
                         formula,
-                        evaluate_cell_with_package_theme(
-                            &name,
-                            formula,
-                            &refs,
-                            &limits(),
-                            &package,
-                        ),
+                        &refs,
+                        &limits(),
+                        &package,
+                    );
+                    measurement.record(formula, evaluation.clone());
+                    measurement.record_oracle(
+                        &format!("{file}:sheet"),
+                        &name,
+                        formula,
+                        cell.value
+                            .as_deref()
+                            .map(|value| (value, cell.unit.as_deref())),
+                        &evaluation,
                     );
                 }
             }
             for (page, sheet) in &package.page_contents {
                 let refs = sheet_references(sheet);
                 let refs = DocumentReferences::new(&refs, document.as_ref());
-                for (name, formula) in sheet_formulas(sheet) {
-                    measurement.record(
+                for (name, cell) in sheet_formula_cells(sheet) {
+                    let formula = cell.formula.as_deref().unwrap();
+                    let evaluation = evaluate_cell_with_package_theme(
+                        &name,
                         formula,
-                        evaluate_cell_with_package_theme(
-                            &name,
-                            formula,
-                            &refs,
-                            &limits(),
-                            &package,
-                        ),
+                        &refs,
+                        &limits(),
+                        &package,
+                    );
+                    measurement.record(formula, evaluation.clone());
+                    measurement.record_oracle(
+                        &format!("{file}:page:{page}:sheet"),
+                        &name,
+                        formula,
+                        cell.value
+                            .as_deref()
+                            .map(|value| (value, cell.unit.as_deref())),
+                        &evaluation,
                     );
                 }
                 let page_refs =
@@ -2009,51 +1851,75 @@ mod tests {
                 for shape in shapes(sheet) {
                     let refs = page_refs.for_shape(shape.id);
                     let resolved = page_refs.shape(shape.id).expect("resolve corpus shape");
-                    for (name, formula) in shape_formulas(shape) {
-                        measurement.record(
-                            formula,
-                            evaluate_cell_with_shape_package_theme(
-                                &name,
-                                formula,
-                                &refs,
-                                &limits(),
-                                resolved,
-                                &package,
-                            ),
-                        );
-                    }
-                }
-            }
-            for sheet in package.master_contents.values() {
-                let refs = sheet_references(sheet);
-                let refs = DocumentReferences::new(&refs, document.as_ref());
-                for (name, formula) in sheet_formulas(sheet) {
-                    measurement.record(
-                        formula,
-                        evaluate_cell_with_package_theme(
+                    for (name, cell) in shape_formula_cells(shape) {
+                        let formula = cell.formula.as_deref().unwrap();
+                        let evaluation = evaluate_cell_with_shape_package_theme(
                             &name,
                             formula,
                             &refs,
                             &limits(),
+                            resolved,
                             &package,
-                        ),
+                        );
+                        measurement.record(formula, evaluation.clone());
+                        measurement.record_oracle(
+                            &format!("{file}:page:{page}:shape:{}", shape.id),
+                            &name,
+                            formula,
+                            cell.value
+                                .as_deref()
+                                .map(|value| (value, cell.unit.as_deref())),
+                            &evaluation,
+                        );
+                    }
+                }
+            }
+            for (master, sheet) in &package.master_contents {
+                let refs = sheet_references(sheet);
+                let refs = DocumentReferences::new(&refs, document.as_ref());
+                for (name, cell) in sheet_formula_cells(sheet) {
+                    let formula = cell.formula.as_deref().unwrap();
+                    let evaluation = evaluate_cell_with_package_theme(
+                        &name,
+                        formula,
+                        &refs,
+                        &limits(),
+                        &package,
+                    );
+                    measurement.record(formula, evaluation.clone());
+                    measurement.record_oracle(
+                        &format!("{file}:master:{master}:sheet"),
+                        &name,
+                        formula,
+                        cell.value
+                            .as_deref()
+                            .map(|value| (value, cell.unit.as_deref())),
+                        &evaluation,
                     );
                 }
                 for shape in shapes(sheet) {
                     let resolved = resolver
                         .resolve_shape_in_sheet(shape, sheet)
                         .expect("resolve corpus master shape");
-                    for (name, formula) in shape_formulas(shape) {
-                        measurement.record(
+                    for (name, cell) in shape_formula_cells(shape) {
+                        let formula = cell.formula.as_deref().unwrap();
+                        let evaluation = evaluate_cell_with_shape_package_theme(
+                            &name,
                             formula,
-                            evaluate_cell_with_shape_package_theme(
-                                &name,
-                                formula,
-                                &DocumentReferences::new(&resolved, document.as_ref()),
-                                &limits(),
-                                &resolved,
-                                &package,
-                            ),
+                            &DocumentReferences::new(&resolved, document.as_ref()),
+                            &limits(),
+                            &resolved,
+                            &package,
+                        );
+                        measurement.record(formula, evaluation.clone());
+                        measurement.record_oracle(
+                            &format!("{file}:master:{master}:shape:{}", shape.id),
+                            &name,
+                            formula,
+                            cell.value
+                                .as_deref()
+                                .map(|value| (value, cell.unit.as_deref())),
+                            &evaluation,
                         );
                     }
                 }
@@ -2069,6 +1935,42 @@ mod tests {
             measurement.error,
             measurement.total,
         );
+        let oracle_compared = measurement.oracle_agreement + measurement.oracle_disagreement;
+        let agreement_rate = if oracle_compared == 0 {
+            0.0
+        } else {
+            measurement.oracle_agreement as f64 * 100.0 / oracle_compared as f64
+        };
+        eprintln!(
+            "VSDX corpus @V oracle (Visio-produced, potentially stale): agreement={} disagreement={} excluded-stale={} no-cache-available={} agreement-rate={agreement_rate:.2}% ({oracle_compared} comparable evaluated formulas; evaluated={}/{} corpus formulas, {:.2}% coverage)",
+            measurement.oracle_agreement,
+            measurement.oracle_disagreement,
+            measurement.oracle_excluded_stale,
+            measurement.oracle_no_cache,
+            measurement.evaluated,
+            measurement.total,
+            measurement.evaluated as f64 * 100.0 / measurement.total as f64,
+        );
+        measurement.oracle_disagreements.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.formula.cmp(&right.formula))
+                .then_with(|| left.computed.cmp(&right.computed))
+                .then_with(|| left.cached.cmp(&right.cached))
+        });
+        measurement.oracle_disagreements.dedup_by(|left, right| {
+            left.name == right.name
+                && left.formula == right.formula
+                && left.computed == right.computed
+                && left.cached == right.cached
+        });
+        measurement.oracle_disagreements.truncate(20);
+        for disagreement in &measurement.oracle_disagreements {
+            eprintln!(
+                "VSDX corpus @V disagreement: cell={} formula={:?} computed={} cached={}",
+                disagreement.name, disagreement.formula, disagreement.computed, disagreement.cached,
+            );
+        }
         let mut top_unsupported = measurement
             .unsupported_names
             .into_iter()
@@ -2095,9 +1997,43 @@ mod tests {
             .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
         top_references.truncate(20);
         eprintln!("VSDX corpus top unresolved references: {top_references:?}");
+        let mut oracle_histogram = measurement
+            .oracle_disagreement_kinds
+            .into_iter()
+            .collect::<Vec<_>>();
+        oracle_histogram
+            .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        eprintln!("VSDX corpus @V disagreement histogram: {oracle_histogram:?}");
+        let mut stale_histogram = measurement
+            .oracle_stale_kinds
+            .into_iter()
+            .collect::<Vec<_>>();
+        stale_histogram
+            .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        eprintln!("VSDX corpus @V excluded-stale histogram: {stale_histogram:?}");
         assert_eq!(
             measurement.total, 6_992,
             "corpus formula denominator changed"
+        );
+        assert_eq!(
+            measurement.evaluated, 3_679,
+            "published corpus evaluation count changed"
+        );
+        assert_eq!(
+            measurement.oracle_agreement, 3_670,
+            "published corpus oracle agreement count changed"
+        );
+        assert_eq!(
+            measurement.oracle_disagreement, 0,
+            "published corpus oracle disagreement count changed"
+        );
+        assert_eq!(
+            oracle_compared, 3_670,
+            "published corpus comparable-oracle count changed"
+        );
+        assert_eq!(
+            measurement.oracle_excluded_stale, 9,
+            "published corpus stale-oracle exclusion count changed"
         );
         assert_eq!(
             measurement.evaluated
@@ -2122,6 +2058,19 @@ mod tests {
         unsupported_other_kinds: BTreeMap<String, usize>,
         error_kinds: BTreeMap<String, usize>,
         unresolved_references: BTreeMap<String, usize>,
+        oracle_agreement: usize,
+        oracle_disagreement: usize,
+        oracle_excluded_stale: usize,
+        oracle_no_cache: usize,
+        oracle_disagreement_kinds: BTreeMap<String, usize>,
+        oracle_stale_kinds: BTreeMap<String, usize>,
+        oracle_disagreements: Vec<OracleDisagreement>,
+    }
+    struct OracleDisagreement {
+        name: String,
+        formula: String,
+        computed: String,
+        cached: String,
     }
     impl CorpusMeasurement {
         fn record(&mut self, formula: &str, evaluation: Evaluation) {
@@ -2150,6 +2099,162 @@ mod tests {
                 }
             }
         }
+        fn record_oracle(
+            &mut self,
+            origin: &str,
+            name: &str,
+            formula: &str,
+            cached: Option<(&str, Option<&str>)>,
+            evaluation: &Evaluation,
+        ) {
+            let Evaluation::Evaluated(computed) = evaluation else {
+                return;
+            };
+            let Some((cached, unit)) = cached else {
+                self.oracle_no_cache += 1;
+                return;
+            };
+            let Evaluation::Evaluated(cached_value) = cell_value_for_cell(name, cached, unit)
+            else {
+                self.oracle_no_cache += 1;
+                return;
+            };
+            if oracle_values_agree(computed.value, cached_value.value) {
+                self.oracle_agreement += 1;
+            } else if let Some(kind) = stale_oracle_cache(origin, name, formula, cached, unit) {
+                self.oracle_excluded_stale += 1;
+                *self.oracle_stale_kinds.entry(kind.into()).or_default() += 1;
+            } else {
+                self.oracle_disagreement += 1;
+                *self
+                    .oracle_disagreement_kinds
+                    .entry(format!("{name}: {formula}"))
+                    .or_default() += 1;
+                self.oracle_disagreements.push(OracleDisagreement {
+                    name: name.into(),
+                    formula: formula.into(),
+                    computed: format_value(computed.value),
+                    cached: cached.into(),
+                });
+            }
+        }
+    }
+
+    fn stale_oracle_cache(
+        origin: &str,
+        name: &str,
+        formula: &str,
+        cached: &str,
+        unit: Option<&str>,
+    ) -> Option<&'static str> {
+        let stale_inh = [
+            "lichtsysteme.vsdx:page:visio/pages/page1.xml:shape:387",
+            "lichtsysteme.vsdx:page:visio/pages/page1.xml:shape:504",
+            "soundplan.vsdx:page:visio/pages/page2.xml:shape:1",
+            "soundplan.vsdx:page:visio/pages/page2.xml:shape:2",
+        ];
+        if name == "LineWeight"
+            && formula.eq_ignore_ascii_case("Inh")
+            && cached
+                == if origin.starts_with("soundplan") {
+                    "0.003472222222222222"
+                } else {
+                    "0.01041666666666667"
+                }
+            && unit == Some("PT")
+            && stale_inh.contains(&origin)
+        {
+            return Some("four evidenced LineWeight Inh caches from prior inheritance contexts");
+        }
+        let stale_theme = [
+            "lichtsysteme.vsdx:master:visio/masters/master1.xml:shape:5",
+            "lichtsysteme.vsdx:master:visio/masters/master3.xml:shape:5",
+            "lichtsysteme.vsdx:master:visio/masters/master4.xml:shape:5",
+            "soundplan.vsdx:master:visio/masters/master2.xml:shape:5",
+            "soundplan.vsdx:master:visio/masters/master3.xml:shape:5",
+        ];
+        (name == "LineWeight"
+            && formula == "THEMEVAL(\"LineWeight\",0.24PT)"
+            && cached == "0.003333333333333333"
+            && unit == Some("PT")
+            && stale_theme.contains(&origin))
+        .then_some("five evidenced LineWeight THEMEVAL display-unit caches")
+    }
+
+    fn oracle_values_agree(computed: Value, cached: Value) -> bool {
+        match (computed, cached) {
+            (Value::Number(computed), Value::Number(cached)) => {
+                computed.unit == cached.unit
+                    && (computed.number - cached.number).abs()
+                        <= 1e-9_f64.max(computed.number.abs().max(cached.number.abs()) * 1e-9)
+            }
+            (Value::Color(computed), Value::Color(cached)) => computed == cached,
+            _ => false,
+        }
+    }
+
+    fn format_value(value: Value) -> String {
+        match value {
+            Value::Number(value) => format!("{} {:?}", value.number, value.unit),
+            Value::Color(value) => {
+                format!("#{:02X}{:02X}{:02X}", value.red, value.green, value.blue)
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_requires_matching_numeric_units() {
+        let inches = Value::Number(Number {
+            number: 1.0,
+            unit: Unit::Inches,
+        });
+        let degrees = Value::Number(Number {
+            number: 1.0,
+            unit: Unit::Radians,
+        });
+        assert!(!oracle_values_agree(inches, degrees));
+    }
+
+    #[test]
+    fn omitted_cell_units_use_the_host_default() {
+        for (name, expected) in [
+            ("Width", Unit::Inches),
+            ("Angle", Unit::Radians),
+            ("FlipX", Unit::Bool),
+        ] {
+            let Evaluation::Evaluated(Evaluated {
+                value: Value::Number(value),
+                ..
+            }) = cell_value_for_cell(name, "0", None)
+            else {
+                panic!("expected numeric value");
+            };
+            assert_eq!(value.unit, expected);
+        }
+    }
+
+    #[test]
+    fn stale_oracle_exclusions_are_limited_to_evidenced_cells() {
+        assert!(
+            stale_oracle_cache(
+                "unrelated.vsdx:page:page.xml:shape:1",
+                "PinX",
+                "Inh",
+                "1",
+                None,
+            )
+            .is_none()
+        );
+        assert!(
+            stale_oracle_cache(
+                "unrelated.vsdx:master:master.xml:shape:1",
+                "LineWeight",
+                "THEMEVAL(\"LineWeight\",0.24PT)",
+                "0.003333333333333333",
+                Some("PT"),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2329,6 +2434,23 @@ mod tests {
         }
         values
     }
+    fn sheet_formula_cells(sheet: &Sheet) -> Vec<(String, &Cell)> {
+        let mut values = sheet
+            .cells()
+            .filter(|cell| cell.formula.is_some())
+            .map(|cell| (cell.name.clone(), cell))
+            .collect::<Vec<_>>();
+        for section in sheet.sections() {
+            for row in section.rows() {
+                values.extend(
+                    row.cells()
+                        .filter(|cell| cell.formula.is_some())
+                        .map(|cell| (section_cell_name(section, row, cell), cell)),
+                );
+            }
+        }
+        values
+    }
     fn shape_formulas(shape: &Shape) -> Vec<(String, &str)> {
         let mut values = shape
             .cells()
@@ -2345,6 +2467,23 @@ mod tests {
                         .as_deref()
                         .map(|formula| (section_cell_name(section, row, cell), formula))
                 }));
+            }
+        }
+        values
+    }
+    fn shape_formula_cells(shape: &Shape) -> Vec<(String, &Cell)> {
+        let mut values = shape
+            .cells()
+            .filter(|cell| cell.formula.is_some())
+            .map(|cell| (cell.name.clone(), cell))
+            .collect::<Vec<_>>();
+        for section in shape.sections() {
+            for row in section.rows() {
+                values.extend(
+                    row.cells()
+                        .filter(|cell| cell.formula.is_some())
+                        .map(|cell| (section_cell_name(section, row, cell), cell)),
+                );
             }
         }
         values

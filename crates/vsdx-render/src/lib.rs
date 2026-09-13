@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use vsdx_eval::{Evaluation, PageShapeReferences, Value, evaluate_cell_with_shape_package_theme};
 use vsdx_parse::{ParseLimits, Shape, VsdxPackage};
-use vsdx_resolve::{Lookup, ResolvedShape, Resolver, realize_geometry};
+use vsdx_resolve::{Lookup, ResolvedShape, Resolver, ScenePoint, SceneTransform, realize_geometry};
 
 const MAX_RECURSION_DEPTH: usize = 64;
 
@@ -507,7 +507,12 @@ impl Renderer {
             .get(page_part)
             .ok_or_else(|| RenderError::MissingPage(page_part.into()))?;
         let resolver = Resolver::new(package);
+        let connectivity = resolver.resolve_page_connectivity(page_part)?;
         let references = PageShapeReferences::new(&resolver, page_part).ok();
+        let shapes = resolver.resolve_page_shapes(page_part)?;
+        let transforms = vsdx_resolve::scene_transforms(page, &shapes, |id, shape, name| {
+            evaluated(package, references.as_ref(), shape, id, name)
+        });
         let page_height = page_dimension(&resolver, package, page_part, "PageHeight")
             .ok_or_else(|| RenderError::PageDimensions("PageHeight is unavailable".into()))?;
         let page_width = page_dimension(&resolver, package, page_part, "PageWidth")
@@ -536,7 +541,9 @@ impl Renderer {
             self.layout_shape(
                 package,
                 &resolver,
+                &connectivity,
                 references.as_ref(),
+                &transforms,
                 page_part,
                 shape,
                 0,
@@ -570,7 +577,9 @@ impl Renderer {
         &self,
         package: &VsdxPackage,
         resolver: &Resolver<'_>,
+        connectivity: &vsdx_resolve::PageConnectivity,
         references: Option<&PageShapeReferences>,
+        transforms: &BTreeMap<u32, SceneTransform>,
         page_part: &str,
         shape: &Shape,
         depth: usize,
@@ -592,8 +601,45 @@ impl Renderer {
         if paint::number(&resolved, "NoShow").is_some_and(|value| value != 0.0) {
             return Ok(());
         }
+        if connectivity
+            .connectors
+            .get(&shape.id)
+            .is_some_and(|connector| {
+                connector.is_1d
+                    && connector.glue.iter().all(|glue| {
+                        !glue.diagnostics.iter().any(|diagnostic| {
+                            matches!(
+                                diagnostic,
+                                vsdx_resolve::ConnectivityDiagnostic::UnsupportedFromCell { .. }
+                            )
+                        })
+                    })
+                    || (connector.begin.is_some() || connector.end.is_some())
+                        && connector.glue.iter().any(|glue| {
+                            glue.to
+                                .as_ref()
+                                .is_some_and(|target| target.connection_point.is_none())
+                        })
+            })
+        {
+            return self.layout_connector(
+                package,
+                resolver,
+                connectivity,
+                references,
+                page_part,
+                shape,
+                id,
+                z_order,
+                &resolved,
+                state,
+            );
+        }
         let Some(bounds) = bounds(package, references, &resolved, shape.id) else {
             return self.placeholder(shape, state, "unresolvable transform");
+        };
+        let Some(transform) = transforms.get(&shape.id) else {
+            return self.placeholder_at(id, z_order, bounds, state, "unresolvable transform");
         };
         if !bounds_finite(bounds) {
             return self.placeholder_at(
@@ -607,22 +653,15 @@ impl Renderer {
         let geometry = resolved.sections.get("Geometry").map(realize_geometry);
         let child_shapes = shape.shapes().collect::<Vec<_>>();
         if !child_shapes.is_empty() {
-            let transform = group_transform(
-                bounds,
-                child_coordinate_extent(
-                    package,
-                    resolver,
-                    references,
-                    page_part,
-                    child_shapes.iter().copied(),
-                ),
-            );
+            let group_transform = affine(transform.local);
             let start = state.primitives.len();
             for child in child_shapes {
                 self.layout_shape(
                     package,
                     resolver,
+                    connectivity,
                     references,
+                    transforms,
                     page_part,
                     child,
                     depth + 1,
@@ -635,7 +674,7 @@ impl Renderer {
                 id,
                 z_order,
                 primitives: children,
-                transform,
+                transform: group_transform,
             });
             return Ok(());
         }
@@ -669,7 +708,7 @@ impl Renderer {
                     y: 0.0,
                     width: bounds.width as f32,
                     height: bounds.height as f32,
-                    transform: bounds_affine(bounds, (0.0, 0.0), (1.0, 1.0)),
+                    transform: affine(transform.local),
                 });
                 return Ok(());
             }
@@ -703,7 +742,7 @@ impl Renderer {
             .commands
             .into_iter()
             .map(|mut command| {
-                transform_command(&mut command, bounds);
+                transform_affine(&mut command, affine(transform.local));
                 command
             })
             .collect::<Vec<_>>();
@@ -728,8 +767,94 @@ impl Renderer {
             transform: Affine::identity(),
         });
         self.text(
-            package, resolver, references, page_part, shape, &resolved, id, bounds, state,
+            package,
+            resolver,
+            references,
+            page_part,
+            shape,
+            &resolved,
+            id,
+            bounds,
+            affine(transform.local).compose(Affine {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: -bounds.x as f32,
+                f: -bounds.y as f32,
+            }),
+            state,
         )?;
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn layout_connector(
+        &self,
+        package: &VsdxPackage,
+        _resolver: &Resolver<'_>,
+        connectivity: &vsdx_resolve::PageConnectivity,
+        references: Option<&PageShapeReferences>,
+        _page_part: &str,
+        shape: &Shape,
+        id: String,
+        z_order: u32,
+        resolved: &ResolvedShape,
+        state: &mut State,
+    ) -> Result<(), RenderError> {
+        let Some(connector) = connectivity.connectors.get(&shape.id) else {
+            return self.placeholder(shape, state, "1D shape is missing connector state");
+        };
+        let mut begin = connector.begin;
+        let mut end = connector.end;
+        for glue in &connector.glue {
+            let Some(point) = glue
+                .to
+                .as_ref()
+                .and_then(|target| target.connection_point.as_ref())
+                .map(|point| point.position)
+            else {
+                let reason = glue.diagnostics.first().map_or_else(
+                    || "connector route cannot be computed: unresolved glued endpoint".into(),
+                    |diagnostic| format!("connector route cannot be computed: unresolved glued endpoint: {diagnostic:?}"),
+                );
+                return self.placeholder_at(id, z_order, Bounds::default(), state, &reason);
+            };
+            match glue.endpoint {
+                vsdx_resolve::ConnectorEndpoint::Begin => begin = Some(point),
+                vsdx_resolve::ConnectorEndpoint::End => end = Some(point),
+            }
+        }
+        let (Some(begin), Some(end)) = (begin, end) else {
+            return self.placeholder_at(
+                id,
+                z_order,
+                Bounds::default(),
+                state,
+                "connector route cannot be computed: unresolved endpoint",
+            );
+        };
+        if ![begin.x, begin.y, end.x, end.y]
+            .into_iter()
+            .all(f64::is_finite)
+        {
+            return self.placeholder(
+                shape,
+                state,
+                "connector route cannot be computed: non-finite endpoint",
+            );
+        }
+        let (fill, stroke) = match paint::paint(package, references, resolved, shape.id) {
+            Ok(paint) => paint,
+            Err(reason) => return self.placeholder(shape, state, &reason),
+        };
+        state.primitives.push(Primitive::Shape {
+            id,
+            z_order,
+            path: connector_route(begin, end, paint::number(resolved, "RoutStyle")),
+            fill,
+            stroke,
+            transform: Affine::identity(),
+        });
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -743,6 +868,7 @@ impl Renderer {
         resolved: &ResolvedShape,
         id: String,
         bounds: Bounds,
+        transform: Affine,
         state: &mut State,
     ) -> Result<(), RenderError> {
         if matches!(resolved.cell("Char.Size"), Some(Lookup::Found(cell)) if cell.cell.value.as_deref().and_then(|value| value.parse::<f32>().ok()).is_some_and(|value| !value.is_finite()))
@@ -895,7 +1021,7 @@ impl Renderer {
                 })
                 .collect(),
             lines,
-            transform: shape_transform(bounds),
+            transform,
         });
         Ok(())
     }
@@ -1243,8 +1369,15 @@ fn transform_rect(x: &mut f32, y: &mut f32, width: &mut f32, height: &mut f32, m
     *width = max_x - min_x;
     *height = max_y - min_y;
 }
-fn transform_command(command: &mut ooxml_drawingml::GeometryPathCommand, bounds: Bounds) {
-    transform_affine(command, bounds_affine(bounds, (0.0, 0.0), (1.0, 1.0)));
+fn affine(transform: vsdx_resolve::SceneAffine) -> Affine {
+    Affine {
+        a: transform.a as f32,
+        b: transform.b as f32,
+        c: transform.c as f32,
+        d: transform.d as f32,
+        e: transform.e as f32,
+        f: transform.f as f32,
+    }
 }
 fn transform_affine(command: &mut ooxml_drawingml::GeometryPathCommand, matrix: Affine) {
     use ooxml_drawingml::GeometryPathCommand::*;
@@ -1273,83 +1406,6 @@ fn transform_affine(command: &mut ooxml_drawingml::GeometryPathCommand, matrix: 
         Close => {}
     }
 }
-fn bounds_affine(group: Bounds, origin: (f64, f64), scale: (f64, f64)) -> Affine {
-    let loc_x = group.loc_pin_x;
-    let loc_y = group.loc_pin_y;
-    let pin_x = group.x + group.loc_pin_x;
-    let pin_y = group.y + group.loc_pin_y;
-    let (sin, cos) = group.angle.sin_cos();
-    let (origin_x, origin_y) = origin;
-    let (scale_x, scale_y) = scale;
-    let sx = scale_x * if group.flip_x { -1.0 } else { 1.0 };
-    let sy = scale_y * if group.flip_y { -1.0 } else { 1.0 };
-    Affine {
-        a: (cos * sx) as f32,
-        b: (sin * sx) as f32,
-        c: (-sin * sy) as f32,
-        d: (cos * sy) as f32,
-        e: (pin_x - cos * sx * (loc_x + origin_x) + sin * sy * (loc_y + origin_y)) as f32,
-        f: (pin_y - sin * sx * (loc_x + origin_x) - cos * sy * (loc_y + origin_y)) as f32,
-    }
-}
-/// Visio documents the lower-left local origin, but not how to derive a group child scale.
-/// Use the conservative selection-extent ratio and translate that documented origin.
-fn group_transform(group: Bounds, child_extent: Option<ChildCoordinateExtent>) -> Affine {
-    let (origin, scale) = child_extent
-        .map(|extent| {
-            (
-                (extent.x, extent.y),
-                (group.width / extent.width, group.height / extent.height),
-            )
-        })
-        .unwrap_or(((0.0, 0.0), (1.0, 1.0)));
-    bounds_affine(group, origin, scale)
-}
-/// Maps a shape's own absolute, pre-rotation bounds into its rotated position, the same
-/// transform already baked into its geometry path, so geometry and text agree.
-fn shape_transform(bounds: Bounds) -> Affine {
-    bounds_affine(bounds, (bounds.x, bounds.y), (1.0, 1.0))
-}
-struct ChildCoordinateExtent {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-fn child_coordinate_extent<'a>(
-    package: &VsdxPackage,
-    resolver: &Resolver<'_>,
-    references: Option<&PageShapeReferences>,
-    page_part: &str,
-    shapes: impl Iterator<Item = &'a Shape>,
-) -> Option<ChildCoordinateExtent> {
-    let bounds = shapes
-        .filter_map(|shape| {
-            resolver
-                .resolve_shape(page_part, shape.id)
-                .ok()
-                .and_then(|resolved| bounds(package, references, &resolved, shape.id))
-        })
-        .collect::<Vec<_>>();
-    let min_x = bounds.iter().map(|bounds| bounds.x).reduce(f64::min)?;
-    let min_y = bounds.iter().map(|bounds| bounds.y).reduce(f64::min)?;
-    let max_x = bounds
-        .iter()
-        .map(|bounds| bounds.x + bounds.width)
-        .reduce(f64::max)?;
-    let max_y = bounds
-        .iter()
-        .map(|bounds| bounds.y + bounds.height)
-        .reduce(f64::max)?;
-    let width = max_x - min_x;
-    let height = max_y - min_y;
-    (width > 0.0 && height > 0.0).then_some(ChildCoordinateExtent {
-        x: min_x,
-        y: min_y,
-        width,
-        height,
-    })
-}
 struct State {
     count: usize,
     z_order: u32,
@@ -1375,8 +1431,26 @@ struct Bounds {
     loc_pin_x: f64,
     loc_pin_y: f64,
     angle: f64,
-    flip_x: bool,
-    flip_y: bool,
+}
+/// Routes RoutStyle != 0 with one horizontal-first bend, otherwise directly.
+fn connector_route(
+    begin: ScenePoint,
+    end: ScenePoint,
+    route_style: Option<f64>,
+) -> Vec<ooxml_drawingml::GeometryPathCommand> {
+    use ooxml_drawingml::GeometryPathCommand::{Line, Move};
+    let mut path = vec![Move {
+        x: begin.x,
+        y: begin.y,
+    }];
+    if route_style.is_some_and(|style| style != 0.0) && begin.x != end.x && begin.y != end.y {
+        path.push(Line {
+            x: end.x,
+            y: begin.y,
+        });
+    }
+    path.push(Line { x: end.x, y: end.y });
+    path
 }
 fn bounds_finite(bounds: Bounds) -> bool {
     [
@@ -1445,8 +1519,6 @@ fn bounds(
         loc_pin_x,
         loc_pin_y,
         angle: value("Angle").unwrap_or(0.0),
-        flip_x: value("FlipX").unwrap_or(0.0) != 0.0,
-        flip_y: value("FlipY").unwrap_or(0.0) != 0.0,
     })
 }
 fn evaluated(
@@ -2458,21 +2530,20 @@ mod tests {
 
     #[test]
     fn group_child_extent_origin_maps_to_the_group_lower_left_corner() {
-        let matrix = group_transform(
-            Bounds {
+        let matrix = affine(vsdx_resolve::bounds_affine(
+            vsdx_resolve::ShapeBounds {
                 x: 10.0,
                 y: 20.0,
                 width: 8.0,
                 height: 12.0,
-                ..Default::default()
+                loc_pin_x: 0.0,
+                loc_pin_y: 0.0,
+                angle: 0.0,
+                flip_x: false,
+                flip_y: false,
             },
-            Some(ChildCoordinateExtent {
-                x: 2.0,
-                y: 3.0,
-                width: 4.0,
-                height: 6.0,
-            }),
-        );
+            Some((2.0, 3.0, 4.0, 6.0)),
+        ));
         assert_point_close(matrix.apply_point(2.0, 3.0), (10.0, 20.0));
         assert_point_close(matrix.apply_point(6.0, 9.0), (18.0, 32.0));
     }
@@ -3134,6 +3205,20 @@ mod tests {
     }
 
     #[test]
+    fn hidden_one_d_connector_emits_no_primitives() {
+        let mut connector = shape(1, 1.0, 1.0);
+        connector.children.extend([
+            ShapeChild::Cell(cell("OneD", "1")),
+            ShapeChild::Cell(cell("BeginX", "1")),
+            ShapeChild::Cell(cell("BeginY", "1")),
+            ShapeChild::Cell(cell("EndX", "4")),
+            ShapeChild::Cell(cell("EndY", "1")),
+            ShapeChild::Cell(cell("NoShow", "1")),
+        ]);
+        assert!(render(vec![connector]).primitives.is_empty());
+    }
+
+    #[test]
     fn unresolved_foreign_data_and_colours_become_placeholders() {
         let mut image = shape(1, 1.0, 1.0);
         image.children.push(ShapeChild::ForeignData(ForeignData {
@@ -3531,6 +3616,79 @@ mod tests {
                 position: 0,
             })
         );
+    }
+
+    #[test]
+    fn corpus_dangling_glue_renders_placeholders() {
+        let Ok(directory) = std::env::var("VSDX_CORPUS_DIR") else {
+            eprintln!(
+                "warning: skipping corpus dangling-glue render test; VSDX_CORPUS_DIR is unset"
+            );
+            return;
+        };
+        let mut dangling = 0;
+        let mut expected = std::collections::BTreeSet::new();
+        let mut placeholders = std::collections::BTreeSet::new();
+        let mut painted = std::collections::BTreeSet::new();
+        for file in ["lichtsysteme.vsdx", "soundplan.vsdx"] {
+            let package = vsdx_parse::parse_vsdx(
+                &std::fs::read(std::path::Path::new(&directory).join(file)).unwrap(),
+            )
+            .unwrap();
+            let resolver = Resolver::new(&package);
+            let renderer = Renderer::default();
+            for page in &package.page_part_paths {
+                let connectivity = resolver.resolve_page_connectivity(page).unwrap();
+                for connector in connectivity.connectors.values() {
+                    let unresolved = connector
+                        .glue
+                        .iter()
+                        .filter(|glue| {
+                            glue.to
+                                .as_ref()
+                                .and_then(|target| target.connection_point.as_ref())
+                                .is_none()
+                        })
+                        .count();
+                    dangling += unresolved;
+                    if unresolved != 0 {
+                        expected.insert(format!("{page}:{}", connector.shape_id));
+                    }
+                }
+                collect_connector_primitives(
+                    &renderer.layout_page(&package, page).unwrap().primitives,
+                    &mut placeholders,
+                    &mut painted,
+                );
+            }
+        }
+        assert_eq!(dangling, 30, "corpus dangling-glue record count changed");
+        assert_eq!(placeholders, expected);
+        assert!(painted.is_disjoint(&expected));
+    }
+
+    fn collect_connector_primitives(
+        primitives: &[Primitive],
+        placeholders: &mut std::collections::BTreeSet<String>,
+        painted: &mut std::collections::BTreeSet<String>,
+    ) {
+        for primitive in primitives {
+            match primitive {
+                Primitive::Placeholder { id, reason, .. } => {
+                    if reason.starts_with("connector route cannot be computed:") {
+                        assert!(!reason.is_empty());
+                        placeholders.insert(id.clone());
+                    }
+                }
+                Primitive::Shape { id, .. } => {
+                    painted.insert(id.clone());
+                }
+                Primitive::Group { primitives, .. } => {
+                    collect_connector_primitives(primitives, placeholders, painted);
+                }
+                Primitive::Image { .. } | Primitive::TextBox { .. } => {}
+            }
+        }
     }
 
     #[test]
