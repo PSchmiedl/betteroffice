@@ -210,6 +210,156 @@ fn undeclared_font_size_matches_word_without_overriding_the_style_hierarchy() {
 }
 
 #[test]
+fn table_paragraph_spacing_overrides_defaults_but_preserves_paragraph_formatting() {
+    let styles = r#"<w:docDefaults><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="279" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"/>
+<w:style w:type="paragraph" w:styleId="Spaced"><w:pPr><w:spacing w:after="100" w:line="360" w:lineRule="auto"/></w:pPr></w:style>
+<w:style w:type="table" w:styleId="Base"><w:pPr><w:spacing w:after="80" w:line="240" w:lineRule="auto"/></w:pPr></w:style>
+<w:style w:type="table" w:styleId="Grid"><w:basedOn w:val="Base"/><w:pPr><w:spacing w:after="0"/></w:pPr></w:style>
+<w:style w:type="table" w:default="1" w:styleId="Inner"><w:pPr><w:spacing w:after="60" w:line="300" w:lineRule="auto"/></w:pPr></w:style>"#;
+    let body = r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p>
+<w:tbl><w:tblPr><w:tblStyle w:val="Grid"/></w:tblPr><w:tblGrid><w:gridCol w:w="9360"/></w:tblGrid><w:tr><w:tc>
+<w:p><w:r><w:t>Table defaults</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="Spaced"/></w:pPr><w:r><w:t>Paragraph style</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="Spaced"/><w:spacing w:after="200" w:line="480" w:lineRule="auto"/></w:pPr><w:r><w:t>Direct formatting</w:t></w:r></w:p>
+<w:sdt><w:sdtContent><w:p><w:r><w:t>Content control</w:t></w:r></w:p></w:sdtContent></w:sdt>
+<w:tbl><w:tblGrid><w:gridCol w:w="9360"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>Nested table</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+<w:p><w:r><w:t>Outer restored</w:t></w:r></w:p>
+</w:tc></w:tr></w:tbl><w:p><w:r><w:t>After</w:t></w:r></w:p>"#;
+    let engine = EngineSession::new(74213);
+    seed_from_docx(engine.doc(), &document(body, styles)).unwrap();
+    let before = engine.doc().encode_state_as_update_v1();
+    let blocks: Value = serde_json::from_str(
+        &engine
+            .lower_story_json("body", &docx_edit::bridge::RenderEnv::default())
+            .unwrap(),
+    )
+    .unwrap();
+    let table_cell = &blocks[1]["rows"][0]["cells"][0]["blocks"];
+    for (paragraph, after_twips, line) in [
+        (&blocks[0], 160.0, 279.0 / 240.0),
+        (&table_cell[0], 0.0, 1.0),
+        (&table_cell[1], 100.0, 1.5),
+        (&table_cell[2], 200.0, 2.0),
+        (&table_cell[3], 0.0, 1.0),
+        (
+            &table_cell[4]["rows"][0]["cells"][0]["blocks"][0],
+            60.0,
+            1.25,
+        ),
+        (&table_cell[5], 0.0, 1.0),
+        (&blocks[2], 160.0, 279.0 / 240.0),
+    ] {
+        let spacing = &paragraph["attrs"]["spacing"];
+        assert_eq!(spacing["after"], after_twips / 15.0, "{paragraph}");
+        assert_eq!(spacing["line"], line, "{paragraph}");
+    }
+    assert_eq!(engine.doc().encode_state_as_update_v1(), before);
+}
+
+#[test]
+fn table_spacing_also_overrides_application_defaults_when_document_defaults_are_absent() {
+    let styles = r#"<w:style w:type="table" w:styleId="Grid"><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr></w:style>"#;
+    let body = r#"<w:tbl><w:tblPr><w:tblStyle w:val="Grid"/></w:tblPr><w:tblGrid><w:gridCol w:w="9360"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>Single spaced</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+    let engine = EngineSession::new(74214);
+    seed_from_docx(engine.doc(), &document(body, styles)).unwrap();
+    let blocks: Value = serde_json::from_str(
+        &engine
+            .lower_story_json("body", &docx_edit::bridge::RenderEnv::default())
+            .unwrap(),
+    )
+    .unwrap();
+    let spacing = &blocks[0]["rows"][0]["cells"][0]["blocks"][0]["attrs"]["spacing"];
+    assert_eq!(spacing["after"], 0.0);
+    assert_eq!(spacing["line"], 1.0);
+}
+
+#[test]
+fn conditional_table_paragraph_spacing_follows_regions_and_cascade() {
+    let body = include_str!(
+        "../../../packages/docx/src/yrs/__fixtures__/table-conditional-spacing/body.xml"
+    );
+    let styles = include_str!(
+        "../../../packages/docx/src/yrs/__fixtures__/table-conditional-spacing/styles.xml"
+    );
+    let engine = EngineSession::new(74219);
+    seed_from_docx(engine.doc(), &document(body, styles)).unwrap();
+    let before = engine.doc().encode_state_as_update_v1();
+    let blocks: Value = serde_json::from_str(
+        &engine
+            .lower_story_json("body", &docx_edit::bridge::RenderEnv::default())
+            .unwrap(),
+    )
+    .unwrap();
+    let expected = [
+        vec![
+            vec![190, 110, 110, 110, 200],
+            vec![130, 170, 180, 170, 140],
+            vec![130, 170, 180, 170, 140],
+            vec![130, 170, 180, 170, 140],
+            vec![210, 120, 120, 120, 220],
+        ],
+        vec![
+            vec![110; 5],
+            vec![150; 5],
+            vec![150; 5],
+            vec![160; 5],
+            vec![160; 5],
+        ],
+        vec![vec![10; 5]; 5],
+        vec![
+            vec![190, 110, 200],
+            vec![170, 180, 170],
+            vec![130, 180, 140],
+            vec![210, 120, 220],
+        ],
+        vec![vec![400, 420, 120, 120, 220]],
+        vec![vec![130, 170, 170, 180, 180]; 5],
+        vec![
+            vec![190, 110, 110, 110, 110],
+            vec![130, 150, 150, 150, 150],
+            vec![130, 160, 160, 160, 160],
+            vec![130, 150, 150, 150, 150],
+            vec![130, 160, 160, 160, 160],
+        ],
+        vec![vec![170, 180, 170, 180, 170]; 5],
+        vec![vec![170, 180, 170, 180, 170]; 5],
+    ];
+    let tables = blocks
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block["kind"] == "table")
+        .collect::<Vec<_>>();
+    assert_eq!(tables.len(), expected.len());
+    for (table, rows) in tables.iter().zip(expected) {
+        for (row, cells) in table["rows"].as_array().unwrap().iter().zip(rows) {
+            assert_eq!(row["cells"].as_array().unwrap().len(), cells.len());
+            for (cell, after) in row["cells"].as_array().unwrap().iter().zip(cells) {
+                assert!(
+                    (cell["blocks"][0]["attrs"]["spacing"]["after"]
+                        .as_f64()
+                        .unwrap()
+                        - f64::from(after) / 15.0)
+                        .abs()
+                        < 1e-8,
+                    "{cell}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        tables[0]["rows"][0]["cells"][0]["blocks"][0]["attrs"]["spacing"]["line"],
+        1.5
+    );
+    assert_eq!(
+        tables[4]["rows"][0]["cells"][0]["blocks"][0]["attrs"]["spacing"]["line"],
+        2.0
+    );
+    assert_eq!(engine.doc().encode_state_as_update_v1(), before);
+}
+
+#[test]
 fn hidden_runs_preserve_edit_positions_and_can_be_revealed() {
     let body = r#"<w:p><w:r><w:t>A</w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>😀secret</w:t><w:tab/><w:br/></w:r><w:hyperlink w:anchor="hidden"><w:r><w:rPr><w:vanish/></w:rPr><w:t>link</w:t></w:r></w:hyperlink><w:r><w:t>Z</w:t></w:r></w:p><w:p><w:r><w:t>After</w:t></w:r></w:p>"#;
     let engine = EngineSession::new(74209);
