@@ -19,6 +19,130 @@ fn cell(address: &str) -> CellRef {
     CellRef::parse_a1(address).unwrap()
 }
 
+#[test]
+fn indexed_palette_colors_reach_rendering_selection_sync_and_save() {
+    let mut model = WorkbookModel::default();
+    model.styles.indexed_colors = vec!["#123456".into(), "#5e88b1".into(), "#99cc00".into()];
+    let format = xlsx_model::CellFormat {
+        font: xlsx_model::Font {
+            color: Some(xlsx_model::Color::Indexed(2)),
+            ..Default::default()
+        },
+        fill: xlsx_model::Fill::Solid(xlsx_model::Color::Indexed(1)),
+        border: xlsx_model::Border {
+            bottom: Some(xlsx_model::BorderEdge {
+                style: xlsx_model::BorderStyle::Thin,
+                color: Some(xlsx_model::Color::Indexed(0)),
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let style = model.styles.intern_cell_format(&format).unwrap();
+    let mut sheet = Sheet::new("Data");
+    sheet.set_cell(
+        cell("A1"),
+        Cell {
+            value: CellValue::Number { value: 1.0 },
+            style,
+            ..Cell::default()
+        },
+    );
+    model.sheets.push(sheet);
+    let mut workbook = Workbook::from_model_collaborative(model.clone(), 11).unwrap();
+    let mut peer = Workbook::from_model_collaborative(model, 12).unwrap();
+    let before = peer.encode_state_vector_v1();
+    workbook
+        .edit_cell(SheetId(0), cell("A1"), "2", CalculationOptions::default())
+        .unwrap();
+    peer.apply_update_v1(
+        &workbook.encode_diff_v1(&before).unwrap(),
+        CalculationOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(workbook.model(), peer.model());
+    let saved = Workbook::open(&workbook.save().unwrap()).unwrap();
+    for workbook in [&workbook, &peer, &saved] {
+        let selection = workbook
+            .selection_formatting(SheetId(0), CellRange::new(cell("A1"), cell("A1")))
+            .unwrap();
+        assert_eq!(selection.fill_color.as_deref(), Some("#5e88b1"));
+        assert_eq!(selection.text_color.as_deref(), Some("#99cc00"));
+        assert_eq!(selection.border_color.as_deref(), Some("#123456"));
+        let list = workbook
+            .display_list(&Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+            })
+            .unwrap();
+        assert!(
+            list.commands
+                .iter()
+                .any(|cmd| matches!(cmd, DrawCmd::FillRect { color, .. } if color == "#5e88b1"))
+        );
+        assert!(list.commands.iter().any(|cmd| matches!(cmd, DrawCmd::Text { text, color, .. } if text == "2" && color == "#99cc00")));
+        assert!(
+            list.commands
+                .iter()
+                .any(|cmd| matches!(cmd, DrawCmd::Line { color, .. } if color == "#123456"))
+        );
+        assert_eq!(workbook.model().styles.cell_format(style), format);
+    }
+}
+
+#[test]
+fn saving_rejects_invalid_palette_colors_from_model_json() {
+    let mut model = WorkbookModel::default();
+    model.sheets.push(Sheet::new("Data"));
+    let mut json = serde_json::to_value(&model.styles).unwrap();
+    json["indexed_colors"] = serde_json::json!(["#123456", "#GGGGGG"]);
+    model.styles = serde_json::from_value(json).unwrap();
+    let workbook = Workbook::from_model(model).unwrap();
+    assert!(
+        workbook
+            .save()
+            .unwrap_err()
+            .to_string()
+            .contains("indexed palette color at index 1")
+    );
+}
+
+#[test]
+fn restored_legacy_snapshots_publish_the_current_palette_identity() {
+    let mut model = WorkbookModel::default();
+    model.sheets.push(Sheet::new("Data"));
+    let legacy = Workbook::from_model_collaborative(model.clone(), 11).unwrap();
+    model.styles.indexed_colors = vec!["#123456".into(); 64];
+    let mut restored = Workbook::from_model_collaborative(model.clone(), 12).unwrap();
+    restored
+        .apply_update_v1(
+            &legacy.encode_state_as_update_v1(),
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    restored
+        .edit_cell(SheetId(0), cell("A1"), "42", CalculationOptions::default())
+        .unwrap();
+    let snapshot = restored.encode_state_as_update_v1();
+    let mut same_palette = Workbook::from_model_collaborative(model.clone(), 13).unwrap();
+    same_palette
+        .apply_update_v1(&snapshot, CalculationOptions::default())
+        .unwrap();
+    assert_eq!(
+        same_palette.cell(SheetId(0), cell("A1")).unwrap().input,
+        "42"
+    );
+    model.styles.indexed_colors.fill("#abcdef".into());
+    let mut different_palette = Workbook::from_model_collaborative(model.clone(), 14).unwrap();
+    assert!(matches!(
+        different_palette.apply_update_v1(&snapshot, CalculationOptions::default()),
+        Err(Error::CollaborativeState(_))
+    ));
+    assert_eq!(different_palette.model(), &model);
+}
+
 fn sample_parts() -> Vec<(String, Vec<u8>)> {
     let mut sheet = Sheet::new("Data");
     sheet.set_cell(
