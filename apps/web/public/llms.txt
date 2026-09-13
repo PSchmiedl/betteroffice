@@ -89,3 +89,4 @@ eigenpal was a popular DOCX editor, deprecated when its maintainers moved to a c
 - [betteroffice-vsdx-resolve](https://crates.io/crates/betteroffice-vsdx-resolve)
 - [betteroffice-vsdx-eval](https://crates.io/crates/betteroffice-vsdx-eval)
 - [betteroffice-vsdx-render](https://crates.io/crates/betteroffice-vsdx-render)
+- [betteroffice-vsdx-edit](https://crates.io/crates/betteroffice-vsdx-edit)
