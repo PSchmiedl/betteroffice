@@ -48,7 +48,7 @@ for bold, italic, size, color, slides, and text boxes.
 
 Props: `file`, `fonts`, `collaboration`, `i18n`, `className`, `fileName`,
 `onReady` (exposes the core `PresentationHandle`, a `refresh` callback for
-host-driven edits, and `save`), `onChange` (deck snapshots), `onError`, and
+host-driven edits, `refreshProposals`, and `save`), `onChange` (deck snapshots), `onError`, and
 `onSave` (receives the saved bytes; without it, saving downloads the file).
 
 ## What works today
@@ -62,6 +62,50 @@ host-driven edits, and `save`), `onChange` (deck snapshots), `onError`, and
   ([`@betteroffice/pptx-i18n`](https://www.npmjs.com/package/@betteroffice/pptx-i18n))
 - Real-time collaboration with people or agents; the deck is a CRDT
 - Live collaborator shape selections and presence chips, shown in each peer's color
+- Agent proposal review directly on the slide canvas, with inline text diffs,
+  old/new shape bounds, before/after previews, acceptance, rejection, and Undo
+
+## Review agent proposals
+
+Use the editor API supplied to `onReady` to stage edits from your agent, then
+refresh the pending list:
+
+```ts
+api.handle.propose('editor-agent', 'Clarify the speaker notes', [{
+  type: 'setSlideNotes',
+  slideId: api.handle.snapshot().slides[0].id,
+  text: 'Explain the customer outcome before the implementation details.',
+}]);
+api.refreshProposals();
+```
+
+Pending edits appear directly on the slide canvas: deleted text is red and
+struck through, inserted text is green and underlined, and moved/resized shapes
+show their previous and proposed bounds. Speaker notes have their own inline
+text diff. The canvas toolbar selects a proposal when several affect the slide
+and provides acceptance, rejection, and access to review details. Acceptance is
+available after the current diff has painted successfully.
+
+The canvas is in review mode while showing a diff. **Edit slide** (or Escape)
+returns to normal editing; **Show changes** restores the diff. This keeps
+temporary review offsets separate from editable text. Saving, PNG export, and
+presentation mode use the actual document. Changes from other users refresh the
+review, and stale targets require the explicit review described below.
+
+The **Agent proposals** button shows the pending count. Each group shows its
+author, rationale, targets, and text changes. **Preview** opens current and
+proposed slide renderings, with a target selector for groups spanning multiple
+shapes or slides. Notes changes also appear as text because notes are outside
+the slide canvas.
+
+Accepting a group updates the editor, calls `onChange`, and creates one Undo
+step. Rejecting it leaves the deck untouched. If a target changed, preview its
+current state before choosing **Apply updated proposal**. A further target
+change detected at that click refreshes the preview for another review.
+
+Pending proposals are session-local and disappear when the deck closes. Only
+accepted edits are saved and synchronized. Existing host-driven edits may keep
+using `api.refresh()`, which also refreshes the proposal list.
 
 ## Collaboration
 

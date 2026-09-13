@@ -19,12 +19,16 @@ mod deck;
 mod effects;
 mod model;
 mod outline_gradients;
+mod proposal_diff;
+mod proposals;
 mod save;
 mod source_run_properties;
 mod story;
 mod undo;
 
 pub use model::*;
+pub use proposal_diff::*;
+pub use proposals::*;
 pub use undo::DeckUndoManager;
 
 #[cfg(feature = "wasm")]
@@ -61,6 +65,7 @@ pub struct DeckSession {
     id_counter: AtomicU64,
     package: Arc<PptxPackage>,
     undo: RefCell<DeckUndoManager>,
+    proposals: RefCell<proposals::ProposalStore>,
 }
 
 impl DeckSession {
@@ -113,6 +118,7 @@ impl DeckSession {
             id_counter: AtomicU64::new(0),
             package: Arc::new(package),
             undo: RefCell::new(undo),
+            proposals: Default::default(),
         })
     }
 
@@ -135,6 +141,7 @@ impl DeckSession {
             id_counter: AtomicU64::new(0),
             package: Arc::new(package),
             undo: RefCell::new(undo),
+            proposals: Default::default(),
         })
     }
 

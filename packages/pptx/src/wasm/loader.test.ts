@@ -8,7 +8,7 @@ import type {
   StorySnapshot,
   TextBoxPrimitive,
 } from '../index';
-import { initWasm, openPresentation, paintSlide } from '../index';
+import { initWasm, openPresentation, paintSlide, StaleProposalError } from '../index';
 
 const root = resolve(import.meta.dir, '../../../..');
 let handle: PresentationHandle;
@@ -30,7 +30,93 @@ beforeAll(async () => {
   });
 });
 
+test('proposals preview real frames, accept atomically, save, and preserve stale errors', () => {
+  const source = openPresentation(fixture, { clientId: 9201, fonts: [{ family: 'Liberation Sans', bytes: fontBytes }] });
+  try {
+    const before = source.snapshot();
+    const slide = before.slides[0];
+    const shape = slide.shapes.find((shape) => shape.textStories.length > 0)!;
+    const story = shape.textStories[0];
+    const end = story.paragraphs[0].runs.reduce((length, run) => length + run.text.length, 0);
+    const updates: Uint8Array[] = [];
+    source.onUpdate((update) => updates.push(update));
+    const proposal = source.propose('review-agent', 'Improve this title', [
+      { type: 'replaceText', storyId: story.id, start: 0, end, text: 'A reviewed title' },
+      { type: 'setShapeRect', slideId: slide.id, shapeId: shape.id, rect: { x: shape.x + 100000, y: shape.y, width: shape.width, height: shape.height } },
+    ]);
+    const frameBefore = source.layoutSlide(0);
+    const frameAfter = source.layoutProposalSlide(proposal.id, 0);
+    expect(frameAfter).not.toEqual(frameBefore);
+    const preview = source.previewProposal(proposal.id);
+    expect(source.snapshot()).toEqual(before);
+    expect(source.canUndo()).toBe(false);
+    expect(updates).toHaveLength(0);
+    expect(source.acceptProposal(proposal.id).snapshot).toEqual(preview.snapshot);
+    expect(updates).toHaveLength(1);
+    const reopened = openPresentation(source.save(), { clientId: 9202 });
+    try {
+      expect(JSON.stringify(reopened.snapshot())).toContain('A reviewed title');
+      expect(reopened.listProposals()).toHaveLength(0);
+    } finally { reopened.dispose(); }
+    expect(source.undo().snapshot).toEqual(before);
+    const stale = source.propose('review-agent', null, [{ type: 'setSlideNotes', slideId: slide.id, text: 'Proposed notes' }]);
+    source.setSlideNotes(slide.id, 'Human notes');
+    expect(() => source.acceptProposal(stale.id)).toThrow(StaleProposalError);
+    expect(source.listProposals()[0].staleTargets).toEqual([slide.id]);
+    expect(source.previewProposal(stale.id).proposal.changes[0].oldText).toBe('Human notes');
+    expect(source.acceptProposal(stale.id, { force: true }).snapshot.slides[0].notes).toBe('Proposed notes');
+    const rejected = source.propose('review-agent', null, [{ type: 'setSlideNotes', slideId: slide.id, text: 'Rejected notes' }]);
+    expect(source.rejectProposal(rejected.id)).toBe(true);
+    expect(source.snapshot().slides[0].notes).toBe('Proposed notes');
+  } finally { source.dispose(); }
+});
+
 afterAll(() => handle.dispose());
+
+test('inline proposal diffs reflow and paint marked text without changing hit tests or saved text', async () => {
+  const source = openPresentation(fixture, { clientId: 9203, fonts: [{ family: 'Liberation Sans', bytes: fontBytes }] });
+  try {
+    const slideId = source.snapshot().slides[0].id;
+    const added = source.addTextBox(slideId, {
+      name: 'Inline review', text: 'Old title and shared context',
+      rect: { x: 100000, y: 100000, width: 1800000, height: 4000000 },
+      style: { fontSizePt: 24, fontFamily: 'Liberation Sans' },
+    });
+    const shape = source.snapshot().slides[0].shapes.find((shape) => shape.id === added.shapeId)!;
+    const story = shape.textStories[0];
+    const proposal = source.propose('review-agent', null, [
+      { type: 'replaceText', storyId: story.id, start: 0, end: 3, text: 'A much clearer' },
+    ]);
+    const state = source.encodeStateAsUpdate();
+    source.layoutSlide(0);
+    const hit = source.hitTest(30, 30);
+    const diff = source.layoutProposalDiffSlide(proposal.id, 0);
+    expect(source.hitTest(30, 30)).toEqual(hit);
+    expect(source.encodeStateAsUpdate()).toEqual(state);
+    const box = diff.frame.primitives.find((primitive): primitive is TextBoxPrimitive => primitive.kind === 'textBox' && primitive.storyId === story.id)!;
+    expect(box.lines.length).toBeGreaterThan(1);
+    const runs = box.lines.flatMap((line) => line.runs);
+    expect(runs.some((run) => run.color === '#b91c1c' && run.text.includes('Old'))).toBe(true);
+    expect(runs.some((run) => run.color === '#166534')).toBe(true);
+    expect(diff.textChanges.map((change) => change.kind)).toContain('insertion');
+    expect(diff.textChanges.map((change) => change.kind)).toContain('deletion');
+    const fills: string[] = [];
+    const ctx = new Proxy({ fillStyle: '', fillRect() { fills.push(this.fillStyle); } } as Record<string, any>, {
+      get(target, key) { return key in target ? target[key as string] : () => {}; },
+    }) as CanvasRenderingContext2D;
+    await paintSlide(ctx, { ...diff.frame, background: undefined, primitives: [box] }, 2, 0.75, { textChanges: diff.textChanges });
+    expect(fills).toContain('#fee2e2cc');
+    expect(fills).toContain('#dcfce7cc');
+    expect(fills).toContain('#b91c1c');
+    expect(fills).toContain('#166534');
+    const reopened = openPresentation(source.save());
+    try { expect(JSON.stringify(reopened.snapshot())).not.toContain('A much clearer'); }
+    finally { reopened.dispose(); }
+    source.acceptProposal(proposal.id);
+    expect(JSON.stringify(source.snapshot())).toContain('A much clearer');
+    expect(source.story(story.id).paragraphs[0].runs.some((run) => run.style.color === '#166534')).toBe(false);
+  } finally { source.dispose(); }
+});
 
 describe('PPTX wasm boundary', () => {
   test('opens shared updates without parsing the file bytes', () => {

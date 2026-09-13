@@ -58,6 +58,50 @@ impl PptxRenderer {
             .and_then(|rendered| rendered.hit_test(x, y));
         serde_json::to_string(&result).map_err(js_error)
     }
+
+    #[wasm_bindgen(js_name = layoutProposalSlideJson)]
+    pub fn layout_proposal_slide_json(
+        &self,
+        document: &PptxDocument,
+        id: &str,
+        slide_index: u32,
+    ) -> Result<String, JsValue> {
+        let preview = document
+            .session()
+            .proposal_preview_session(id)
+            .map_err(js_error)?;
+        let rendered = self
+            .renderer
+            .layout_slide(
+                preview.package(),
+                &preview.snapshot().map_err(js_error)?,
+                slide_index as usize,
+            )
+            .map_err(js_error)?;
+        serde_json::to_string(&rendered.display_list).map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = layoutProposalDiffSlideJson)]
+    pub fn layout_proposal_diff_slide_json(
+        &self,
+        document: &PptxDocument,
+        id: &str,
+        slide_index: u32,
+    ) -> Result<String, JsValue> {
+        let session = document.session();
+        let preview = session.preview_proposal_diff(id).map_err(js_error)?;
+        let rendered = self
+            .renderer
+            .layout_slide(session.package(), &preview.snapshot, slide_index as usize)
+            .map_err(js_error)?;
+        serde_json::to_string(&serde_json::json!({
+            "proposal": preview.proposal,
+            "snapshot": preview.snapshot,
+            "textChanges": preview.text_changes,
+            "frame": rendered.display_list,
+        }))
+        .map_err(js_error)
+    }
 }
 
 impl Default for PptxRenderer {
