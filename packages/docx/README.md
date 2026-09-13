@@ -6,11 +6,6 @@ WebAssembly, plus the display-list, canvas-render, geometry, and accessibility
 helpers the adapters build on. Layout never touches the DOM: the engine
 measures every line and pages are replayed onto canvas.
 
-> **Early (`0.0.x`).** The core surfaces — opening/saving documents, the editor
-> components, collaboration — are settling and unlikely to change shape. Smaller
-> APIs may still move between releases; breaking changes are always listed in
-> the changelog.
-
 ```bash
 bun add @betteroffice/docx
 ```
@@ -71,4 +66,5 @@ repository root, install `wasm-pack` 0.15.0 and `binaryen`, then run
 `bun run build:docx-wasm`.
 Package builds, demo startup, and CI run this step automatically.
 
-Docs: https://betteroffice.dev · Apache-2.0.
+[JavaScript guide](https://docs.betteroffice.dev/docs/javascript) ·
+[Changelog](https://github.com/openooxml/betteroffice/blob/main/packages/docx/CHANGELOG.md) · Apache-2.0.

@@ -1,5 +1,6 @@
 import {
   CAPABILITIES,
+  BENCHMARKS,
   COLLABORATION,
   DEMO,
   DOCS,
@@ -12,6 +13,7 @@ import {
   PACKAGES_SECTION,
   PEERS,
   REPO,
+  RELEASES,
   SITE,
   SUITE,
 } from "./content";
@@ -25,12 +27,12 @@ function named(items: { name: string; desc: string }[]): string {
 export function homepageMarkdown(): string {
   const editors = EDITORS.map(
     (editor) =>
-      `- **${editor.name}** (\`.${editor.format}\`) — ${editor.desc} [Demo](${DEMO}/${editor.format})`,
+      `- **${editor.name}** (\`.${editor.format}\`, ${editor.status}) — ${editor.desc} [Demo](${DEMO}/${editor.format})`,
   ).join("\n");
 
   const packages = PACKAGES.map(
     (pkg) =>
-      `- [\`${pkg.name}\`](https://www.npmjs.com/package/${pkg.name}) — ${pkg.desc}`,
+      `- [\`${pkg.name}\`](${pkg.sourceOnly ? `${REPO}/tree/main/packages/${pkg.name.split("/")[1]}` : `https://www.npmjs.com/package/${pkg.name}`})${pkg.sourceOnly ? " (source preview)" : ""} — ${pkg.desc}`,
   ).join("\n");
 
   const ecosystems = ECOSYSTEMS.map(
@@ -64,9 +66,13 @@ One install line per ecosystem:
 
 ${ecosystems}
 
+[Package guide](${DOCS}/docs/packages) · [Release notes](${RELEASES})
+
 ## ${FOUNDATION.heading}
 
 ${FOUNDATION.prose}
+
+[Visual fidelity results](${BENCHMARKS})
 
 ${named(CAPABILITIES)}
 
@@ -75,5 +81,7 @@ ${named(CAPABILITIES)}
 ${COLLABORATION.prose}
 
 ${named(PEERS)}
+
+[Collaboration guide](${DOCS}/docs/collaboration)
 `;
 }

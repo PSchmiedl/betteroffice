@@ -1,11 +1,9 @@
-export const SITE = "https://betteroffice.dev";
-export const REPO = "https://github.com/openooxml/betteroffice";
-export const DOCS = "https://docs.betteroffice.dev";
-export const DEMO = "https://demo.betteroffice.dev";
-export const OPENOOXML = "https://openooxml.org";
-export const NPM = "https://www.npmjs.com/org/betteroffice";
-export const CRATES = "https://crates.io/search?q=betteroffice";
-export const PYPI = "https://pypi.org/project/betteroffice-xlsx";
+import { CRATES, DOCS, NPM, PYPI } from "../../../shared/sites";
+export { BENCHMARKS, CRATES, DEMO, DOCS, NPM, OPENOOXML, PYPI, RELEASES, REPO, SITE } from "../../../shared/sites";
+
+export const SITE_TITLE = "BetterOffice — DOCX, XLSX and PPTX editors";
+export const SITE_DESCRIPTION =
+  "Open-source DOCX, XLSX and PPTX editors for React, with Rust and WebAssembly cores, collaboration, and headless APIs. Apache-2.0.";
 
 export const HERO = {
   title: "BetterOffice",
@@ -20,7 +18,7 @@ export const ECOSYSTEMS = [
     install: "npm install @betteroffice/docx-react",
     url: NPM,
     docs: `${DOCS}/docs/javascript`,
-    desc: "React editors and framework-free cores for documents, spreadsheets, slides and diagrams.",
+    desc: "Published React editors and framework-free cores for DOCX, XLSX and PPTX; VSDX is available from source.",
   },
   {
     name: "Rust",
@@ -36,7 +34,7 @@ export const ECOSYSTEMS = [
     install: "pip install betteroffice-xlsx",
     url: PYPI,
     docs: `${DOCS}/docs/python`,
-    desc: "Spreadsheets from Python: formulas evaluated, sheets rendered to PNG, workbooks saved.",
+    desc: "Published DOCX, XLSX and PPTX packages, with installation and examples in the Python guide.",
   },
 ];
 
@@ -44,7 +42,7 @@ export const SUITE = {
   label: "Suite",
   heading: "One suite, four editors",
   prose:
-    "BetterOffice packages the OpenOOXML engines as ready-to-use editors. Documents, spreadsheets, slides and Visio diagrams are live today on the same foundation.",
+    "DOCX, XLSX and PPTX editors are published on npm. The VSDX diagram editor is available as a source preview with a browser demo.",
 };
 
 export const EDITORS = [
@@ -52,25 +50,25 @@ export const EDITORS = [
     name: "Documents",
     format: "docx",
     desc: "Word-faithful editing: fonts, theme colors, styles, tables, headers & footers, tracked changes.",
-    live: true,
+    status: "available",
   },
   {
     name: "Spreadsheets",
     format: "xlsx",
     desc: "Calculation graph, grid rendering and number formats on the same shared core.",
-    live: true,
+    status: "available",
   },
   {
     name: "Slides",
     format: "pptx",
     desc: "Slide model, masters and shape editing on the same shared core.",
-    live: true,
+    status: "available",
   },
   {
     name: "Diagrams",
     format: "vsdx",
     desc: "VSDX editor with a tabbed ribbon, a standard-shape gallery, a page tab strip and a zoom status bar, for moving, Shift-drag resizing, adding and deleting shapes, setting fill and line colour, and saving diagrams. No resize-handle or connector-drag UI.",
-    live: true,
+    status: "source preview",
   },
 ];
 
@@ -78,7 +76,7 @@ export const PACKAGES_SECTION = {
   label: "Packages",
   heading: "Ships as components, not iframes",
   prose:
-    "The editors install from npm and render inside your app — no embeds, no external services, documents never leave the page. The same engines publish to crates.io for native Rust and to PyPI for Python.",
+    "The DOCX, XLSX and PPTX editors install from npm and render inside your app — no embeds, no external services, documents never leave the page. The same engines publish to crates.io for native Rust and to PyPI for Python.",
 };
 
 export const PACKAGES = [
@@ -108,10 +106,12 @@ export const PACKAGES = [
   },
   {
     name: "@betteroffice/vsdx",
+    sourceOnly: true,
     desc: "VSDX core — Rust and WebAssembly support for parsing, rendering, round-tripping, editing, saving, and collaboration.",
   },
   {
     name: "@betteroffice/vsdx-react",
+    sourceOnly: true,
     desc: "The VSDX editor as a drop-in React component: a tabbed ribbon, a searchable standard-shape gallery, a page tab strip and a zoom status bar over move, resize with Shift-drag, add, delete, set fill or line colour, and save. No resize-handle or connector-drag UI.",
   },
 ];

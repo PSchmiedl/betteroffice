@@ -1,13 +1,13 @@
 ---
-title: BetterOffice
-description: Browser-native DOCX, XLSX, and PPTX editors, plus VSDX support in development
+title: Getting started
+description: Install BetterOffice DOCX, XLSX and PPTX engines for React, JavaScript, Rust and Python; explore VSDX from source
 ---
 
 BetterOffice provides Rust and WebAssembly document engines with framework-neutral
 core packages and React editors. The same engines publish to npm, crates.io, and
 PyPI.
 
-VSDX support is in development. Its framework-free core parses, resolves,
+VSDX is available from source and is not yet published on npm or crates.io. Its framework-free core parses, resolves,
 renders, round-trips, and transactionally edits `.vsdx` packages. A React editor
 and live demo are available: it can move, resize with Shift-drag, add, and delete shapes, set fill
 and line colours, and save. It does not provide text editing, stencils, resize-handle UI, or connector-drag/routing UI.
@@ -24,3 +24,6 @@ Shape drafts accept formulas only; cached cell values and nested added shapes ar
 - [Python](./python): the three format wheels on PyPI, engine compiled in.
 - [Collaboration](./collaboration): connect DOCX, XLSX, and PPTX editors through
   a shared transport and deploy a Cloudflare Durable Object relay.
+
+- [Visual fidelity results](https://github.com/openooxml/betteroffice#visual-fidelity): published releases and source builds compared with Microsoft Office.
+- [Release notes](https://github.com/openooxml/betteroffice/releases): version-specific changes.

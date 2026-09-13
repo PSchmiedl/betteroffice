@@ -4,11 +4,6 @@ Framework-free core for the BetterOffice XLSX editor — the Rust engine (parse,
 calc, render) compiled to WebAssembly, plus display-list, viewport, hit-test,
 and accessibility helpers.
 
-> **Early (`0.0.x`).** The core surfaces — opening/saving documents, the editor
-> components, collaboration — are settling and unlikely to change shape. Smaller
-> APIs may still move between releases; breaking changes are always listed in
-> the changelog.
-
 ```bash
 bun add @betteroffice/xlsx
 ```
@@ -130,4 +125,5 @@ root, install `wasm-pack` 0.15.0 and `binaryen`, then run
 `bun run build:xlsx-wasm`. Package builds, tests, demo startup, and CI run this
 step automatically.
 
-Docs: https://betteroffice.dev · Apache-2.0.
+[JavaScript guide](https://docs.betteroffice.dev/docs/javascript) ·
+[Changelog](https://github.com/openooxml/betteroffice/blob/main/packages/xlsx/CHANGELOG.md) · Apache-2.0.

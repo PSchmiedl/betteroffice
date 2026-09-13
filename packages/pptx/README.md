@@ -4,11 +4,6 @@ Framework-free core for the BetterOffice PPTX editor — the Rust parser, yrs de
 model, slide layout, and display-list engine compiled to WebAssembly, plus the
 Canvas2D replay host.
 
-> **Early (`0.0.x`).** The core surfaces — opening/saving documents, the editor
-> components, collaboration — are settling and unlikely to change shape. Smaller
-> APIs may still move between releases; breaking changes are always listed in
-> the changelog.
-
 ```bash
 bun add @betteroffice/pptx
 ```
@@ -164,4 +159,5 @@ root, install `wasm-pack` 0.15.0 and `binaryen`, then run
 `bun scripts/build-pptx-wasm.ts`.
 Package builds copy the binary into `dist/generated`.
 
-Docs: https://betteroffice.dev · Apache-2.0.
+[JavaScript guide](https://docs.betteroffice.dev/docs/javascript) ·
+[Changelog](https://github.com/openooxml/betteroffice/blob/main/packages/pptx/CHANGELOG.md) · Apache-2.0.
