@@ -8419,6 +8419,16 @@ pub(crate) fn table_total_width(measure: &TableExtentIn) -> f64 {
 }
 
 fn nested_table_x_offset(block: &TableBlockIn, measure: &TableExtentIn, content_width: f64) -> f64 {
+    if let Some(floating) = &block.floating
+        && matches!(
+            floating.horz_anchor.as_deref(),
+            None | Some("margin" | "text")
+        )
+        && floating.tblp_x_spec.is_none()
+        && let Some(offset) = floating.tblp_x.filter(|offset| offset.is_finite())
+    {
+        return offset;
+    }
     let table_width = table_total_width(measure);
     match block.justification.as_deref() {
         Some("center") => ((content_width - table_width) / 2.0).max(0.0),
