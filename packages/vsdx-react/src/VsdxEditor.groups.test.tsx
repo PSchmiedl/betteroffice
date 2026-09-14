@@ -30,6 +30,18 @@ function bounds(points: ReadonlyArray<{ x: number; y: number }>) {
   return { left: Math.min(...points.map((point) => point.x)), right: Math.max(...points.map((point) => point.x)), top: Math.min(...points.map((point) => point.y)), bottom: Math.max(...points.map((point) => point.y)) };
 }
 
+function pin(handle: DiagramHandle, shapeId: string, name: 'PinX' | 'PinY'): number {
+  const walk = (shapes: ReturnType<DiagramHandle['snapshot']>['pages'][number]['shapes']): number | null => {
+    for (const shape of shapes) {
+      if (shape.id === shapeId) return Number(shape.cells.find((cell) => cell.name === name && cell.locator.section === null)?.value);
+      const nested = walk(shape.children);
+      if (nested !== null) return nested;
+    }
+    return null;
+  };
+  return walk(handle.snapshot().pages[0].shapes)!;
+}
+
 async function clickInsideTheGroup() {
   const canvasPrototype = Object.getPrototypeOf(document.createElement('canvas')) as HTMLCanvasElement;
   const getContext = canvasPrototype.getContext;
@@ -73,5 +85,19 @@ test('a click inside a group selects the group and frames it where the group is 
     expect(frame.top).toBeCloseTo(-243, 0);
     expect(frame.bottom).toBeCloseTo(377.6, 0);
     expect(INSIDE_CHILD.x > frame.left && INSIDE_CHILD.x < frame.right && INSIDE_CHILD.y > frame.top && INSIDE_CHILD.y < frame.bottom).toBe(true);
+  } finally { restore(); }
+});
+
+test('an arrow-key nudge moves the selected group in page space', async () => {
+  const { handle, main, child, restore } = await clickInsideTheGroup();
+  try {
+    const groupBefore = pin(handle, GROUP_ID, 'PinY');
+    const childBefore = pin(handle, CHILD_ID, 'PinY');
+    await act(async () => { fireEvent.keyDown(main, { key: 'ArrowUp' }); });
+    expect(pin(handle, GROUP_ID, 'PinY') - groupBefore).toBeCloseTo(1 / 96, 6);
+    expect(pin(handle, CHILD_ID, 'PinY')).toBe(childBefore);
+    const moved = bounds(childPoints(handle.layoutPage(0).primitives));
+    expect(moved.left).toBeCloseTo(child.left, 3);
+    expect(moved.top).toBeCloseTo(child.top - 1, 3);
   } finally { restore(); }
 });
