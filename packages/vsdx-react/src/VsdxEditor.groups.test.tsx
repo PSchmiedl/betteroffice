@@ -101,3 +101,14 @@ test('an arrow-key nudge moves the selected group in page space', async () => {
     expect(moved.top).toBeCloseTo(child.top - 1, 3);
   } finally { restore(); }
 });
+
+test('a right-click inside a group selects the group before opening the menu', async () => {
+  const { main, restore } = await clickInsideTheGroup();
+  try {
+    await act(async () => { fireEvent.contextMenu(main, { clientX: INSIDE_CHILD.x, clientY: INSIDE_CHILD.y }); });
+    expect(document.querySelector('[role="menu"]')).not.toBeNull();
+    const label = main.getAttribute('aria-label') ?? '';
+    expect(label).toContain(GROUP_ID);
+    expect(label).not.toContain(CHILD_ID);
+  } finally { restore(); }
+});
