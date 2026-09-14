@@ -28,8 +28,12 @@ export interface StandardShape {
   id: string;
   nameKey: TranslationKey;
   preview: string;
+  defaultSize: { width: number; height: number };
   draft: (x: number, y: number, width: number, height: number) => FormulaShapeDraft;
 }
+
+/** Height of every default insert box, in inches; the width follows the master's aspect ratio. */
+const DEFAULT_SHAPE_HEIGHT_IN = 1;
 
 export const polygonVertices: Readonly<Record<string, readonly Point[]>> = {
   rectangle: [[0, 0], [1, 0], [1, 1], [0, 1]],
@@ -171,14 +175,18 @@ function draftFor(id: string, path: GeometryPath, square: boolean, aspectRatio =
   };
 }
 
-function polygonShape(id: keyof typeof polygonVertices, extraRows: readonly GeometryRow[] = [], square = false, aspectRatio = 0): StandardShape {
-  const path = polygonPath(polygonVertices[id], extraRows);
+function shapeFrom(id: string, path: GeometryPath, square = false, aspectRatio = 0): StandardShape {
   return {
     id,
     nameKey: `shapesPanel.shape.${id}` as TranslationKey,
     preview: aspectRatio ? svgRows(path.rows, aspectRatio).trim() : path.preview,
+    defaultSize: { width: aspectRatio > 0 ? DEFAULT_SHAPE_HEIGHT_IN * aspectRatio : DEFAULT_SHAPE_HEIGHT_IN, height: DEFAULT_SHAPE_HEIGHT_IN },
     draft: draftFor(id, path, square, aspectRatio),
   };
+}
+
+function polygonShape(id: keyof typeof polygonVertices, extraRows: readonly GeometryRow[] = [], square = false, aspectRatio = 0): StandardShape {
+  return shapeFrom(id, polygonPath(polygonVertices[id], extraRows), square, aspectRatio);
 }
 
 const circlePath = curvedPath([
@@ -267,8 +275,8 @@ const pyramidEdges: readonly GeometryRow[] = [
 export const standardShapes: readonly StandardShape[] = [
   polygonShape('rectangle', [], false, 4 / 3),
   polygonShape('square', [], true),
-  { id: 'circle', nameKey: 'shapesPanel.shape.circle', preview: circlePath.preview, draft: draftFor('circle', circlePath, true) },
-  { id: 'ellipse', nameKey: 'shapesPanel.shape.ellipse', preview: svgRows(circlePath.rows, 1.5).trim(), draft: draftFor('ellipse', circlePath, false, 1.5) },
+  shapeFrom('circle', circlePath, true),
+  shapeFrom('ellipse', circlePath, false, 1.5),
   polygonShape('rightTriangle'),
   polygonShape('triangle'),
   polygonShape('rotatedTriangle'),
@@ -277,20 +285,20 @@ export const standardShapes: readonly StandardShape[] = [
   polygonShape('heptagon'),
   polygonShape('octagon'),
   polygonShape('decagon'),
-  { id: 'cylinder', nameKey: 'shapesPanel.shape.cylinder', preview: cylinderPath.preview, draft: draftFor('cylinder', cylinderPath, false) },
+  shapeFrom('cylinder', cylinderPath),
   polygonShape('parallelogram'),
   polygonShape('trapezoid'),
   polygonShape('diamond'),
   polygonShape('cross'),
   polygonShape('chevron'),
   polygonShape('cube', cubeEdges),
-  { id: 'teardrop', nameKey: 'shapesPanel.shape.teardrop', preview: teardropPath.preview, draft: draftFor('teardrop', teardropPath, false) },
-  { id: 'semicircle', nameKey: 'shapesPanel.shape.semicircle', preview: semicirclePath.preview, draft: draftFor('semicircle', semicirclePath, false) },
-  { id: 'halfEllipse', nameKey: 'shapesPanel.shape.halfEllipse', preview: halfEllipsePath.preview, draft: draftFor('halfEllipse', halfEllipsePath, false) },
-  { id: 'cone', nameKey: 'shapesPanel.shape.cone', preview: uprightConePath.preview, draft: draftFor('cone', uprightConePath, false) },
-  { id: 'invertedCone', nameKey: 'shapesPanel.shape.invertedCone', preview: invertedConePath.preview, draft: draftFor('invertedCone', invertedConePath, false) },
+  shapeFrom('teardrop', teardropPath),
+  shapeFrom('semicircle', semicirclePath),
+  shapeFrom('halfEllipse', halfEllipsePath),
+  shapeFrom('cone', uprightConePath),
+  shapeFrom('invertedCone', invertedConePath),
   polygonShape('pyramid', pyramidEdges),
-  { id: 'pointedOval', nameKey: 'shapesPanel.shape.pointedOval', preview: pointedOvalPath.preview, draft: draftFor('pointedOval', pointedOvalPath, false) },
+  shapeFrom('pointedOval', pointedOvalPath),
   polygonShape('funnel'),
   polygonShape('star4'),
   polygonShape('star5'),

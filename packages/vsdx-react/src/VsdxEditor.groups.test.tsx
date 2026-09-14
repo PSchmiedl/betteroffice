@@ -112,3 +112,14 @@ test('a right-click inside a group selects the group before opening the menu', a
     expect(label).not.toContain(CHILD_ID);
   } finally { restore(); }
 });
+
+test('a right-click on empty canvas drops the menu and the selection it targeted', async () => {
+  const { main, restore } = await clickInsideTheGroup();
+  try {
+    await act(async () => { fireEvent.contextMenu(main, { clientX: INSIDE_CHILD.x, clientY: INSIDE_CHILD.y }); });
+    expect(document.querySelector('[role="menu"]')).not.toBeNull();
+    await act(async () => { fireEvent.contextMenu(main, { clientX: 5, clientY: 5 }); });
+    expect(document.querySelector('[role="menu"]') === null).toBe(true);
+    expect(main.getAttribute('aria-label') ?? '').not.toContain(GROUP_ID);
+  } finally { restore(); }
+});

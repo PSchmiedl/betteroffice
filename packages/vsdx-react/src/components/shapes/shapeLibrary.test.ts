@@ -88,6 +88,17 @@ test('inserts the ellipse wider than tall and the circle square', () => {
   expect(circle.width).toBe(circle.height);
 });
 
+test('gives every master a one-inch-tall default box at the ratio its draft writes', () => {
+  for (const shape of standardShapes) {
+    const drafted = defaultSize(shape.id);
+    expect(shape.defaultSize.height).toBe(1);
+    expect(shape.defaultSize.width / shape.defaultSize.height).toBeCloseTo(drafted.width / drafted.height, 10);
+  }
+  expect(standardShapes.find((shape) => shape.id === 'ellipse')?.defaultSize).toEqual({ width: 1.5, height: 1 });
+  expect(standardShapes.find((shape) => shape.id === 'rectangle')?.defaultSize.width).toBeCloseTo(4 / 3, 10);
+  expect(standardShapes.find((shape) => shape.id === 'circle')?.defaultSize).toEqual({ width: 1, height: 1 });
+});
+
 test('follows the Visio gallery order', () => {
   expect(standardShapes.map((shape) => shape.id)).toEqual([
     'rectangle', 'square', 'circle', 'ellipse', 'rightTriangle', 'triangle', 'rotatedTriangle',
