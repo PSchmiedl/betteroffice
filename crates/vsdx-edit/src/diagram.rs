@@ -633,12 +633,14 @@ impl DiagramSession {
         x_formula: impl Into<String>,
         y_formula: impl Into<String>,
     ) -> EditResult<[CellFormulaReceipt; 2]> {
-        self.set_cell_formula_pair(
+        self.set_cell_formulas(
             context,
             page_id,
             shape_id,
-            ("PinX", x_formula.into(), MutationGesture::MoveX),
-            ("PinY", y_formula.into(), MutationGesture::MoveY),
+            [
+                ("PinX", x_formula.into(), MutationGesture::MoveX),
+                ("PinY", y_formula.into(), MutationGesture::MoveY),
+            ],
         )
     }
 
@@ -650,17 +652,87 @@ impl DiagramSession {
         width_formula: impl Into<String>,
         height_formula: impl Into<String>,
     ) -> EditResult<[CellFormulaReceipt; 2]> {
-        self.set_cell_formula_pair(
+        self.set_cell_formulas(
             context,
             page_id,
             shape_id,
-            ("Width", width_formula.into(), MutationGesture::ResizeWidth),
-            (
-                "Height",
-                height_formula.into(),
-                MutationGesture::ResizeHeight,
-            ),
+            [
+                ("Width", width_formula.into(), MutationGesture::ResizeWidth),
+                (
+                    "Height",
+                    height_formula.into(),
+                    MutationGesture::ResizeHeight,
+                ),
+            ],
         )
+    }
+
+    pub fn set_shape_bounds(
+        &self,
+        context: &EditCtx,
+        page_id: &str,
+        shape_id: &str,
+        formulas: [String; 4],
+    ) -> EditResult<[CellFormulaReceipt; 4]> {
+        let [x, y, width, height] = formulas;
+        self.set_cell_formulas(
+            context,
+            page_id,
+            shape_id,
+            [
+                ("PinX", x, MutationGesture::MoveX),
+                ("PinY", y, MutationGesture::MoveY),
+                ("Width", width, MutationGesture::ResizeWidth),
+                ("Height", height, MutationGesture::ResizeHeight),
+            ],
+        )
+    }
+
+    pub fn resize_loc_pin(
+        &self,
+        page_id: &str,
+        shape_id: &str,
+        width: f64,
+        height: f64,
+    ) -> EditResult<[f64; 2]> {
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return Err(EditError::InvalidState(
+                "invalid resize dimensions".to_owned(),
+            ));
+        }
+        let txn = self.doc.transact();
+        let mut references = CrdtMutationContext::new(&txn, page_id, shape_id)?.references;
+        for (name, value) in [("Width", width), ("Height", height)] {
+            references.cells.insert(
+                name.to_owned(),
+                Lookup::Found(vsdx_resolve::ResolvedCell {
+                    cell: Cell {
+                        name: name.to_owned(),
+                        formula: Some(value.to_string()),
+                        value: None,
+                        unit: None,
+                        del: false,
+                        other_attrs: Vec::new(),
+                    },
+                    provenance: vsdx_resolve::Provenance::Local,
+                }),
+            );
+        }
+        let loc_pin = |name: &str, fallback: f64| -> EditResult<f64> {
+            if !references.cells.contains_key(name) {
+                return Ok(fallback);
+            }
+            evaluate_cached_formula(name, &references)
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    EditError::InvalidState(format!("cannot evaluate {name} for resize"))
+                })
+        };
+        Ok([
+            loc_pin("LocPinX", width / 2.0)?,
+            loc_pin("LocPinY", height / 2.0)?,
+        ])
     }
 
     pub fn reorder_shape(
@@ -755,14 +827,13 @@ impl DiagramSession {
         })
     }
 
-    fn set_cell_formula_pair(
+    fn set_cell_formulas<const N: usize>(
         &self,
         context: &EditCtx,
         page_id: &str,
         shape_id: &str,
-        first: (&str, String, MutationGesture),
-        second: (&str, String, MutationGesture),
-    ) -> EditResult<[CellFormulaReceipt; 2]> {
+        cells: [(&str, String, MutationGesture); N],
+    ) -> EditResult<[CellFormulaReceipt; N]> {
         let mut txn = self.transact_for(context);
         let context_for_policy = CrdtMutationContext::new(&txn, page_id, shape_id)?;
         let decide =
@@ -785,30 +856,29 @@ impl DiagramSession {
                     Err(EditError::InvalidState(reason))
                 }
             };
-        let (first_target, first_formula) = decide(first)?;
-        let (second_target, second_formula) = decide(second)?;
-        let first_cell = cell_map(&mut txn, page_id, shape_id, &first_target)?;
-        let second_cell = cell_map(&mut txn, page_id, shape_id, &second_target)?;
-        let first_before = map_string(&first_cell, &txn, "formula");
-        let second_before = map_string(&second_cell, &txn, "formula");
-        first_cell.insert(&mut txn, "formula", first_formula.as_str());
-        second_cell.insert(&mut txn, "formula", second_formula.as_str());
-        Ok([
+        let targets = cells
+            .into_iter()
+            .map(decide)
+            .collect::<EditResult<Vec<_>>>()?;
+        let prepared = targets
+            .into_iter()
+            .map(|(target, formula)| {
+                let cell = cell_map(&mut txn, page_id, shape_id, &target)?;
+                Ok((target, formula, cell))
+            })
+            .collect::<EditResult<Vec<_>>>()?;
+        Ok(std::array::from_fn(|index| {
+            let (target, formula, cell) = &prepared[index];
+            let before = map_string(cell, &txn, "formula");
+            cell.insert(&mut txn, "formula", formula.as_str());
             CellFormulaReceipt {
                 page_id: page_id.to_owned(),
                 shape_id: shape_id.to_owned(),
-                cell_name: first_target.cell_name,
-                before: first_before,
-                after: first_formula,
-            },
-            CellFormulaReceipt {
-                page_id: page_id.to_owned(),
-                shape_id: shape_id.to_owned(),
-                cell_name: second_target.cell_name,
-                before: second_before,
-                after: second_formula,
-            },
-        ])
+                cell_name: target.cell_name.clone(),
+                before,
+                after: formula.clone(),
+            }
+        }))
     }
 }
 

@@ -28,9 +28,11 @@ export const vsdxdocument_openCollaborativeFromUpdate: (a: number, b: number, c:
 export const vsdxdocument_redoJson: (a: number) => [number, number, number, number];
 export const vsdxdocument_reorderPageJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const vsdxdocument_reorderShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
+export const vsdxdocument_resizeLocPin: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
 export const vsdxdocument_resizeShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const vsdxdocument_save: (a: number) => [number, number, number, number];
 export const vsdxdocument_setCellFormulaJson: (a: number, b: number, c: number) => [number, number, number, number];
+export const vsdxdocument_setShapeBoundsJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const vsdxdocument_snapshotJson: (a: number) => [number, number, number, number];
 export const vsdxdocument_startUpdateObservation: (a: number) => [number, number];
 export const vsdxdocument_undoJson: (a: number) => [number, number, number, number];

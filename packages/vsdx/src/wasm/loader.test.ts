@@ -562,6 +562,31 @@ describe('VSDX wasm boundary', () => {
     await expectUntouchedParts(foundation, saved, editedPart);
   });
 
+  test('shape bounds emit one complete update and undo all four cells', () => {
+    const diagram = openDiagram(demo, { clientId: 9080 });
+    const peer = openDiagram(demo, { clientId: 9081 });
+    try {
+      const before = diagram.snapshot();
+      const observed: ReturnType<typeof diagram.snapshot>[] = [];
+      const stop = diagram.onUpdate((update) => { peer.applyUpdate(update); observed.push(peer.snapshot()); });
+      const receipts = diagram.setShapeBounds('page:1', 'page:1:shape:20', '2', '3', '4', '5');
+      expect(receipts.map((receipt) => receipt.after)).toEqual(['2', '3', '4', '5']);
+      expect(observed).toEqual([diagram.snapshot()]);
+      expect(diagram.undo().applied).toBe(true);
+      expect(diagram.snapshot()).toEqual(before);
+      expect(diagram.canUndo()).toBe(false);
+      stop();
+      diagram.setCellFormula('page:1', 'page:1:shape:20', { cellName: 'PinY' }, 'GUARD(3)');
+      const locked = diagram.snapshot();
+      expect(() => diagram.setShapeBounds('page:1', 'page:1:shape:20', '6', '7', '8', '9')).toThrow('GUARD');
+      expect(diagram.snapshot()).toEqual(locked);
+      expect(diagram.resizeLocPin('page:1', 'page:1:shape:20', 8, 10)).toEqual({ x: 2.8, y: 0.575 });
+      diagram.setCellFormula('page:1', 'page:1:shape:20', { cellName: 'LocPinX' }, 'Width*0.5');
+      diagram.setCellFormula('page:1', 'page:1:shape:20', { cellName: 'LocPinY' }, 'Height*0.5');
+      expect(diagram.resizeLocPin('page:1', 'page:1:shape:20', 8, 10)).toEqual({ x: 4, y: 5 });
+    } finally { diagram.dispose(); peer.dispose(); }
+  });
+
   test('aborts a guarded move batch without changing the save bytes', () => {
     const pageId = 'page:1';
     const shapeId = 'page:1:shape:1';

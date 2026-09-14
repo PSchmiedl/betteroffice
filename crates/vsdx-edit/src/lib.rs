@@ -836,6 +836,77 @@ mod tests {
     }
 
     #[test]
+    fn shape_bounds_refusal_preserves_all_cells_and_emits_no_update() {
+        for (name, formula) in [
+            ("PinX", "GUARD(1)"),
+            ("LockMoveY", "1"),
+            ("LockHeight", "1"),
+        ] {
+            let session = session();
+            for cell in ["PinX", "PinY", "Width", "Height"] {
+                add_cell(&session, cell, Some("1"), None);
+            }
+            add_cell(&session, name, Some(formula), None);
+            let before = session.snapshot().unwrap();
+            let vector = session.encode_state_vector_v1();
+            assert!(
+                session
+                    .set_shape_bounds(
+                        &EditCtx::local("a"),
+                        "page:1",
+                        "page:1:shape:1",
+                        ["2", "3", "4", "5"].map(str::to_owned)
+                    )
+                    .is_err()
+            );
+            assert_eq!(session.snapshot().unwrap(), before);
+            assert_eq!(session.encode_state_vector_v1(), vector);
+        }
+    }
+
+    #[test]
+    fn shape_bounds_undo_restores_all_four_cells() {
+        let session = session();
+        for cell in ["PinX", "PinY", "Width", "Height"] {
+            add_cell(&session, cell, Some("1"), None);
+        }
+        let before = session.snapshot().unwrap();
+        let receipts = session
+            .set_shape_bounds(
+                &EditCtx::local("a"),
+                "page:1",
+                "page:1:shape:1",
+                ["2", "3", "4", "5"].map(str::to_owned),
+            )
+            .unwrap();
+        assert_eq!(receipts.map(|receipt| receipt.after), ["2", "3", "4", "5"]);
+        assert!(session.undo());
+        assert_eq!(session.snapshot().unwrap(), before);
+        assert!(!session.can_undo());
+    }
+
+    #[test]
+    fn resize_loc_pin_evaluates_formulas_without_mutating() {
+        let session = session();
+        for (name, formula) in [
+            ("Width", "2"),
+            ("Height", "3"),
+            ("LocPinX", "Width*0.5+0.25"),
+            ("LocPinY", "0.75"),
+        ] {
+            add_cell(&session, name, Some(formula), None);
+        }
+        let before = session.snapshot().unwrap();
+        assert_eq!(
+            session
+                .resize_loc_pin("page:1", "page:1:shape:1", 4.0, 6.0)
+                .unwrap(),
+            [2.25, 0.75]
+        );
+        assert_eq!(session.snapshot().unwrap(), before);
+    }
+
+    #[test]
     fn matching_locks_refuse_move_and_resize() {
         let session = session();
         add_cell(&session, "PinX", Some("1"), None);

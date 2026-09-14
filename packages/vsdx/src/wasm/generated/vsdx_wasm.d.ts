@@ -26,9 +26,11 @@ export class VsdxDocument {
     redoJson(): string;
     reorderPageJson(args: string): string;
     reorderShapeJson(args: string): string;
+    resizeLocPin(page_id: string, shape_id: string, width: number, height: number): Float64Array;
     resizeShapeJson(args: string): string;
     save(): Uint8Array;
     setCellFormulaJson(args: string): string;
+    setShapeBoundsJson(args: string): string;
     snapshotJson(): string;
     startUpdateObservation(): void;
     undoJson(): string;
@@ -80,9 +82,11 @@ export interface InitOutput {
     readonly vsdxdocument_redoJson: (a: number) => [number, number, number, number];
     readonly vsdxdocument_reorderPageJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_reorderShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly vsdxdocument_resizeLocPin: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly vsdxdocument_resizeShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_save: (a: number) => [number, number, number, number];
     readonly vsdxdocument_setCellFormulaJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly vsdxdocument_setShapeBoundsJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_snapshotJson: (a: number) => [number, number, number, number];
     readonly vsdxdocument_startUpdateObservation: (a: number) => [number, number];
     readonly vsdxdocument_undoJson: (a: number) => [number, number, number, number];
