@@ -33,7 +33,13 @@ fn lower_shape(
     let geometry_path = array(shape, "geometryPath")
         .filter(|path| !path.is_empty())
         .cloned()
-        .or_else(|| preset_geometry(&shape_type))?;
+        .or_else(|| preset_geometry(&shape_type))
+        .or_else(|| {
+            object(shape, "position")
+                .is_some()
+                .then(|| preset_geometry("rect"))
+                .flatten()
+        })?;
     let size = object(shape, "size");
     let width = size
         .and_then(|value| number_in(value, "width"))
@@ -1202,5 +1208,46 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn unknown_preset_requires_an_object_anchor_for_fallback() {
+        for position in [
+            Value::Null,
+            json!(true),
+            json!(1),
+            json!("anchor"),
+            json!([]),
+        ] {
+            let shape = json!({"shapeType": "unknown", "position": position});
+            assert!(lower_shape_json(&shape, 527, &RenderEnv::default()).is_none());
+        }
+    }
+
+    #[test]
+    fn anchored_unknown_preset_keeps_anchor_with_rect_fallback() {
+        let anchored = json!({
+            "shapeType": "bracketPair",
+            "size": {"width": 5715000, "height": 685800},
+            "position": {
+                "horizontal": {"relativeTo": "column", "posOffset": -114935},
+                "vertical": {"relativeTo": "paragraph", "posOffset": 5715},
+                "relativeHeight": 251659776.0
+            },
+            "wrap": {"type": "inFront"}
+        });
+        let block = lower_shape_json(&anchored, 528, &RenderEnv::default()).unwrap();
+        assert_eq!(block.shape_type, "bracketPair");
+        assert!((block.width - 600.0).abs() < 1e-6);
+        assert!((block.height - 72.0).abs() < 1e-6);
+        assert!(block.position.is_some());
+        assert_eq!(block.wrap_type.as_deref(), Some("inFront"));
+        let inline = json!({
+            "shapeType": "rect",
+            "size": {"width": 914400, "height": 685800}
+        });
+        let block = lower_shape_json(&inline, 529, &RenderEnv::default()).unwrap();
+        assert!(block.position.is_none());
+        assert!((block.height - 72.0).abs() < 1e-6);
     }
 }
