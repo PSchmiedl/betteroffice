@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::f64::consts::PI;
 
 use docx_layout::types::{
@@ -34,6 +35,7 @@ fn lower_shape(
         .filter(|path| !path.is_empty())
         .cloned()
         .or_else(|| preset_geometry(&shape_type))
+        .or_else(|| shared_plus_geometry(&shape_type, shape))
         .or_else(|| {
             object(shape, "position")
                 .is_some()
@@ -909,6 +911,30 @@ fn preset_geometry(shape_type: &str) -> Option<Vec<Value>> {
     })
 }
 
+fn shared_plus_geometry(shape_type: &str, shape: &Value) -> Option<Vec<Value>> {
+    if shape_type != "plus" {
+        return None;
+    }
+    let size = object(shape, "size");
+    let width = size
+        .and_then(|value| number_in(value, "width"))
+        .unwrap_or(0.0);
+    let height = size
+        .and_then(|value| number_in(value, "height"))
+        .unwrap_or(0.0);
+    let aspect = if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+        width / height
+    } else {
+        1.0
+    };
+    let path = docx_parse::drawingml::preset_geometry_to_path("plus", &HashMap::new(), aspect)?;
+    path.into_iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+        .filter(|path| !path.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1249,5 +1275,35 @@ mod tests {
         let block = lower_shape_json(&inline, 529, &RenderEnv::default()).unwrap();
         assert!(block.position.is_none());
         assert!((block.height - 72.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn plus_without_authored_geometry_uses_shared_default() {
+        let shape = json!({
+            "shapeType": "plus",
+            "size": {"width": 557530, "height": 538480}
+        });
+        let block = lower_shape_json(&shape, 530, &RenderEnv::default()).unwrap();
+        assert_eq!(block.geometry_path.len(), 13);
+        assert_eq!(
+            block.geometry_path[0],
+            json!({"type": "move", "x": 0.0, "y": 0.25})
+        );
+        assert_eq!(block.geometry_path[12], json!({"type": "close"}));
+    }
+
+    #[test]
+    fn plus_authored_geometry_is_preserved_over_shared_default() {
+        let authored = vec![
+            json!({"type": "move", "x": 0.0, "y": 0.39887}),
+            json!({"type": "line", "x": 0.3852, "y": 0.39887}),
+        ];
+        let shape = json!({
+            "shapeType": "plus",
+            "size": {"width": 557530, "height": 538480},
+            "geometryPath": authored
+        });
+        let block = lower_shape_json(&shape, 531, &RenderEnv::default()).unwrap();
+        assert_eq!(block.geometry_path, authored);
     }
 }
