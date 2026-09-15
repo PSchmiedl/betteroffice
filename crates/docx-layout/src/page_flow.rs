@@ -35,6 +35,7 @@ use crate::types::{ColumnLayout, Fragment, Page, PageMargins, Size};
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageFlowGeometry {
     pub suppress_leading_spacing: bool,
+    pub numbering_parity_offset: bool,
     pub page_size: Size,
     pub margins: PageMargins,
     pub columns: ColumnLayout,
@@ -74,6 +75,7 @@ fn calculate_column_width(
 /// The page/column cursor and the pages it has produced so far.
 pub struct Paginator {
     suppress_leading_spacing: bool,
+    numbering_parity_offset: bool,
     pub pages: Vec<Page>,
     states: Vec<FlowState>,
     page_size: Size,
@@ -109,6 +111,7 @@ impl Paginator {
         let column_region_top = margins.top;
         Ok(Paginator {
             suppress_leading_spacing: false,
+            numbering_parity_offset: false,
             pages: Vec::new(),
             states: Vec::new(),
             page_size,
@@ -146,7 +149,18 @@ impl Paginator {
         paginator.pending_columns = geometry.pending_columns.clone();
         paginator.start_page_number = start_page_number;
         paginator.suppress_leading_spacing = geometry.suppress_leading_spacing;
+        paginator.numbering_parity_offset = geometry.numbering_parity_offset;
         Ok(paginator)
+    }
+
+    pub fn restart_page_numbering(&mut self, start: u64) {
+        let idx = self.get_current();
+        let number = self.pages[self.states[idx].page_index].number;
+        self.numbering_parity_offset = start % 2 != u64::from(number % 2);
+    }
+
+    pub fn physical_parity_is_odd(&self, number: u64) -> bool {
+        (number % 2 != 0) != self.numbering_parity_offset
     }
 
     /// Sets ownership for future pages and the untouched current page.
@@ -163,6 +177,7 @@ impl Paginator {
     pub fn snapshot_geometry(&self) -> PageFlowGeometry {
         PageFlowGeometry {
             suppress_leading_spacing: self.suppress_leading_spacing,
+            numbering_parity_offset: self.numbering_parity_offset,
             page_size: self.page_size.clone(),
             margins: self.margins.clone(),
             columns: self.columns.clone(),
@@ -317,6 +332,7 @@ impl Paginator {
             watermark: None,
             vertical_align: None,
             note_areas: None,
+            parity_filler: None,
         };
 
         let state = FlowState {
@@ -477,6 +493,13 @@ impl Paginator {
         self.create_new_page()
     }
 
+    /// Marks the current page as an automatic parity filler.
+    pub fn mark_parity_filler(&mut self) {
+        let idx = self.get_current();
+        let page_index = self.states[idx].page_index;
+        self.pages[page_index].parity_filler = Some(true);
+    }
+
     /// Moves to the next column, or the next page from the last column.
     pub fn force_column_break(&mut self) -> usize {
         let idx = self.get_current();
@@ -612,6 +635,10 @@ impl crate::section_breaks::SectionBreakPaginator for Paginator {
     fn insert_blank_page(&mut self) -> u32 {
         let idx = Paginator::insert_blank_page(self);
         self.pages[self.states[idx].page_index].number
+    }
+
+    fn mark_parity_filler(&mut self) {
+        Paginator::mark_parity_filler(self);
     }
 
     fn current_page_size(&mut self) -> Size {
