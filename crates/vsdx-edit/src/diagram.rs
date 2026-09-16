@@ -1074,6 +1074,14 @@ impl DiagramSession {
             .into_iter()
             .map(decide)
             .collect::<EditResult<Vec<_>>>()?;
+        for (index, (target, _)) in targets.iter().enumerate() {
+            if targets[..index].iter().any(|(seen, _)| seen == target) {
+                return Err(EditError::InvalidState(format!(
+                    "redirects converge on {} more than once",
+                    target.cell_name
+                )));
+            }
+        }
         let prepared = targets
             .into_iter()
             .map(|(target, formula)| {
