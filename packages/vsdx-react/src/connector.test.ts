@@ -48,7 +48,7 @@ function shape(cells: Record<string, string>): ShapeSnapshot {
 }
 
 const frame: PageDisplayList = {
-  contractVersion: 6,
+  contractVersion: 7,
   width: 816,
   height: 1056,
   printWidth: 816,

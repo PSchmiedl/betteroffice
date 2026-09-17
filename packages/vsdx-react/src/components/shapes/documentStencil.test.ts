@@ -4,7 +4,7 @@ import { documentMasterDraft, documentStencilEntries, masterPreviewPath } from '
 
 function displayList(path: GeometryPathCommand[]): PageDisplayList {
   return {
-    contractVersion: 6,
+    contractVersion: 7,
     width: 96,
     height: 96,
     printWidth: 96,

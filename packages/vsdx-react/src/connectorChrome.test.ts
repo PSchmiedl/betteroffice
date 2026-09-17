@@ -13,7 +13,7 @@ const page: PageSnapshot = {
 
 function frameWith(connectorId: string): PageDisplayList {
   return {
-    contractVersion: 6,
+    contractVersion: 7,
     width: 816,
     height: 1056,
     printWidth: 816,

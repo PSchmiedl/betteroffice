@@ -183,7 +183,7 @@ test('the page-break toggle reflects and flips the overlay state', () => {
   const toggled: boolean[] = [];
   cleanup();
   const diagram = stubDiagram();
-  const frame: PageDisplayList = { contractVersion: 6, width: 816, height: 1056, printWidth: 816, printHeight: 1056, paintTransform: { a: 96, b: 0, c: 0, d: -96, e: 0, f: 1056 }, primitives: [] };
+  const frame: PageDisplayList = { contractVersion: 7, width: 816, height: 1056, printWidth: 816, printHeight: 1056, paintTransform: { a: 96, b: 0, c: 0, d: -96, e: 0, f: 1056 }, primitives: [] };
   const view = render(<RibbonCommandsProvider handle={diagram} snapshot={diagram.snapshot()} pageId="page" selection={null} frame={frame} pageBreaks={{ shown: false, toggle: () => toggled.push(true) }} onMutation={() => {}} onError={() => {}} onDownload={() => {}}><Ribbon t={createT(en)} /></RibbonCommandsProvider>);
   const toggle = view.container.querySelector('[data-command-id="pageBreaks"]') as HTMLButtonElement;
   expect(toggle.hasAttribute('aria-pressed')).toBe(false);

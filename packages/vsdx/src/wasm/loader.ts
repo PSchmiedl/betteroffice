@@ -126,7 +126,7 @@ export function openDiagram(bytes: Uint8Array, options: OpenDiagramOptions = {})
     masters: () => {
       const masters = json<DocumentMaster[]>(() => renderer.masterPreviewsJson(doc));
       for (const master of masters) {
-        if (master.display && master.display.contractVersion !== 6) throw new Error(`unsupported VSDX display-list contract version ${master.display.contractVersion}`);
+        if (master.display && master.display.contractVersion !== 7) throw new Error(`unsupported VSDX display-list contract version ${master.display.contractVersion}`);
       }
       return masters;
     },
@@ -137,7 +137,7 @@ export function openDiagram(bytes: Uint8Array, options: OpenDiagramOptions = {})
     layoutPage: pageIndex => {
       hitIds.clear();
       const list = json<PageDisplayList>(() => renderer.layoutPageJson(doc, pageIndex));
-      if (list.contractVersion !== 6) throw new Error(`unsupported VSDX display-list contract version ${list.contractVersion}`);
+      if (list.contractVersion !== 7) throw new Error(`unsupported VSDX display-list contract version ${list.contractVersion}`);
       const page = json<DiagramSnapshot>(() => doc.snapshotJson()).pages[pageIndex];
       const shapes = [...page.shapes];
       while (shapes.length) { const shape = shapes.pop()!; hitIds.set(`${page.sourcePartPath}:${shape.sourceId}`, shape.id); shapes.push(...shape.children); }

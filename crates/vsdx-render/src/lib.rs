@@ -5,6 +5,7 @@ mod layout;
 mod line_jumps;
 mod paint;
 mod pdf;
+mod shadow;
 
 pub use display_list::*;
 pub use layout::{PIXELS_PER_INCH, final_paint_transform, to_canvas, to_canvas_length};
@@ -610,6 +611,11 @@ impl Renderer {
         };
         let mut cache = LayoutCache::default();
         let layers = self.effective_page_layers(package, page_part);
+        let page_shadow = shadow::page_shadow(&resolver, package, page_part);
+        let context = shadow::ShadowContext {
+            page: &page_shadow,
+            parent_show: None,
+        };
         for shape in page.shapes() {
             self.layout_shape(
                 package,
@@ -623,6 +629,7 @@ impl Renderer {
                 shape,
                 0,
                 (false, false),
+                &context,
                 &mut state,
                 &mut cache,
             )?;
@@ -693,6 +700,11 @@ impl Renderer {
         };
         let mut cache = LayoutCache::default();
         let layers: &[vsdx_resolve::PageLayer] = &[];
+        let master_shadow = shadow::PageShadow::default();
+        let context = shadow::ShadowContext {
+            page: &master_shadow,
+            parent_show: None,
+        };
         for shape in sheet.shapes() {
             self.layout_shape(
                 package,
@@ -706,6 +718,7 @@ impl Renderer {
                 shape,
                 0,
                 (false, false),
+                &context,
                 &mut state,
                 &mut cache,
             )?;
@@ -760,6 +773,7 @@ impl Renderer {
         shape: &Shape,
         depth: usize,
         flips: (bool, bool),
+        context: &shadow::ShadowContext<'_>,
         state: &mut State,
         cache: &mut LayoutCache,
     ) -> Result<(), RenderError> {
@@ -844,6 +858,7 @@ impl Renderer {
                 z_order,
                 resolved,
                 &sections,
+                context,
                 state,
                 transforms,
             );
@@ -882,6 +897,10 @@ impl Renderer {
         if !child_shapes.is_empty() {
             let group_transform = affine(transform.local);
             let start = state.primitives.len();
+            let child_context = shadow::ShadowContext {
+                page: context.page,
+                parent_show: Some(shadow::show_value(package, references, resolved, shape.id)),
+            };
             for child in child_shapes {
                 self.layout_shape(
                     package,
@@ -895,6 +914,7 @@ impl Renderer {
                     child,
                     depth + 1,
                     flips,
+                    &child_context,
                     state,
                     cache,
                 )?;
@@ -1014,7 +1034,9 @@ impl Renderer {
             needs_fill,
             needs_stroke,
         );
+        let shade = shadow::resolve(package, references, resolved, shape.id, context);
         let mut diagnostics = outcome.diagnostics;
+        diagnostics.extend(shade.diagnostics);
         for (controls, path) in paths {
             state.primitives.push(Primitive::Shape {
                 id: id.clone(),
@@ -1030,6 +1052,7 @@ impl Renderer {
                 } else {
                     outcome.stroke.clone()
                 },
+                shadow: shade.shadow.clone(),
                 transform: Affine::identity(),
                 diagnostics: std::mem::take(&mut diagnostics),
             });
@@ -1071,6 +1094,7 @@ impl Renderer {
         z_order: u32,
         resolved: &ResolvedShape,
         sections: &[&vsdx_resolve::ResolvedSection],
+        context: &shadow::ShadowContext<'_>,
         state: &mut State,
         transforms: &BTreeMap<u32, SceneTransform>,
     ) -> Result<(), RenderError> {
@@ -1143,14 +1167,18 @@ impl Renderer {
             package, references, resolved, shape.id, transforms, begin, end,
         )
         .unwrap_or_else(|| connector_route(begin, end, style));
+        let shade = shadow::resolve(package, references, resolved, shape.id, context);
+        let mut diagnostics = outcome.diagnostics;
+        diagnostics.extend(shade.diagnostics);
         state.primitives.push(Primitive::Shape {
             id: id.clone(),
             z_order,
             path,
             fill: outcome.fill,
             stroke: outcome.stroke,
+            shadow: shade.shadow,
             transform: Affine::identity(),
-            diagnostics: outcome.diagnostics,
+            diagnostics,
         });
         state
             .jump_overrides
@@ -2133,6 +2161,7 @@ fn primitives_finite(primitives: &[Primitive]) -> bool {
             transform,
             fill,
             stroke,
+            shadow,
             ..
         } => {
             transform.is_finite()
@@ -2141,6 +2170,11 @@ fn primitives_finite(primitives: &[Primitive]) -> bool {
                 && stroke
                     .as_ref()
                     .is_none_or(|stroke| stroke.width.is_finite())
+                && shadow.as_ref().is_none_or(|shadow| {
+                    [shadow.blur_in, shadow.offset_x_in, shadow.offset_y_in]
+                        .into_iter()
+                        .all(f32::is_finite)
+                })
         }
         Primitive::Image {
             x,
@@ -2849,6 +2883,7 @@ mod tests {
     mod gradient_fill;
     mod layers;
     mod section_controls;
+    mod shadow;
 
     #[test]
     fn hit_testing_does_not_bridge_separate_subpaths() {
@@ -4457,6 +4492,7 @@ mod tests {
                         color: "#000".into(),
                     }),
                     stroke: None,
+                    shadow: None,
                     transform: Affine::identity(),
                     diagnostics: Vec::new(),
                 },
@@ -4473,6 +4509,7 @@ mod tests {
                         color: "#000".into(),
                     }),
                     stroke: None,
+                    shadow: None,
                     transform: Affine::identity(),
                     diagnostics: Vec::new(),
                 },
@@ -4519,6 +4556,7 @@ mod tests {
                         color: "#000".into(),
                     }),
                     stroke: None,
+                    shadow: None,
                     transform: Affine::identity(),
                     diagnostics: Vec::new(),
                 },
@@ -4535,6 +4573,7 @@ mod tests {
                         width: 0.2,
                         dashed: false,
                     }),
+                    shadow: None,
                     transform: Affine::identity(),
                     diagnostics: Vec::new(),
                 },

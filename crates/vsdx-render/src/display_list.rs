@@ -1,7 +1,7 @@
 use ooxml_drawingml::GeometryPathCommand;
 use serde::{Deserialize, Serialize};
 
-pub const CONTRACT_VERSION: u32 = 6;
+pub const CONTRACT_VERSION: u32 = 7;
 
 /// Replay primitives in ascending `z_order` (back-to-front); hit test in descending order.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -178,6 +178,14 @@ pub struct Stroke {
     pub dashed: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Shadow {
+    pub color: String,
+    pub blur_in: f32,
+    pub offset_x_in: f32,
+    pub offset_y_in: f32,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
@@ -190,6 +198,8 @@ pub enum Primitive {
         path: Vec<GeometryPathCommand>,
         fill: Option<Paint>,
         stroke: Option<Stroke>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shadow: Option<Shadow>,
         #[serde(default, skip_serializing_if = "Affine::is_identity")]
         transform: Affine,
         /// Paint channels that fell back to the Visio default; empty when fully resolved.
@@ -323,7 +333,8 @@ impl DiagnosticCategory {
             | "unresolvable-fill-gradient"
             | "lossy-fill-gradient"
             | "unresolvable-stroke-colour"
-            | "unresolvable-stroke-width" => Self::Fidelity,
+            | "unresolvable-stroke-width"
+            | "unsupported-shadow-oblique" => Self::Fidelity,
             _ => Self::Integrity,
         }
     }
