@@ -233,6 +233,18 @@ test('guarded colour cells hide the mini toolbar instead of refusing on pick', (
   }
 });
 
+test('a SETATREF redirect to a guarded cell hides only that swatch', () => {
+  const redirected = renderShapeMenu({ cells: [cell('FillForegnd', 'RGB(255,0,0)'), cell('LineColor', 'SETATREF(LineTarget)'), cell('LineTarget', 'GUARD(RGB(0,0,255))')] });
+  try {
+    const bar = toolbar();
+    expect(bar).not.toBeNull();
+    expect(bar?.querySelector('[data-command-id="fillColor"]')).not.toBeNull();
+    expect(bar?.querySelector('[data-command-id="lineColor"]')).toBeNull();
+  } finally {
+    redirected.view.unmount();
+  }
+});
+
 test('commands that do not exist or are disabled are not shown', () => {
   function PartialHost({ commands }: { commands: Partial<Record<RibbonCommandId, RibbonCommand | undefined>> }) {
     const ref = { current: null } as RefObject<HTMLDivElement | null>;

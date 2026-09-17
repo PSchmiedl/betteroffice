@@ -184,7 +184,7 @@ export function isHandleResizeBlocked(shape: ShapeSnapshot | null): boolean {
   return (['PinX', 'PinY', 'Width', 'Height'] as const).some((cell) => guardChainBlocked(shape, cell));
 }
 
-/** True when a single-cell write would be refused by a GUARD on that cell. */
+/** True when a single-cell write would be refused by the mutation policy. */
 export function isCellWriteBlocked(shape: ShapeSnapshot | null, cellName: string): boolean {
   if (!shape) return false;
   return guardChainBlocked(shape, cellName);
@@ -258,7 +258,7 @@ export function createRibbonCommands(
     fillColor: { id: 'fillColor', enabled: selected && !isCellWriteBlocked(shape, 'FillForegnd'), value: swatch.fill ?? color(cellValue(shape, 'FillForegnd'), '#000000'), run: (value?: string) => formula('FillForegnd', colorFormula(value))() },
     lineColor: { id: 'lineColor', enabled: selected && !isCellWriteBlocked(shape, 'LineColor'), value: swatch.line ?? color(cellValue(shape, 'LineColor'), '#000000'), run: (value?: string) => formula('LineColor', colorFormula(value))() },
     lineWeight: {
-      id: 'lineWeight', enabled: selected, value: cellFormula(shape, 'LineWeight'), run: (value?: string) => {
+      id: 'lineWeight', enabled: selected && !isCellWriteBlocked(shape, 'LineWeight'), value: cellFormula(shape, 'LineWeight'), run: (value?: string) => {
         if (value === undefined) return;
         const next = parseLineWeightInput(value);
         if (next === null || !isFormulaChange(cellFormula(shape, 'LineWeight'), value, parseLineWeightInput)) return;
@@ -266,7 +266,7 @@ export function createRibbonCommands(
       },
     },
     linePattern: {
-      id: 'linePattern', enabled: selected, value: cellFormula(shape, 'LinePattern'), run: (value?: string) => {
+      id: 'linePattern', enabled: selected && !isCellWriteBlocked(shape, 'LinePattern'), value: cellFormula(shape, 'LinePattern'), run: (value?: string) => {
         if (value === undefined) return;
         const next = parseLinePatternInput(value);
         if (next === null || !isFormulaChange(cellFormula(shape, 'LinePattern'), value, parseLinePatternInput)) return;

@@ -1567,3 +1567,53 @@ test('the view toggle draws page-break guides over the page', async () => {
     expect(view.getByTestId('vsdx-page-breaks').querySelectorAll('div')).toHaveLength(5);
   } finally { cleanup(); canvasPrototype.getContext = getContext; }
 });
+
+test('the error banner dismisses and clears on the next successful edit', async () => {
+  const canvasPrototype = Object.getPrototypeOf(document.createElement('canvas')) as HTMLCanvasElement;
+  const getContext = canvasPrototype.getContext;
+  canvasPrototype.getContext = () => new Proxy({}, { get: () => () => {}, set: () => true }) as never;
+  const fixture = await readFile(resolve(root, 'crates/vsdx-parse/tests/fixtures/guard-format.vsdx'));
+  const errors: Error[] = [];
+  let ready: { handle: DiagramHandle; refresh: () => void } | undefined;
+  const view = render(<VsdxEditor file={fixture} fonts={[]} onReady={(api) => { ready = api; }} onError={(error) => { errors.push(error); }} />);
+  try {
+    await waitFor(() => expect(ready).toBeDefined());
+    const handle = ready!.handle;
+    const fakeFrame = { contractVersion: 5, width: 960, height: 720, paintTransform: { a: 96, b: 0, c: 0, d: -96, e: 0, f: 720 }, primitives: [] };
+    handle.layoutPage = (() => fakeFrame) as unknown as DiagramHandle['layoutPage'];
+    handle.hitTest = (() => ({ kind: 'shape', shapeId: 'page:1:shape:1' })) as unknown as DiagramHandle['hitTest'];
+    await act(async () => { ready!.refresh(); });
+    const { selectionCorners } = await import('./VsdxEditor');
+    const canvases = view.container.querySelectorAll('canvas');
+    const main = canvases[0] as HTMLCanvasElement;
+    const overlay = canvases[1] as HTMLCanvasElement;
+    main.getBoundingClientRect = (() => ({ left: 0, top: 0, width: 960, height: 720, right: 960, bottom: 720, x: 0, y: 0, toJSON: () => ({}) })) as unknown as typeof main.getBoundingClientRect;
+    (main as unknown as { setPointerCapture: (id: number) => void }).setPointerCapture = () => {};
+    (main as unknown as { releasePointerCapture: (id: number) => void }).releasePointerCapture = () => {};
+    (main as unknown as { hasPointerCapture: (id: number) => boolean }).hasPointerCapture = () => false;
+    overlay.getContext = ((() => new Proxy({}, { get: () => () => {}, set: () => true })) as unknown as typeof overlay.getContext);
+    const { fireEvent } = await import('@testing-library/react');
+    fireEvent.pointerDown(main, { pointerId: 1, clientX: 100, clientY: 100 });
+    await act(async () => {});
+    fireEvent.pointerUp(main, { pointerId: 1, clientX: 100, clientY: 100 });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    const page = handle.snapshot().pages[0];
+    const corners = selectionCorners(page, fakeFrame as never, { pageId: page.id, shapeId: 'page:1:shape:1', hit: { kind: 'shape', shapeId: 'page:1:shape:1' } });
+    const grip = rotationGripPosition(corners!, 1);
+    fireEvent.pointerDown(main, { pointerId: 2, clientX: grip.x, clientY: grip.y });
+    await act(async () => {});
+    const banner = view.container.querySelector('[role="alert"]');
+    expect(banner?.textContent).toContain('rotation');
+    const dismiss = view.getByRole('button', { name: 'Dismiss error' });
+    fireEvent.click(dismiss);
+    await act(async () => {});
+    expect(view.container.querySelector('[role="alert"]')).toBeNull();
+    fireEvent.pointerDown(main, { pointerId: 3, clientX: grip.x, clientY: grip.y });
+    await act(async () => {});
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain('rotation');
+    const plainId = handle.snapshot().pages[0].shapes[2].id;
+    await act(async () => { handle.setCellFormula(page.id, plainId, { cellName: 'FillForegnd' }, 'RGB(9,9,9)'); ready!.refresh(); });
+    await act(async () => {});
+    expect(view.container.querySelector('[role="alert"]')).toBeNull();
+  } finally { cleanup(); canvasPrototype.getContext = getContext; }
+});
