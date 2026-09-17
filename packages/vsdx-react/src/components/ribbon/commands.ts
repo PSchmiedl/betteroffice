@@ -76,7 +76,7 @@ function colorFormula(value = '#000000'): string {
 }
 
 /** Matches a GUARD function call without matching reference names containing guard. */
-const GUARD_CALL = /(^|[^A-Z0-9_.])GUARD\s*\(/i;
+export const GUARD_CALL = /(^|[^A-Z0-9_.])GUARD\s*\(/i;
 
 export function numberValue(value: string | undefined): number {
   const result = Number(value ?? '0');
