@@ -105,6 +105,94 @@ impl DiagramSession {
         Ok(receipt)
     }
 
+    /// Adds a connector glued at its begin only; the end stays where the draft puts it.
+    pub fn add_free_connector(
+        &self,
+        context: &EditCtx,
+        page_id: &str,
+        draft: &ShapeDraft,
+        from: &ConnectorGlue,
+    ) -> EditResult<ShapeReceipt> {
+        validate_shape_draft(draft)?;
+        self.validate_free_connector(page_id, draft, from)?;
+        let mut txn = self.transact_for(context);
+        let receipt = insert_shape(&mut txn, self.client_id, page_id, draft)?;
+        let connects = txn.get_or_insert_map(CONNECTS);
+        let key = format!("{}:{}", receipt.shape_id, GlueEndpoint::Begin.name());
+        let entry = connects.insert(&mut txn, key.as_str(), MapPrelim::default());
+        entry.insert(&mut txn, "id", key.as_str());
+        entry.insert(&mut txn, "pageId", page_id);
+        entry.insert(&mut txn, "connectorId", receipt.shape_id.as_str());
+        entry.insert(&mut txn, "endpoint", GlueEndpoint::Begin.name());
+        entry.insert(&mut txn, "targetId", from.shape_id.as_str());
+        entry.insert(
+            &mut txn,
+            "toCell",
+            from.to_cell.as_deref().unwrap_or("PinX"),
+        );
+        Ok(receipt)
+    }
+
+    fn validate_free_connector(
+        &self,
+        page_id: &str,
+        draft: &ShapeDraft,
+        from: &ConnectorGlue,
+    ) -> EditResult<()> {
+        let mut package = self.package()?;
+        let snapshot = self.snapshot()?;
+        let page = snapshot
+            .pages
+            .iter()
+            .find(|page| page.id == page_id)
+            .ok_or_else(|| EditError::InvalidState("connector page does not exist".to_owned()))?;
+        let from_sheet = *snapshot_shape_sources(page)
+            .get(from.shape_id.as_str())
+            .ok_or_else(|| EditError::ShapeNotFound(from.shape_id.clone()))?;
+        let sheet = package
+            .page_contents
+            .get_mut(&page.source_part_path)
+            .ok_or_else(|| {
+                EditError::InvalidState("connector page part does not exist".to_owned())
+            })?;
+        let source_id = largest_shape_id(sheet).checked_add(1).ok_or_else(|| {
+            EditError::InvalidState("cannot allocate a connector source ID".to_owned())
+        })?;
+        let candidate = ShapeSnapshot {
+            id: String::new(),
+            source_id,
+            name: draft.name.clone(),
+            cells: draft.cells.clone(),
+            children: Vec::new(),
+        };
+        let mut shape = shape_from_snapshot(&candidate);
+        materialize_shape(&mut shape, &candidate, &HashSet::new(), 1)?;
+        let Some(SheetChild::Shapes(shapes)) = sheet
+            .children
+            .iter_mut()
+            .find(|child| matches!(child, SheetChild::Shapes(_)))
+        else {
+            return Err(EditError::InvalidState(
+                "connector page has no shapes".to_owned(),
+            ));
+        };
+        shapes.push(ShapesChild::Shape(shape));
+        sheet
+            .children
+            .push(SheetChild::Connects(vec![ConnectsChild::Connect(
+                Connect {
+                    from_sheet: source_id,
+                    from_cell: Some(GlueEndpoint::Begin.endpoint_cell().to_owned()),
+                    from_part: None,
+                    to_sheet: from_sheet,
+                    to_cell: Some(from.to_cell.as_deref().unwrap_or("PinX").to_owned()),
+                    to_part: None,
+                    other_attrs: Vec::new(),
+                },
+            )]));
+        resolved_connector(&package, &page.source_part_path, source_id)
+    }
+
     /// Inserts a shape and a connector glued from an existing shape to it, in one transaction.
     pub fn add_connected_shape(
         &self,
@@ -732,6 +820,89 @@ mod tests {
             .unwrap();
         assert_eq!(point.row, 0);
         assert_eq!(point.position, vsdx_resolve::ScenePoint { x: 2.5, y: 3.5 });
+    }
+
+    #[test]
+    fn free_connector_glues_its_begin_and_keeps_its_end() {
+        let session = DiagramSession::open(
+            include_bytes!("../../../vsdx-parse/tests/fixtures/foundation.vsdx"),
+            705,
+        )
+        .unwrap();
+        let context = EditCtx::local("free-connector");
+        let from = session
+            .add_shape(&context, "page:1", &rect_draft("1", "1"))
+            .unwrap();
+        session
+            .add_free_connector(
+                &context,
+                "page:1",
+                &connector_draft(),
+                &ConnectorGlue {
+                    shape_id: from.shape_id.clone(),
+                    to_cell: None,
+                },
+            )
+            .unwrap();
+        let part = page_part(&session);
+        let package = session.package().unwrap();
+        let connectivity = vsdx_resolve::Resolver::new(&package)
+            .resolve_page_connectivity(&part)
+            .unwrap();
+        let connector = connectivity.connectors.get(&3).unwrap();
+        assert_eq!(connector.glue.len(), 1);
+        assert_eq!(
+            connector.glue[0].endpoint,
+            vsdx_resolve::ConnectorEndpoint::Begin
+        );
+        let end_before = connector.end;
+        session
+            .move_shape(&context, "page:1", &from.shape_id, "3", "3")
+            .unwrap();
+        let package = session.package().unwrap();
+        let moved = vsdx_resolve::Resolver::new(&package)
+            .resolve_page_connectivity(&part)
+            .unwrap();
+        let moved = moved.connectors.get(&3).unwrap();
+        let begin_after = moved.glue[0]
+            .to
+            .as_ref()
+            .unwrap()
+            .connection_point
+            .as_ref()
+            .unwrap()
+            .position;
+        assert_eq!(begin_after.x, 3.0);
+        assert_eq!(begin_after.y, 3.0);
+        assert_eq!(moved.end, end_before);
+    }
+
+    #[test]
+    fn free_connector_refuses_an_unresolvable_glue_target() {
+        let session = DiagramSession::open(
+            include_bytes!("../../../vsdx-parse/tests/fixtures/foundation.vsdx"),
+            706,
+        )
+        .unwrap();
+        let context = EditCtx::local("free-connector");
+        let from = session
+            .add_shape(&context, "page:1", &rect_draft("1", "1"))
+            .unwrap();
+        let before = session.snapshot().unwrap().pages[0].shapes.len();
+        assert!(
+            session
+                .add_free_connector(
+                    &context,
+                    "page:1",
+                    &connector_draft(),
+                    &ConnectorGlue {
+                        shape_id: from.shape_id.clone(),
+                        to_cell: Some("Connections.X1".to_owned()),
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(session.snapshot().unwrap().pages[0].shapes.len(), before);
     }
 
     fn connected_target_draft(pin_x: &str, pin_y: &str) -> ShapeDraft {
