@@ -1972,6 +1972,7 @@ function PptxEditorContent({
           onFormat={formatSelection}
           currentShapeFormatting={selectedShapeFormatting}
           shapeSelectionActive={!canvasReview.reviewing && selectedShape?.kind === 'shape'}
+          shapeArrangeActive={!canvasReview.reviewing && Boolean(selectedShape)}
           onShapeFormat={formatShape}
           onInsertSlide={addSlide}
           onInsertImage={() => pictureInputRef.current?.click()}

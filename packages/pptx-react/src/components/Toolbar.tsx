@@ -88,6 +88,9 @@ export interface ToolbarProps {
   onFormat?: (action: FormattingAction) => void;
   currentShapeFormatting?: ShapeFormatting;
   shapeSelectionActive?: boolean;
+  /** Enables the arrange (z-order) menu; true for any selected object, not
+   *  only the preset shapes `shapeSelectionActive` covers. */
+  shapeArrangeActive?: boolean;
   onShapeFormat?: (action: ShapeFormattingAction) => void;
   onInsertSlide?: (layoutPartPath?: string | null) => void;
   onInsertImage?: () => void;
@@ -179,6 +182,7 @@ export function Toolbar(explicitProps: ToolbarProps) {
     onFormat,
     currentShapeFormatting = {},
     shapeSelectionActive = false,
+    shapeArrangeActive = false,
     onShapeFormat,
     onInsertSlide,
     onInsertImage,
@@ -205,6 +209,7 @@ export function Toolbar(explicitProps: ToolbarProps) {
   const [rootWidth, setRootWidth] = useState(Number.POSITIVE_INFINITY);
   const formattingEnabled = !disabled && textSelectionActive && Boolean(onFormat);
   const shapeFormattingEnabled = !disabled && shapeSelectionActive && Boolean(onShapeFormat);
+  const arrangeEnabled = !disabled && shapeArrangeActive && Boolean(onShapeFormat);
   const slideEnabled = !disabled && Boolean(onInsertSlide);
   const toolEnabled = !disabled && Boolean(onToolChange);
   const insertImageEnabled = !disabled && Boolean(onInsertImage);
@@ -244,6 +249,10 @@ export function Toolbar(explicitProps: ToolbarProps) {
     if (formattingEnabled) onFormat?.(action);
   };
   const applyShape = (action: ShapeFormattingAction) => {
+    if (action.type === 'zOrder') {
+      if (arrangeEnabled) onShapeFormat?.(action);
+      return;
+    }
     if (shapeFormattingEnabled) onShapeFormat?.(action);
   };
 
@@ -718,7 +727,7 @@ export function Toolbar(explicitProps: ToolbarProps) {
             ) : null}
             <ToolbarDropdown
               title={t('toolbar.arrange')}
-              disabled={!shapeFormattingEnabled}
+              disabled={!arrangeEnabled}
               menuWidth={190}
               testId="pptx-shape-arrange"
               trigger={<ToolbarIcon name="bringToFront" />}

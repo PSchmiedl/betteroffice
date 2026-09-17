@@ -151,7 +151,7 @@ describe('Toolbar shape controls', () => {
     const actions: ShapeFormattingAction[] = [];
     const { getByLabelText, getByTestId } = render(
       <LocaleProvider>
-        <Toolbar shapeSelectionActive onShapeFormat={(action) => actions.push(action)} />
+        <Toolbar shapeArrangeActive onShapeFormat={(action) => actions.push(action)} />
       </LocaleProvider>
     );
 
@@ -170,6 +170,35 @@ describe('Toolbar shape controls', () => {
       { type: 'zOrder', value: 'backward' },
       { type: 'zOrder', value: 'back' },
     ]);
+  });
+
+  it('arranges a picture even though it has no fill or border controls', () => {
+    // Fill/border/adjust only apply to preset shapes (`shapeSelectionActive`),
+    // but z-order applies to any selected object, pictures included.
+    const actions: ShapeFormattingAction[] = [];
+    const { getByLabelText, getByTestId } = render(
+      <LocaleProvider>
+        <Toolbar shapeArrangeActive onShapeFormat={(action) => actions.push(action)} />
+      </LocaleProvider>
+    );
+
+    expect(getByTestId('pptx-shape-fill').hasAttribute('disabled')).toBe(true);
+    expect(getByTestId('pptx-shape-arrange').hasAttribute('disabled')).toBe(false);
+
+    fireEvent.click(getByTestId('pptx-shape-arrange'));
+    fireEvent.click(getByLabelText('Send to back'));
+
+    expect(actions).toEqual([{ type: 'zOrder', value: 'back' }]);
+  });
+
+  it('disables the arrange menu without a selected object', () => {
+    const { getByTestId } = render(
+      <LocaleProvider>
+        <Toolbar onShapeFormat={() => {}} />
+      </LocaleProvider>
+    );
+
+    expect(getByTestId('pptx-shape-arrange').hasAttribute('disabled')).toBe(true);
   });
 
   it('exposes the primary adjustment for non-round presets', () => {
