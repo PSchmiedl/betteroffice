@@ -19,10 +19,11 @@ export const CONTROL_HANDLE_FILL = '#ffeb00';
 export const CONTROL_HANDLE_CSS = 7;
 export const ROTATION_SNAP_STEP = Math.PI / 12;
 export const CANVAS_KEYBOARD_DPI = 96;
-export const CANVAS_KEYBOARD_NUDGE_MULTIPLIER = 10;
+/** One ruler tick, which is what Visio's plain arrow nudges by with nothing to snap to. */
+export const CANVAS_KEYBOARD_NUDGE_INCHES = 1 / 16;
 export type CanvasKeyboardIntent = { kind: 'undo' } | { kind: 'redo' } | { kind: 'delete' } | { kind: 'escape' } | { kind: 'save' } | { kind: 'selectAll' } | { kind: 'nudge'; dx: number; dy: number };
 export interface CanvasKeyboardEventLike { key: string; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; target?: unknown; }
-/** One screen pixel in model inches at the given zoom. */
+/** One screen pixel in model inches; the Shift nudge, capped at a ruler tick so it never coarsens past the plain one. */
 export const keyboardNudgeStep = (zoom: number): number => {
   const safe = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
   return 1 / (CANVAS_KEYBOARD_DPI * safe);
@@ -68,7 +69,7 @@ export const canvasKeyboardIntent = (event: CanvasKeyboardEventLike, zoom: numbe
   }
   if (mod || alt) return null;
   if (key === 'Delete' || key === 'Backspace') return { kind: 'delete' };
-  const step = keyboardNudgeStep(zoom) * (shift ? CANVAS_KEYBOARD_NUDGE_MULTIPLIER : 1);
+  const step = shift ? Math.min(keyboardNudgeStep(zoom), CANVAS_KEYBOARD_NUDGE_INCHES) : CANVAS_KEYBOARD_NUDGE_INCHES;
   if (key === 'ArrowLeft') return { kind: 'nudge', dx: -step, dy: 0 };
   if (key === 'ArrowRight') return { kind: 'nudge', dx: step, dy: 0 };
   if (key === 'ArrowUp') return { kind: 'nudge', dx: 0, dy: step };
