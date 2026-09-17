@@ -91,6 +91,8 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const [shapesCollapsed, setShapesCollapsed] = useState(false);
   const [layersCollapsed, setLayersCollapsed] = useState(false);
   const [explorerCollapsed, setExplorerCollapsed] = useState(false);
+  const [showPageBreaks, setShowPageBreaks] = useState(false);
+  const pageBreakToggle = useMemo(() => ({ shown: showPageBreaks, toggle: () => setShowPageBreaks((value) => !value) }), [showPageBreaks]);
   const [diagnostics, setDiagnostics] = useState<TextDiagnostic[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ top: number; left: number; kind: 'shape' | 'canvas' } | null>(null);
@@ -707,7 +709,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const fidelity = diagnostics.filter((diagnostic) => diagnostic.category === 'fidelity');
   return <div className={className} style={styles.root} aria-label={t('editor.appLabel')}>
     <header style={styles.titleBar}><strong>{t('ribbon.documentName')}</strong><span style={{ color: dirty ? '#a16207' : '#526273' }}>{dirty ? t('ribbon.dirty') : t('ribbon.saved')}</span></header>
-    <RibbonCommandsProvider handle={handleRef.current} snapshot={model.snapshot} pageId={model.snapshot?.pages[model.pageIndex]?.id} selection={selection} frame={model.frame} onMutation={() => refresh(undefined, true)} onError={reportError} onDownload={download}>
+    <RibbonCommandsProvider handle={handleRef.current} snapshot={model.snapshot} pageId={model.snapshot?.pages[model.pageIndex]?.id} selection={selection} frame={model.frame} pageBreaks={pageBreakToggle} onMutation={() => refresh(undefined, true)} onError={reportError} onDownload={download}>
     <RibbonCommandsBridge target={commandsRef} />
     <Ribbon t={t} hasSelection={selection !== null} />
     <div style={styles.contentRow}>
@@ -724,6 +726,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       {!loading && !model.frame && <span>{file ? t('editor.noPages') : t('editor.openPrompt')}</span>}
       <div style={styles.canvasFrame} onDragOver={onCanvasDragOver} onDrop={onCanvasDrop}>
         <canvas ref={mainCanvasRef} tabIndex={0} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel} onLostPointerCapture={onLostPointerCapture} onDoubleClick={onCanvasDoubleClick} onContextMenu={onCanvasContextMenu} onKeyDown={onCanvasKeyDown} onFocus={onCanvasFocus} onBlur={onCanvasBlur} aria-label={selection ? t('pages.canvasLabelWithSelection', { current: model.pageIndex + 1, total: model.snapshot?.pages.length ?? 0, name: selection.shapeId }) : t('pages.canvasLabel', { current: model.pageIndex + 1, total: model.snapshot?.pages.length ?? 0 })} style={styles.canvas} />
+        {showPageBreaks && model.frame && <PageBreakGrid frame={model.frame} zoom={zoom} />}
         <canvas ref={overlayCanvasRef} aria-hidden="true" style={styles.overlay} />
         {editing && editOverlay && (
           <div ref={editWrapRef} style={{ ...styles.textEditWrap, width: editOverlay.width, height: editOverlay.height, transform: `matrix(${editOverlay.matrix.a}, ${editOverlay.matrix.b}, ${editOverlay.matrix.c}, ${editOverlay.matrix.d}, ${editOverlay.matrix.e}, ${editOverlay.matrix.f})` }}>
@@ -784,6 +787,40 @@ export const CENTRE_INSERT_CASCADE = 8;
 export function centreInsertPoint(centre: ModelPoint, count: number): ModelPoint {
   const step = count % CENTRE_INSERT_CASCADE;
   return { x: centre.x + step * CENTRE_INSERT_STEP_IN, y: centre.y - step * CENTRE_INSERT_STEP_IN };
+}
+
+/** Page extent and the printer-paper tile behind the page-break grid, in page pixels. */
+export interface PageBreakFrame { width: number; height: number; printWidth: number; printHeight: number; }
+
+/** Upper bound on page-break guides per axis; a denser tile draws none. */
+export const MAX_PAGE_BREAK_LINES = 1000;
+
+/** Page-break offsets in CSS pixels along one axis, excluding the page edges. */
+function pageBreakAxis(extent: number, tile: number, zoom: number): number[] {
+  const step = tile * zoom;
+  const span = extent * zoom;
+  if (!Number.isFinite(step) || step <= 0 || !Number.isFinite(span)) return [];
+  if (span / step > MAX_PAGE_BREAK_LINES + 1) return [];
+  const offsets: number[] = [];
+  for (let k = 1; k * step < span - 1e-6; k += 1) offsets.push(k * step);
+  return offsets;
+}
+
+/** Where printer-paper boundaries fall inside the page, in CSS pixels from the page origin. */
+export function pageBreakLines(frame: PageBreakFrame, zoom: number): { vertical: number[]; horizontal: number[] } {
+  return {
+    vertical: pageBreakAxis(frame.width, frame.printWidth, zoom),
+    horizontal: pageBreakAxis(frame.height, frame.printHeight, zoom),
+  };
+}
+
+/** Printer-paper guides drawn over the page. */
+export function PageBreakGrid({ frame, zoom }: { frame: PageBreakFrame; zoom: number }) {
+  const lines = pageBreakLines(frame, zoom);
+  return <div data-testid="vsdx-page-breaks" aria-hidden="true" style={styles.overlay}>
+    {lines.vertical.map((x) => <div key={`v${x}`} style={{ ...styles.pageBreakLine, left: x, top: 0, width: 1, height: '100%' }} />)}
+    {lines.horizontal.map((y) => <div key={`h${y}`} style={{ ...styles.pageBreakLine, left: 0, top: y, width: '100%', height: 1 }} />)}
+  </div>;
 }
 
 interface ClientRectLike { left: number; top: number; width: number; height: number; }
@@ -928,4 +965,4 @@ function fontFaceEqual(left: VsdxFontFace, right: VsdxFontFace): boolean { retur
 function bytesEqual(left: Uint8Array, right: Uint8Array): boolean { return left === right || (left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index])); }
 function resolveImage(assetId: string, handle: DiagramHandle | null, cache: { current: Map<string, Promise<CanvasImageSource | null>> }, message: string): Promise<CanvasImageSource | null> { const existing = cache.current.get(assetId); if (existing) return existing; const pending = decodeImage(handle?.mediaBytes(assetId), message); cache.current.set(assetId, pending); return pending; }
 async function decodeImage(bytes: Uint8Array | undefined, message: string): Promise<CanvasImageSource | null> { if (!bytes) return null; const blob = new Blob([bytes.slice()]); if (typeof createImageBitmap === 'function') return createImageBitmap(blob); const url = URL.createObjectURL(blob); try { return await new Promise<HTMLImageElement>((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = () => reject(new Error(message)); image.src = url; }); } finally { URL.revokeObjectURL(url); } }
-const styles: Record<string, CSSProperties> = { root: { display: 'flex', flexDirection: 'column', width: '100%', height: '100%', minHeight: 480, color: '#172033', background: '#f3f5f8', fontFamily: 'ui-sans-serif, system-ui, sans-serif' }, titleBar: { display: 'flex', alignItems: 'center', gap: 12, minHeight: 32, padding: '0 14px', background: '#f8fafc', borderBottom: '1px solid #d8dee9', fontSize: 13 }, contentRow: { display: 'flex', flex: 1, minHeight: 0 }, leftColumn: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }, rightColumn: { display: 'flex', height: '100%', minHeight: 0 }, shapesWrap: { display: 'flex', flex: '1 1 auto', minHeight: 0 }, workspace: { position: 'relative', display: 'flex', flex: 1, alignItems: 'center', justifyContent: 'center', overflow: 'auto' }, canvasFrame: { position: 'relative', flex: '0 0 auto' }, canvas: { display: 'block', background: '#fff', boxShadow: '0 8px 32px rgba(27, 39, 61, 0.2)', touchAction: 'none' }, overlay: { position: 'absolute', inset: 0, pointerEvents: 'none' }, textEditWrap: { position: 'absolute', left: 0, top: 0, transformOrigin: '0 0', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'visible', background: 'transparent', border: '1px dashed #1d4ed8', zIndex: 2 }, textEditBox: { width: '100%', background: 'transparent', border: 'none', outline: 'none', resize: 'none', overflow: 'visible', textAlign: 'center', whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word', lineHeight: 1.2, padding: 0, margin: 0 }, integrity: { position: 'absolute', right: 14, bottom: 14, maxWidth: 340, padding: 12, color: '#7f1d1d', background: '#fef2f2', border: '1px solid #fca5a5' }, fidelity: { position: 'absolute', right: 14, bottom: 14, maxWidth: 340, padding: 8, color: '#475569', background: '#fff', fontSize: 12 }, error: { position: 'absolute', left: 14, right: 14, bottom: 14, padding: 10, color: '#8b1e2d', background: '#fff0f2', border: '1px solid #efb8c0' } };
+const styles: Record<string, CSSProperties> = { root: { display: 'flex', flexDirection: 'column', width: '100%', height: '100%', minHeight: 480, color: '#172033', background: '#f3f5f8', fontFamily: 'ui-sans-serif, system-ui, sans-serif' }, titleBar: { display: 'flex', alignItems: 'center', gap: 12, minHeight: 32, padding: '0 14px', background: '#f8fafc', borderBottom: '1px solid #d8dee9', fontSize: 13 }, contentRow: { display: 'flex', flex: 1, minHeight: 0 }, leftColumn: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }, rightColumn: { display: 'flex', height: '100%', minHeight: 0 }, shapesWrap: { display: 'flex', flex: '1 1 auto', minHeight: 0 }, workspace: { position: 'relative', display: 'flex', flex: 1, alignItems: 'center', justifyContent: 'center', overflow: 'auto' }, canvasFrame: { position: 'relative', flex: '0 0 auto' }, canvas: { display: 'block', background: '#fff', boxShadow: '0 8px 32px rgba(27, 39, 61, 0.2)', touchAction: 'none' }, overlay: { position: 'absolute', inset: 0, pointerEvents: 'none' }, pageBreakLine: { position: 'absolute', pointerEvents: 'none', background: '#c3ccd9' }, textEditWrap: { position: 'absolute', left: 0, top: 0, transformOrigin: '0 0', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'visible', background: 'transparent', border: '1px dashed #1d4ed8', zIndex: 2 }, textEditBox: { width: '100%', background: 'transparent', border: 'none', outline: 'none', resize: 'none', overflow: 'visible', textAlign: 'center', whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word', lineHeight: 1.2, padding: 0, margin: 0 }, integrity: { position: 'absolute', right: 14, bottom: 14, maxWidth: 340, padding: 12, color: '#7f1d1d', background: '#fef2f2', border: '1px solid #fca5a5' }, fidelity: { position: 'absolute', right: 14, bottom: 14, maxWidth: 340, padding: 8, color: '#475569', background: '#fff', fontSize: 12 }, error: { position: 'absolute', left: 14, right: 14, bottom: 14, padding: 10, color: '#8b1e2d', background: '#fff0f2', border: '1px solid #efb8c0' } };

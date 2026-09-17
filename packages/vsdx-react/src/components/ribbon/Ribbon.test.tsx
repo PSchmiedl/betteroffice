@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { GlobalRegistrator } from '@happy-dom/global-registrator';
 import { useLayoutEffect } from 'react';
-import type { DiagramHandle } from '@betteroffice/vsdx';
+import type { DiagramHandle, PageDisplayList } from '@betteroffice/vsdx';
 import { createT, en } from '@betteroffice/vsdx-i18n';
 import { Ribbon } from './Ribbon';
 import { RibbonCommandsProvider, createRibbonCommands } from './commands';
@@ -175,6 +175,24 @@ test('tabs without commands stay hidden until they have content', () => {
   for (const name of ['Design', 'Review', 'View', 'Help', 'Shape']) expect(view.queryByRole('tab', { name })).toBeNull();
   expect(view.queryByText(en.ribbon.empty)).toBeNull();
   view.unmount();
+});
+
+test('the page-break toggle reflects and flips the overlay state', () => {
+  const toggled: boolean[] = [];
+  cleanup();
+  const diagram = stubDiagram();
+  const frame: PageDisplayList = { contractVersion: 6, width: 816, height: 1056, printWidth: 816, printHeight: 1056, paintTransform: { a: 96, b: 0, c: 0, d: -96, e: 0, f: 1056 }, primitives: [] };
+  const view = render(<RibbonCommandsProvider handle={diagram} snapshot={diagram.snapshot()} pageId="page" selection={null} frame={frame} pageBreaks={{ shown: false, toggle: () => toggled.push(true) }} onMutation={() => {}} onError={() => {}} onDownload={() => {}}><Ribbon t={createT(en)} /></RibbonCommandsProvider>);
+  const toggle = view.container.querySelector('[data-command-id="pageBreaks"]') as HTMLButtonElement;
+  expect(toggle.hasAttribute('aria-pressed')).toBe(false);
+  expect(toggle.getAttribute('aria-label')).toBe(en.ribbon.commands.pageBreaks);
+  expect(toggle.disabled).toBe(false);
+  fireEvent.click(toggle);
+  expect(toggled).toHaveLength(1);
+  view.unmount();
+  const shown = render(<RibbonCommandsProvider handle={diagram} snapshot={diagram.snapshot()} pageId="page" selection={null} frame={frame} pageBreaks={{ shown: true, toggle: () => {} }} onMutation={() => {}} onError={() => {}} onDownload={() => {}}><Ribbon t={createT(en)} /></RibbonCommandsProvider>);
+  expect(shown.container.querySelector('[data-command-id="pageBreaks"]')?.getAttribute('aria-pressed')).toBe('true');
+  shown.unmount();
 });
 
 function cell(name: string, value: string) {

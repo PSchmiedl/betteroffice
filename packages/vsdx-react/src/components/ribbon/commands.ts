@@ -7,7 +7,7 @@ import { standardShapeById } from '../shapes/shapeLibrary';
 export type RibbonCommandId =
   | 'undo' | 'redo' | 'delete' | 'fillColor' | 'lineColor' | 'lineWeight' | 'linePattern'
   | 'bringToFront' | 'bringForward' | 'sendBackward' | 'sendToBack'
-  | 'rotateLeft' | 'rotateRight' | 'flipHorizontal' | 'flipVertical' | 'addShape' | 'download';
+  | 'rotateLeft' | 'rotateRight' | 'flipHorizontal' | 'flipVertical' | 'addShape' | 'download' | 'pageBreaks';
 
 export interface RibbonCommand { id: RibbonCommandId; run: (value?: string) => void; enabled: boolean; active?: boolean; value?: string; }
 export type RibbonCommands = Record<RibbonCommandId, RibbonCommand>;
@@ -23,8 +23,12 @@ export interface RibbonCommandsProviderProps {
   onMutation: () => void;
   onError: (error: unknown) => void;
   onDownload: (bytes: Uint8Array) => void;
+  pageBreaks?: PageBreakToggle;
   children: ReactNode;
 }
+
+/** Whether the page-break overlay is shown, and how to flip it. */
+export interface PageBreakToggle { shown: boolean; toggle: () => void; }
 
 export interface ShapePlacement { shape: ShapeSnapshot; index: number; siblings: readonly ShapeSnapshot[]; }
 
@@ -190,7 +194,8 @@ export function createRibbonCommands(
   onMutation: () => void,
   onError: (error: unknown) => void,
   onDownload: (bytes: Uint8Array) => void,
-  frame?: PageDisplayList | null
+  frame?: PageDisplayList | null,
+  pageBreaks?: PageBreakToggle
 ): RibbonCommands {
   const execute = (operation: (current: DiagramHandle, selected: VsdxShapeSelection | null) => void, needsSelection = false) => () => {
     if (!handle || (needsSelection && !selection)) return;
@@ -258,12 +263,13 @@ export function createRibbonCommands(
       }),
     },
     download: { id: 'download', enabled: Boolean(handle), run: () => { if (!handle) return; try { onDownload(handle.save()); } catch (error) { onError(error); } } },
+    pageBreaks: { id: 'pageBreaks', enabled: Boolean(frame && pageBreaks), active: Boolean(pageBreaks?.shown), run: () => pageBreaks?.toggle() },
   } as RibbonCommands;
   return commands;
 }
 
-export function RibbonCommandsProvider({ handle, snapshot, pageId, selection, frame, onMutation, onError, onDownload, children }: RibbonCommandsProviderProps) {
-  const commands = useMemo(() => createRibbonCommands(handle, selection, pageId, onMutation, onError, onDownload, frame), [handle, snapshot, pageId, selection, frame, onMutation, onError, onDownload]);
+export function RibbonCommandsProvider({ handle, snapshot, pageId, selection, frame, onMutation, onError, onDownload, pageBreaks, children }: RibbonCommandsProviderProps) {
+  const commands = useMemo(() => createRibbonCommands(handle, selection, pageId, onMutation, onError, onDownload, frame, pageBreaks), [handle, snapshot, pageId, selection, frame, onMutation, onError, onDownload, pageBreaks]);
   return createElement(RibbonCommandsContext.Provider, { value: commands }, children);
 }
 

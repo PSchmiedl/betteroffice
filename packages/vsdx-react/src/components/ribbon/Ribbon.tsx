@@ -140,7 +140,13 @@ function HomePanel({ t }: { t: TFunction }) {
     <FormatRun t={t} />
     <Divider />
     <ArrangeRun t={t} />
+    <Divider />
+    <ShowRun t={t} />
   </div>;
+}
+
+function ShowRun({ t }: { t: TFunction }) {
+  return <RibbonRun label={t('ribbon.groups.view')}><CommandButton id="pageBreaks" icon="pageBreaks" label={t('ribbon.commands.pageBreaks')} /></RibbonRun>;
 }
 
 function ShapePanel({ t }: { t: TFunction }) {

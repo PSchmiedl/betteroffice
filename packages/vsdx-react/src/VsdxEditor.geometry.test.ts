@@ -1,13 +1,15 @@
 import { expect, test } from 'bun:test';
 import type { DiagramSnapshot, PageDisplayList } from '@betteroffice/vsdx';
 import type { PointerEvent } from 'react';
-import { canvasPointerPosition, centreInsertPoint, clientPointToModel, inchFormula, resolveDragGeometry, selectionCorners, stillSelectable } from './VsdxEditor';
+import { MAX_PAGE_BREAK_LINES, canvasPointerPosition, centreInsertPoint, clientPointToModel, inchFormula, pageBreakLines, resolveDragGeometry, selectionCorners, stillSelectable } from './VsdxEditor';
 import { previewOutline, resolveNudgeGeometry, resolveRotationAngle } from './interactions';
 
 const frame: PageDisplayList = {
-  contractVersion: 5,
+  contractVersion: 6,
   width: 816,
   height: 1056,
+  printWidth: 816,
+  printHeight: 1056,
   paintTransform: { a: 96, b: 0, c: 0, d: -96, e: 0, f: 1056 },
   primitives: [],
 };
@@ -207,4 +209,32 @@ test('a nudge inside a rotated and scaled group matches the equivalent drag', ()
   expect(nudged.x).toBeCloseTo(dragged.x, 10);
   expect(nudged.y).toBeCloseTo(dragged.y, 10);
   expect(nudged.x).not.toBeCloseTo(2 + dx, 6);
+});
+
+test('page breaks fall on printer-paper boundaries inside the page', () => {
+  const plan = { width: 45.27165 * 96, height: 39.33858 * 96, printWidth: 11.69291 * 96, printHeight: 8.26772 * 96 };
+  const lines = pageBreakLines(plan, 1);
+  expect(lines.vertical).toHaveLength(3);
+  expect(lines.horizontal).toHaveLength(4);
+  expect(lines.vertical[0]).toBeCloseTo(plan.printWidth, 8);
+  expect(lines.horizontal[0]).toBeCloseTo(plan.printHeight, 8);
+  for (let i = 1; i < lines.vertical.length; i += 1) expect(lines.vertical[i] - lines.vertical[i - 1]).toBeCloseTo(plan.printWidth, 8);
+  for (let i = 1; i < lines.horizontal.length; i += 1) expect(lines.horizontal[i] - lines.horizontal[i - 1]).toBeCloseTo(plan.printHeight, 8);
+  expect(lines.vertical.every((x) => x < plan.width)).toBe(true);
+  expect(lines.horizontal.every((y) => y < plan.height)).toBe(true);
+});
+
+test('page breaks scale with the zoom and vanish for a page that fits one sheet', () => {
+  const plan = { width: 45.27165 * 96, height: 39.33858 * 96, printWidth: 11.69291 * 96, printHeight: 8.26772 * 96 };
+  expect(pageBreakLines(plan, 1.5).vertical[0]).toBeCloseTo(plan.printWidth * 1.5, 8);
+  expect(pageBreakLines(frame, 1)).toEqual({ vertical: [], horizontal: [] });
+  expect(pageBreakLines({ width: frame.width, height: frame.height, printWidth: frame.width * 2, printHeight: frame.height * 2 }, 1)).toEqual({ vertical: [], horizontal: [] });
+});
+
+test('a degenerate print tile draws no page-break guides', () => {
+  const dense = { width: frame.width, height: frame.height, printWidth: 1e-4 * 96, printHeight: 1e-4 * 96 };
+  expect(pageBreakLines(dense, 1)).toEqual({ vertical: [], horizontal: [] });
+  const legible = { width: frame.width, height: frame.height, printWidth: frame.width / MAX_PAGE_BREAK_LINES, printHeight: frame.height / MAX_PAGE_BREAK_LINES };
+  expect(pageBreakLines(legible, 1).vertical).toHaveLength(MAX_PAGE_BREAK_LINES - 1);
+  expect(pageBreakLines({ width: frame.width, height: frame.height, printWidth: 0, printHeight: -1 }, 1)).toEqual({ vertical: [], horizontal: [] });
 });
