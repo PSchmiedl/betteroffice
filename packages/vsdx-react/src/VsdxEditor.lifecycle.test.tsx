@@ -1177,7 +1177,7 @@ test('typing Delete in the shapes search box keeps the selected shape', async ()
   } finally { cleanup(); canvasPrototype.getContext = getContext; }
 });
 
-test('a right-click opens the shape menu with a selection and empty canvas opens nothing', async () => {
+test('a right-click opens the shape menu on a shape and the canvas menu on empty canvas', async () => {
   const canvasPrototype = Object.getPrototypeOf(document.createElement('canvas')) as HTMLCanvasElement;
   const getContext = canvasPrototype.getContext;
   canvasPrototype.getContext = () => new Proxy({}, { get: () => () => {}, set: () => true }) as never;
@@ -1199,8 +1199,13 @@ test('a right-click opens the shape menu with a selection and empty canvas opens
     const { fireEvent } = await import('@testing-library/react');
     const { en } = await import('@betteroffice/vsdx-i18n');
     expect(fireEvent.contextMenu(main, { clientX: 900, clientY: 700, button: 2 }) === false).toBe(true);
-    expect(document.querySelector('[role="menu"]')).toBeNull();
+    const emptyMenu = document.querySelector('[role="menu"]');
+    expect(emptyMenu === null).toBe(false);
+    expect(emptyMenu?.getAttribute('aria-label')).toBe(en.contextMenu.canvasLabel);
     expect(main.getAttribute('aria-label')).not.toContain('selected shape');
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: 'Escape' });
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+    expect(document.activeElement).toBe(main);
     handle.hitTest = (() => ({ kind: 'shape', shapeId: 'page:1:shape:20' })) as unknown as DiagramHandle['hitTest'];
     expect(fireEvent.contextMenu(main, { clientX: 100, clientY: 100, button: 2 }) === false).toBe(true);
     const menu = document.querySelector('[role="menu"]');
@@ -1210,6 +1215,60 @@ test('a right-click opens the shape menu with a selection and empty canvas opens
     fireEvent.keyDown(document.activeElement as HTMLElement, { key: 'Escape' });
     expect(document.querySelector('[role="menu"]')).toBeNull();
     expect(document.activeElement).toBe(main);
+  } finally { cleanup(); canvasPrototype.getContext = getContext; }
+});
+
+test('replacing the document closes the open canvas menu', async () => {
+  const canvasPrototype = Object.getPrototypeOf(document.createElement('canvas')) as HTMLCanvasElement;
+  const getContext = canvasPrototype.getContext;
+  canvasPrototype.getContext = () => new Proxy({}, { get: () => () => {}, set: () => true }) as never;
+  const fixture = await readFile(resolve(root, 'apps/demo/public/betteroffice-demo.vsdx'));
+  let ready: { handle: DiagramHandle; refresh: () => void } | undefined;
+  const view = render(<VsdxEditor file={fixture} fonts={[]} onReady={(api) => { ready = api; }} />);
+  try {
+    await waitFor(() => expect(ready).toBeDefined());
+    const handle = ready!.handle;
+    const fakeFrame = { contractVersion: 4, width: 960, height: 720, paintTransform: { a: 96, b: 0, c: 0, d: -96, e: 0, f: 720 }, primitives: [] };
+    handle.layoutPage = (() => fakeFrame) as unknown as DiagramHandle['layoutPage'];
+    handle.hitTest = (() => null) as unknown as DiagramHandle['hitTest'];
+    await act(async () => { ready!.refresh(); });
+    const main = view.container.querySelectorAll('canvas')[0] as HTMLCanvasElement;
+    main.getBoundingClientRect = (() => ({ left: 0, top: 0, width: 960, height: 720, right: 960, bottom: 720, x: 0, y: 0, toJSON: () => ({}) })) as unknown as typeof main.getBoundingClientRect;
+    (main as unknown as { setPointerCapture: (id: number) => void }).setPointerCapture = () => {};
+    const { fireEvent } = await import('@testing-library/react');
+    expect(fireEvent.contextMenu(main, { clientX: 900, clientY: 700, button: 2 }) === false).toBe(true);
+    expect(document.querySelector('[role="menu"]')).not.toBeNull();
+    await act(async () => { view.rerender(<VsdxEditor file={fixture.slice()} fonts={[]} onReady={(api) => { ready = api; }} />); });
+    await waitFor(() => expect(document.querySelector('[role="menu"]')).toBeNull());
+  } finally { cleanup(); canvasPrototype.getContext = getContext; }
+});
+
+test('switching the active page closes the open canvas menu', async () => {
+  const canvasPrototype = Object.getPrototypeOf(document.createElement('canvas')) as HTMLCanvasElement;
+  const getContext = canvasPrototype.getContext;
+  canvasPrototype.getContext = () => new Proxy({}, { get: () => () => {}, set: () => true }) as never;
+  const fixture = await readFile(resolve(root, 'apps/demo/public/betteroffice-demo.vsdx'));
+  let ready: { handle: DiagramHandle; refresh: () => void } | undefined;
+  const view = render(<VsdxEditor file={fixture} fonts={[]} onReady={(api) => { ready = api; }} />);
+  try {
+    await waitFor(() => expect(ready).toBeDefined());
+    const handle = ready!.handle;
+    const fakeFrame = { contractVersion: 4, width: 960, height: 720, paintTransform: { a: 96, b: 0, c: 0, d: -96, e: 0, f: 720 }, primitives: [] };
+    handle.layoutPage = (() => fakeFrame) as unknown as DiagramHandle['layoutPage'];
+    handle.hitTest = (() => null) as unknown as DiagramHandle['hitTest'];
+    await act(async () => { ready!.refresh(); });
+    const main = view.container.querySelectorAll('canvas')[0] as HTMLCanvasElement;
+    main.getBoundingClientRect = (() => ({ left: 0, top: 0, width: 960, height: 720, right: 960, bottom: 720, x: 0, y: 0, toJSON: () => ({}) })) as unknown as typeof main.getBoundingClientRect;
+    (main as unknown as { setPointerCapture: (id: number) => void }).setPointerCapture = () => {};
+    const { fireEvent } = await import('@testing-library/react');
+    expect(fireEvent.contextMenu(main, { clientX: 900, clientY: 700, button: 2 }) === false).toBe(true);
+    expect(document.querySelector('[role="menu"]')).not.toBeNull();
+    const pageTablist = view.container.querySelector('[aria-label="Page tabs"]');
+    expect(pageTablist).not.toBeNull();
+    const pageTabs = pageTablist!.querySelectorAll('[role="tab"]');
+    expect(pageTabs.length).toBeGreaterThan(1);
+    await act(async () => { fireEvent.click(pageTabs[1] as HTMLElement); });
+    expect(document.querySelector('[role="menu"]')).toBeNull();
   } finally { cleanup(); canvasPrototype.getContext = getContext; }
 });
 
