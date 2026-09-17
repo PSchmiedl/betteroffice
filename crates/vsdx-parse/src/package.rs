@@ -263,6 +263,22 @@ pub fn parse_vsdx_with_limits(data: &[u8], limits: &ParseLimits) -> Result<VsdxP
             .copied()
             .unwrap_or(usize::MAX)
     });
+    let mut master_names = BTreeMap::new();
+    for master in xml_parts
+        .get(masters_part_path.as_deref().unwrap_or(""))
+        .into_iter()
+        .flat_map(|root| root.children_named("Master"))
+    {
+        let Some(id) = master.attribute("ID").and_then(|id| id.parse::<u32>().ok()) else {
+            continue;
+        };
+        if let Some(name) = master
+            .attribute("Name")
+            .or_else(|| master.attribute("NameU"))
+        {
+            master_names.insert(id, name.to_owned());
+        }
+    }
     let page_contents = parse_part_sheets(&page_part_paths, &mut xml_parts, &mut budget)?;
     let master_contents = parse_part_sheets(&master_part_paths, &mut xml_parts, &mut budget)?;
     let mut themes: BTreeMap<u32, Theme> = BTreeMap::new();
@@ -318,6 +334,7 @@ pub fn parse_vsdx_with_limits(data: &[u8], limits: &ParseLimits) -> Result<VsdxP
         page_part_ids,
         page_names,
         master_part_ids,
+        master_names,
         page_contents,
         master_contents,
         parts: package_parts,

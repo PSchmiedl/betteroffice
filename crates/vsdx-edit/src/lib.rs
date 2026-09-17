@@ -701,7 +701,11 @@ mod tests {
                     .add_shape(
                         &EditCtx::local("test"),
                         "page:1",
-                        &ShapeDraft { name: None, cells }
+                        &ShapeDraft {
+                            name: None,
+                            master: None,
+                            cells
+                        }
                     )
                     .is_err()
             );
@@ -714,6 +718,7 @@ mod tests {
         let session = session();
         let draft = ShapeDraft {
             name: None,
+            master: None,
             cells: Vec::new(),
         };
         let first = session
@@ -728,6 +733,314 @@ mod tests {
             .add_shape(&EditCtx::local("test"), "page:1", &draft)
             .unwrap();
         assert_ne!(first.shape_id, second.shape_id);
+    }
+
+    const STENCIL_SOURCE: &[u8] =
+        include_bytes!("../../vsdx-parse/tests/fixtures/document-stencil.vsdx");
+
+    fn stencil_session() -> DiagramSession {
+        DiagramSession::open(STENCIL_SOURCE, 11).unwrap()
+    }
+
+    fn placement_cell(name: &str, formula: &str) -> CellSnapshot {
+        CellSnapshot {
+            row_type: None,
+            locator: CellLocator {
+                sheet: CellSheet::Page(1),
+                shape_id: None,
+                section: None,
+                section_index: None,
+                row: None,
+                cell_name: name.to_owned(),
+            },
+            name: name.to_owned(),
+            formula: Some(formula.to_owned()),
+            value: None,
+        }
+    }
+
+    fn stencil_instance_draft(master: Option<u32>) -> ShapeDraft {
+        ShapeDraft {
+            name: Some("Stencil instance".to_owned()),
+            master,
+            cells: [
+                ("PinX", "4"),
+                ("PinY", "5"),
+                ("Width", "2"),
+                ("Height", "1"),
+                ("LocPinX", "1"),
+                ("LocPinY", "0.5"),
+            ]
+            .into_iter()
+            .map(|(name, formula)| placement_cell(name, formula))
+            .collect(),
+        }
+    }
+
+    fn shape_paths(list: &vsdx_render::VsdxDisplayList, id: &str) -> Vec<String> {
+        list.primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                vsdx_render::Primitive::Shape {
+                    id: shape, path, ..
+                } if shape.as_str() == id => Some(format!("{path:?}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn document_stencil_lists_master_names() {
+        let names = stencil_session().package().unwrap().master_names;
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            [
+                (1, "Stencil-Rect".to_owned()),
+                (2, "Stencil-Tri".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn master_instance_insert_resolves_geometry_through_the_master() {
+        let session = stencil_session();
+        let receipt = session
+            .add_shape(
+                &EditCtx::local("test"),
+                "page:1",
+                &stencil_instance_draft(Some(1)),
+            )
+            .unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let added = snapshot.pages[0]
+            .shapes
+            .iter()
+            .find(|shape| shape.id == receipt.shape_id)
+            .unwrap();
+        assert_eq!(added.master, Some(1));
+        assert!(
+            added
+                .cells
+                .iter()
+                .all(|cell| cell.locator.section.as_deref() != Some("Geometry")),
+            "a master instance stores placement only; geometry stays inherited: {:?}",
+            added
+                .cells
+                .iter()
+                .map(|cell| &cell.name)
+                .collect::<Vec<_>>()
+        );
+        let renderer = vsdx_render::Renderer::default();
+        let package = session.package().unwrap();
+        let list = renderer
+            .layout_page(&package, "visio/pages/page1.xml")
+            .unwrap();
+        let inserted = shape_paths(&list, &format!("visio/pages/page1.xml:{}", added.source_id));
+        assert_eq!(
+            inserted.len(),
+            1,
+            "the instance renders its inherited geometry"
+        );
+        assert_eq!(
+            inserted,
+            shape_paths(&list, "visio/pages/page1.xml:1"),
+            "same master plus same placement renders the same path"
+        );
+    }
+
+    #[test]
+    fn master_instance_insert_rejects_unknown_masters() {
+        let session = stencil_session();
+        let before = session.snapshot().unwrap();
+        for master in [Some(0), Some(999)] {
+            assert!(
+                session
+                    .add_shape(
+                        &EditCtx::local("test"),
+                        "page:1",
+                        &stencil_instance_draft(master)
+                    )
+                    .is_err(),
+                "master {master:?} must be refused"
+            );
+        }
+        assert_eq!(session.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn master_instance_insert_round_trips_through_save() {
+        let session = stencil_session();
+        let receipt = session
+            .add_shape(
+                &EditCtx::local("test"),
+                "page:1",
+                &stencil_instance_draft(Some(2)),
+            )
+            .unwrap();
+        let saved = session.save().unwrap();
+        let reparsed = vsdx_parse::parse_vsdx(&saved).unwrap();
+        let part = reparsed.page_part_paths[0].clone();
+        let stored = reparsed.page_contents[&part]
+            .shapes()
+            .max_by_key(|shape| shape.id)
+            .unwrap();
+        assert_eq!(stored.master, Some(2));
+        let reopened = DiagramSession::open(&saved, 12).unwrap();
+        let reopened_snapshot = reopened.snapshot().unwrap();
+        let live_source = session.snapshot().unwrap().pages[0]
+            .shapes
+            .iter()
+            .find(|shape| shape.id == receipt.shape_id)
+            .unwrap()
+            .source_id;
+        let added = reopened_snapshot.pages[0]
+            .shapes
+            .iter()
+            .find(|shape| shape.source_id == live_source)
+            .unwrap();
+        assert_eq!(added.master, Some(2));
+        let renderer = vsdx_render::Renderer::default();
+        let live = renderer
+            .layout_page(&session.package().unwrap(), "visio/pages/page1.xml")
+            .unwrap();
+        let again = renderer
+            .layout_page(&reopened.package().unwrap(), "visio/pages/page1.xml")
+            .unwrap();
+        assert_eq!(live, again);
+    }
+
+    #[test]
+    fn master_instance_insert_undoes_in_one_step() {
+        let session = stencil_session();
+        let before = session.snapshot().unwrap();
+        session
+            .add_shape(
+                &EditCtx::local("test"),
+                "page:1",
+                &stencil_instance_draft(Some(1)),
+            )
+            .unwrap();
+        assert!(session.undo());
+        assert_eq!(session.snapshot().unwrap(), before);
+        assert!(!session.can_undo());
+    }
+
+    fn placement_only_draft(master: u32, width: Option<&str>) -> ShapeDraft {
+        let mut cells = vec![placement_cell("PinX", "4"), placement_cell("PinY", "2")];
+        if let Some(width) = width {
+            cells.push(placement_cell("Width", width));
+            cells.push(placement_cell("Height", width));
+            cells.push(placement_cell("LocPinX", "Width*0.5"));
+            cells.push(placement_cell("LocPinY", "Height*0.5"));
+        }
+        ShapeDraft {
+            name: None,
+            master: Some(master),
+            cells,
+        }
+    }
+
+    #[test]
+    fn master_instance_insert_keeps_the_master_dimensions_when_none_are_written() {
+        let session = stencil_session();
+        let inherited = session
+            .add_shape(
+                &EditCtx::local("test"),
+                "page:1",
+                &placement_only_draft(2, None),
+            )
+            .unwrap();
+        let squared = session
+            .add_shape(
+                &EditCtx::local("test"),
+                "page:1",
+                &placement_only_draft(2, Some("1")),
+            )
+            .unwrap();
+        let snapshot = session.snapshot().unwrap();
+        let source_id = |shape_id: &str| {
+            snapshot.pages[0]
+                .shapes
+                .iter()
+                .find(|shape| shape.id == shape_id)
+                .unwrap()
+                .source_id
+        };
+        let list = vsdx_render::Renderer::default()
+            .layout_page(&session.package().unwrap(), "visio/pages/page1.xml")
+            .unwrap();
+        let inherited = shape_paths(
+            &list,
+            &format!("visio/pages/page1.xml:{}", source_id(&inherited.shape_id)),
+        );
+        assert_eq!(
+            inherited,
+            shape_paths(&list, "visio/pages/page1.xml:3"),
+            "an instance without an XForm renders like the stored instance of the same master"
+        );
+        assert_ne!(
+            inherited,
+            shape_paths(
+                &list,
+                &format!("visio/pages/page1.xml:{}", source_id(&squared.shape_id))
+            ),
+            "writing 1x1 distorts a non-square master"
+        );
+    }
+
+    fn write_peer_shape_master(peer: &Doc, shape_id: &str, master: f64) {
+        let mut txn = peer.transact_mut();
+        let sheets = txn.get_map(SHEETS).unwrap();
+        let shape = match sheets.get(&txn, shape_id) {
+            Some(yrs::Out::YMap(shape)) => shape,
+            _ => unreachable!(),
+        };
+        shape.insert(&mut txn, "master", master);
+    }
+
+    #[test]
+    fn remote_master_instances_are_validated_against_the_package() {
+        for (master, accepted) in [(1.0, true), (0.0, false), (999.0, false)] {
+            let session = stencil_session();
+            let before = session.encode_state_as_update_v1();
+            let peer =
+                DiagramSession::open_from_update(&session.encode_state_as_update_v1(), 8).unwrap();
+            let receipt = peer
+                .add_shape(
+                    &EditCtx::local("peer"),
+                    "page:1",
+                    &stencil_instance_draft(Some(1)),
+                )
+                .unwrap();
+            if master != 1.0 {
+                write_peer_shape_master(&peer.doc, &receipt.shape_id, master);
+            }
+            let update = peer
+                .encode_diff_v1(&session.encode_state_vector_v1())
+                .unwrap();
+            assert_eq!(
+                session.apply_update_v1(&update).is_ok(),
+                accepted,
+                "master {master}"
+            );
+            if !accepted {
+                assert_eq!(before, session.encode_state_as_update_v1());
+            }
+        }
+    }
+
+    #[test]
+    fn remote_rewrite_of_an_existing_shape_master_is_rejected() {
+        let session = stencil_session();
+        let before = session.encode_state_as_update_v1();
+        let peer = peer_doc(&session, 9);
+        write_peer_shape_master(&peer, "page:1:shape:1", 2.0);
+        assert!(
+            session
+                .apply_update_v1(&peer_update(&session, &peer))
+                .is_err()
+        );
+        assert_eq!(before, session.encode_state_as_update_v1());
     }
 
     #[test]
@@ -1648,6 +1961,7 @@ mod tests {
         let session = session();
         let draft = ShapeDraft {
             name: None,
+            master: None,
             cells: Vec::new(),
         };
         let first = session
@@ -1675,6 +1989,7 @@ mod tests {
         };
         let draft = ShapeDraft {
             name: None,
+            master: None,
             cells: vec![
                 CellSnapshot {
                     row_type: None,
@@ -1732,6 +2047,7 @@ mod tests {
                 "page:1",
                 &ShapeDraft {
                     name: Some("Added".to_owned()),
+                    master: None,
                     cells: vec![CellSnapshot {
                         row_type: None,
                         locator: CellLocator {
@@ -1787,6 +2103,7 @@ mod tests {
     fn shape_draft_round_trips_through_serde() {
         let draft = ShapeDraft {
             name: Some("Rectangle".to_owned()),
+            master: None,
             cells: vec![CellSnapshot {
                 row_type: None,
                 locator: CellLocator {
@@ -2310,6 +2627,7 @@ mod tests {
         let right = DiagramSession::open_from_update(&state, 12).unwrap();
         let draft = ShapeDraft {
             name: Some("Added".to_owned()),
+            master: None,
             cells: Vec::new(),
         };
         let left_added = left
@@ -2909,6 +3227,7 @@ mod tests {
                         &page.id,
                         &ShapeDraft {
                             name: Some("Generated".to_owned()),
+                            master: None,
                             cells: generated_shape_cells(),
                         },
                     )
@@ -2966,6 +3285,7 @@ mod tests {
                 &page.id,
                 &ShapeDraft {
                     name: Some("Generated".to_owned()),
+                    master: None,
                     cells: generated_shape_cells(),
                 },
             )
@@ -3058,6 +3378,7 @@ mod tests {
     fn control_draft() -> ShapeDraft {
         ShapeDraft {
             name: Some("Adjustable".to_owned()),
+            master: None,
             cells: vec![
                 control_plain("Width", "2"),
                 control_plain("Height", "1"),
@@ -3302,6 +3623,7 @@ mod tests {
     fn connector_draft() -> ShapeDraft {
         ShapeDraft {
             name: Some("Connector".to_owned()),
+            master: None,
             cells: [
                 ("OneD", "1"),
                 ("BeginX", "1"),

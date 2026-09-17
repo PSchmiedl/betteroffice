@@ -27,6 +27,7 @@ interface GeometryPath {
 export interface StandardShape {
   id: string;
   nameKey: TranslationKey;
+  label?: string;
   preview: string;
   defaultSize: { width: number; height: number };
   draft: (x: number, y: number, width: number, height: number) => FormulaShapeDraft;
@@ -40,6 +41,10 @@ export interface ShapeStencil {
 
 /** Height of every default insert box, in inches; the width follows the master's aspect ratio. */
 const DEFAULT_SHAPE_HEIGHT_IN = 1;
+
+export function shapeLabel(shape: StandardShape, t: (key: TranslationKey) => string): string {
+  return shape.label ?? t(shape.nameKey);
+}
 
 export const polygonVertices: Readonly<Record<string, readonly Point[]>> = {
   rectangle: [[0, 0], [1, 0], [1, 1], [0, 1]],

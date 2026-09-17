@@ -50,7 +50,9 @@
     "standardShapes": "Standard Shapes",
     "quickShapes": "Quick Shapes",
     "arrowShapes": "Arrows and Lines",
+    "documentShapes": "Document Stencil",
     "empty": "No shapes found",
+    "documentEmpty": "This document defines no masters",
     "shape": {
       "rectangle": "Rectangle",
       "square": "Square",
@@ -111,7 +113,8 @@
       "circularArrow": "Circular Arrow",
       "quadArrow": "Quad Arrow",
       "leftRightUp": "Left-Right-Up",
-      "arcedLine": "Arced Line"
+      "arcedLine": "Arced Line",
+      "documentShape": "Document shape"
     }
   },
   "shapeData": {

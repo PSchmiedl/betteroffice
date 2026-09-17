@@ -62,6 +62,24 @@ impl VsdxRenderer {
         Ok(json)
     }
 
+    /// Lays every document master out once per materialized package.
+    #[wasm_bindgen(js_name = masterPreviewsJson)]
+    pub fn master_previews_json(&self, document: &VsdxDocument) -> Result<String, JsValue> {
+        let package = document.session().package().map_err(js_error)?;
+        let previews = package
+            .master_sheets
+            .keys()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "name": package.master_names.get(id),
+                    "display": self.renderer.layout_master(&package, *id).ok(),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&previews).map_err(js_error)
+    }
+
     #[wasm_bindgen(js_name = pageLayersJson)]
     pub fn page_layers_json(
         &self,
@@ -336,6 +354,7 @@ mod tests {
                     "page:1",
                     &vsdx_edit::ShapeDraft {
                         name: None,
+                        master: None,
                         cells: Vec::new(),
                     },
                     &vsdx_edit::ConnectorGlue {
@@ -453,5 +472,41 @@ mod tests {
         renderer.set_layer_visible("visio/pages/page1.xml", 0, false);
         renderer.layout_page_json(&document, 0).unwrap();
         renderer.clear_layer_visibility();
+    }
+
+    #[test]
+    fn master_previews_list_every_document_master_once() {
+        let document = VsdxDocument::open_collaborative(
+            include_bytes!("../../vsdx-parse/tests/fixtures/document-stencil.vsdx"),
+            1.0,
+        )
+        .unwrap();
+        let renderer = VsdxRenderer::new();
+        let previews: serde_json::Value =
+            serde_json::from_str(&renderer.master_previews_json(&document).unwrap()).unwrap();
+        let previews = previews.as_array().unwrap();
+        assert_eq!(previews.len(), 2);
+        assert_eq!(previews[0]["id"], serde_json::json!(1));
+        assert_eq!(previews[0]["name"], serde_json::json!("Stencil-Rect"));
+        assert_eq!(
+            previews[0]["display"]["contractVersion"],
+            serde_json::json!(vsdx_render::CONTRACT_VERSION)
+        );
+        assert_eq!(
+            previews[0]["display"]["primitives"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(previews[1]["id"], serde_json::json!(2));
+        assert_eq!(previews[1]["name"], serde_json::json!("Stencil-Tri"));
+        assert_eq!(
+            previews[1]["display"]["primitives"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

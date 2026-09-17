@@ -1,8 +1,8 @@
 import { createT, deepMerge, diagnosticMessage, en } from '@betteroffice/vsdx-i18n';
 import type { Translations } from '@betteroffice/vsdx-i18n';
 import { canvasPointToModel, modelPointToCanvas, initWasm, openDiagram, paintPage, sizeCanvasForPage } from '@betteroffice/vsdx';
-import type { Affine, CellLocator, PageLayer, PagePrimitive, CollaborationReplica, DiagramHandle, DiagramSnapshot, HitTestResult, ModelPoint, PageDisplayList, PageSnapshot, ShapeDataRow, ShapeSnapshot, TextDiagnostic, VsdxFontFace, VsdxPresence } from '@betteroffice/vsdx';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { Affine, CellLocator, DocumentMaster, PageLayer, PagePrimitive, CollaborationReplica, DiagramHandle, DiagramSnapshot, HitTestResult, ModelPoint, PageDisplayList, PageSnapshot, ShapeDataRow, ShapeSnapshot, TextDiagnostic, VsdxFontFace, VsdxPresence } from '@betteroffice/vsdx';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent, FocusEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from 'react';
 import { AUTO_CONNECT_FADE_MS, HOVER_FREE_DRAG_INCHES, HOVER_PROXIMITY_PX, QUICK_SHAPE_IDS, autoConnectArrowAt, autoConnectArrowCss, autoConnectArrowsForShape, autoConnectHaloHit, connectionPointsForShape, connectorDraft, connectorEndpointGlue, connectorGlue, connectorRouteFromFrame, dropTargetForPoint, hoverPointAt, isConnectorShape, nearestConnectionPointAnywhere, paintAutoConnectOverlay, paintConnectorOverlay, quickShapePlacement, reroutePreviewForMove, routeConnector } from './connector';
 import type { AutoConnectSide, ConnectionPoint, ConnectorDragEndpoint, ConnectorOverlayRoute, ConnectorOverlayScene } from './connector';
@@ -22,7 +22,8 @@ import { LayersPanel } from './components/layers/LayersPanel';
 import { ShapeDataPanel } from './components/shapeData/ShapeDataPanel';
 import { DrawingExplorer } from './components/explorer/DrawingExplorer';
 import { shapeStencils, stencilShapeById } from './components/shapes/shapeLibrary';
-import type { StandardShape } from './components/shapes/shapeLibrary';
+import type { ShapeStencil, StandardShape } from './components/shapes/shapeLibrary';
+import { documentStencilEntries } from './components/shapes/documentStencil';
 import { StatusBar, clampZoom } from './components/statusbar';
 import { paintDragPreview, paintSelectionFrame, passedDragThreshold, previewOutline, hitTestSelection, isOwnedBrowserShortcut, hitTestControlHandles, controlCellWriteBlocked, controlHandleCanvasPositions, controlHandlesForShape, isPrintableEntryKey, paintControlHandles, resolveControlDrag, resolveDragGeometry, resolveNudgeGeometry, resolveRotationAngle, resizeCursor, canvasKeyboardIntent, shapeLocalToPage, textEditOverlay, withoutTextBox } from './interactions';
 import type { CanvasKeyboardIntent, ControlDrag, DragStart, ResizeHandle } from './interactions';
@@ -109,6 +110,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const rulerFrameRef = useRef<number | null>(null);
   const snappedReleaseRef = useRef<{ raw: ModelPoint; point: ModelPoint } | null>(null);
   const [shapesCollapsed, setShapesCollapsed] = useState(false);
+  const [documentStencil, setDocumentStencil] = useState<{ loaded: boolean; masters: readonly DocumentMaster[] }>({ loaded: false, masters: [] });
   const [layersCollapsed, setLayersCollapsed] = useState(false);
   const [explorerCollapsed, setExplorerCollapsed] = useState(false);
   const [showPageBreaks, setShowPageBreaks] = useState(false);
@@ -201,6 +203,10 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       }
     } catch (value) { reportError(value); }
   }, [reportError]);
+  const stencils = useMemo<readonly ShapeStencil[]>(() => [
+    ...shapeStencils,
+    { id: 'document', nameKey: 'shapesPanel.documentShapes', shapes: documentStencilEntries(documentStencil.masters) },
+  ], [documentStencil]);
   const commitTextEdit = useCallback(() => {
     const current = editingRef.current;
     const handle = handleRef.current;
@@ -220,7 +226,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     let handle: DiagramHandle | null = null;
     let stopUpdates = () => {};
     let stopResync = () => {};
-    handleRef.current?.dispose(); handleRef.current = null; imageCache.current.clear(); setSelection(null); setContextMenu(null); setClipboard(null); setEditing(null); setDraft(''); modelRef.current = { snapshot: null, pageIndex: 0, frame: null, layers: [] }; setModel(modelRef.current); setError(null); setDirty(false);
+    handleRef.current?.dispose(); handleRef.current = null; imageCache.current.clear(); setSelection(null); setContextMenu(null); setClipboard(null); setEditing(null); setDraft(''); modelRef.current = { snapshot: null, pageIndex: 0, frame: null, layers: [] }; setModel(modelRef.current); setError(null); setDirty(false); setDocumentStencil({ loaded: false, masters: [] }); setActiveStencilId('standard');
     if (!file) { setLoading(false); return; }
     setLoading(true);
     const openingFonts = fontsRef.current;
@@ -246,6 +252,13 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       }
     };
   }, [sessionClientId, initialUpdate, file, refresh, reportError]);
+
+  useLayoutEffect(() => {
+    const handle = handleRef.current;
+    if (!handle || loading || documentStencil.loaded || activeStencilId !== 'document') return;
+    try { setDocumentStencil({ loaded: true, masters: handle.masters() }); }
+    catch (value) { setDocumentStencil({ loaded: true, masters: [] }); reportError(value); }
+  }, [activeStencilId, documentStencil.loaded, loading, reportError]);
 
   useEffect(() => {
     const handle = handleRef.current;
@@ -1233,6 +1246,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     insertCascadeRef.current.set(page.id, cascade + 1);
     insertShapeAt(shape, centreInsertPoint(canvasPointToModel(frame.paintTransform, frame.width / 2, frame.height / 2), cascade));
   }, [insertShapeAt]);
+  const droppedShape = useCallback((id: string) => stencils.flatMap((stencil) => stencil.shapes).find((shape) => shape.id === id), [stencils]);
   const onCanvasDragOver = (event: DragEvent<HTMLDivElement>) => {
     if (!handleRef.current || !modelRef.current.frame) return;
     if (!event.dataTransfer.types.includes(STENCIL_DRAG_MIME)) return;
@@ -1242,7 +1256,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const onCanvasDrop = (event: DragEvent<HTMLDivElement>) => {
     const frame = modelRef.current.frame; const canvas = mainCanvasRef.current;
     if (!frame || !canvas) return;
-    const shape = stencilShapeById(event.dataTransfer.getData(STENCIL_DRAG_MIME).trim());
+    const shape = droppedShape(event.dataTransfer.getData(STENCIL_DRAG_MIME).trim());
     if (!shape) return;
     event.preventDefault();
     insertShapeAt(shape, clientPointToModel(frame, canvas.getBoundingClientRect(), event.clientX, event.clientY).model);
@@ -1300,7 +1314,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     {leftPanel === undefined ? (
       <div style={styles.leftColumn}>
         <div style={styles.shapesWrap}>
-          <ShapesPanel stencils={shapeStencils} activeStencilId={activeStencilId} onSelectStencil={setActiveStencilId} collapsed={shapesCollapsed} onToggleCollapsed={() => setShapesCollapsed((value) => !value)} onInsert={insertShape} t={t} />
+          <ShapesPanel stencils={stencils} activeStencilId={activeStencilId} onSelectStencil={setActiveStencilId} collapsed={shapesCollapsed} onToggleCollapsed={() => setShapesCollapsed((value) => !value)} onInsert={insertShape} t={t} />
         </div>
         <LayersPanel layers={model.layers} collapsed={layersCollapsed} onToggleCollapsed={() => setLayersCollapsed((value) => !value)} onToggleLayer={toggleLayerVisible} t={t} />
       </div>

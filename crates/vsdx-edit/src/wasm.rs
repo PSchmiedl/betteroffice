@@ -309,6 +309,8 @@ struct AddConnectedShapeArgs {
 #[serde(deny_unknown_fields)]
 struct FormulaShapeDraft {
     name: Option<String>,
+    #[serde(default)]
+    master: Option<u32>,
     cells: Vec<serde_json::Value>,
 }
 
@@ -342,6 +344,7 @@ impl FormulaShapeDraft {
         }
         Ok(ShapeDraft {
             name: self.name,
+            master: self.master,
             cells,
         })
     }

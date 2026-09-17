@@ -148,6 +148,14 @@ fn original_package_from_doc(doc: &Doc) -> EditResult<vsdx_parse::VsdxPackage> {
     }
 }
 
+/// Master IDs the opened package defines; sessions never add or remove masters.
+fn original_master_ids(doc: &Doc) -> EditResult<std::collections::BTreeSet<u32>> {
+    Ok(original_package_from_doc(doc)?
+        .master_sheets
+        .into_keys()
+        .collect())
+}
+
 fn original_shape_ids(doc: &Doc) -> EditResult<HashSet<String>> {
     let txn = doc.transact();
     let sheets = required_map(&txn, SHEETS)?;
@@ -434,7 +442,7 @@ fn shape_from_snapshot(snapshot: &ShapeSnapshot) -> Shape {
         } else {
             "Group".to_owned()
         }),
-        master: None,
+        master: snapshot.master,
         master_shape: None,
         line_style: None,
         fill_style: None,
@@ -658,6 +666,9 @@ fn seed_shape(
     map.insert(txn, "pageId", page_id);
     map.insert(txn, "sourceId", shape.id as f64);
     map.insert(txn, "origin", "original");
+    if let Some(master) = shape.master {
+        map.insert(txn, "master", f64::from(master));
+    }
     if let Some(parent_id) = parent_id {
         map.insert(txn, "parentId", parent_id);
     }
@@ -1364,6 +1375,13 @@ impl DiagramSession {
         draft: &ShapeDraft,
     ) -> EditResult<ShapeReceipt> {
         validate_shape_draft(draft, false)?;
+        if let Some(master) = draft.master
+            && !original_master_ids(&self.doc)?.contains(&master)
+        {
+            return Err(EditError::InvalidState(
+                "shape draft references an unknown master".to_owned(),
+            ));
+        }
         let mut txn = self.transact_for(context);
         insert_shape(&mut txn, self.client_id, page_id, draft)
     }
@@ -1990,6 +2008,9 @@ fn insert_shape(
     if let Some(name) = &draft.name {
         shape.insert(txn, "name", name.as_str());
     }
+    if let Some(master) = draft.master {
+        shape.insert(txn, "master", f64::from(master));
+    }
     let cells = shape.insert(txn, "cells", MapPrelim::default());
     shape.insert(txn, "shapes", ArrayPrelim::default());
     for cell in &draft.cells {
@@ -2011,8 +2032,24 @@ fn insert_shape(
     })
 }
 
+fn validate_draft_master(package: &vsdx_parse::VsdxPackage, draft: &ShapeDraft) -> EditResult<()> {
+    if let Some(master) = draft.master
+        && !package.master_sheets.contains_key(&master)
+    {
+        return Err(EditError::InvalidState(
+            "shape draft references an unknown master".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /** Paste reuses trusted cached values for formula-less cells; other drafts stay formula-only. */
 fn validate_shape_draft(draft: &ShapeDraft, allow_values: bool) -> EditResult<()> {
+    if draft.master == Some(0) {
+        return Err(EditError::InvalidState(
+            "shape draft references an invalid master".to_owned(),
+        ));
+    }
     validate_draft_cells(&draft.name, &draft.cells, allow_values)
 }
 
@@ -2569,7 +2606,40 @@ pub(crate) fn validate_remote_update(before: &Doc, staged: &Doc) -> EditResult<(
         }
     }
     validate_new_cells(before, staged, &before_identities)?;
+    validate_remote_masters(before, staged)?;
     connect::validate_remote_glue(before, staged)?;
+    Ok(())
+}
+
+/// Rejects remote shapes whose master the opened package does not define.
+fn validate_remote_masters(before: &Doc, staged: &Doc) -> EditResult<()> {
+    let before_txn = before.transact();
+    let staged_txn = staged.transact();
+    let before_sheets = required_map(&before_txn, SHEETS)?;
+    let staged_sheets = required_map(&staged_txn, SHEETS)?;
+    let mut added = Vec::new();
+    for (shape_id, staged_shape) in staged_sheets.iter(&staged_txn) {
+        if before_sheets.get(&before_txn, shape_id).is_some() {
+            continue;
+        }
+        let Out::YMap(staged_shape) = staged_shape else {
+            continue;
+        };
+        if let Some(master) = map_u32(&staged_shape, &staged_txn, "master")? {
+            added.push((shape_id.to_owned(), master));
+        }
+    }
+    if added.is_empty() {
+        return Ok(());
+    }
+    let known = original_master_ids(before)?;
+    for (shape_id, master) in added {
+        if !known.contains(&master) {
+            return Err(EditError::InvalidState(format!(
+                "remote update adds shape {shape_id} with unknown master {master}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2762,6 +2832,7 @@ fn validate_session_topology(before: &Doc, staged: &Doc) -> EditResult<()> {
             "sourceId",
             "origin",
             "parentId",
+            "master",
             "copySourceId",
             "copySourcePageId",
             "copyRefusal",
@@ -3240,6 +3311,7 @@ fn snapshot_shape<T: ReadTxn>(
         .get(shape_id)
         .copied()
         .unwrap_or(stored_source_id);
+    let master = map_u32(&shape, txn, "master")?;
     let cells = map_map(&shape, txn, "cells")?;
     let references = local_references(&cells, txn)?;
     let evaluate_locally = |formula: &str| evaluate_cached_formula(formula, &references);
@@ -3285,6 +3357,7 @@ fn snapshot_shape<T: ReadTxn>(
             id: shape_id.to_owned(),
             source_id,
             name: map_string(&shape, txn, "name"),
+            master,
             cells: snapshots,
             children: Vec::new(),
             copy_source_id: map_u32(&shape, txn, "copySourceId")?,
@@ -3309,6 +3382,7 @@ fn snapshot_shape<T: ReadTxn>(
         id: shape_id.to_owned(),
         source_id,
         name: map_string(&shape, txn, "name"),
+        master,
         cells: snapshots,
         children,
         copy_source_id: map_u32(&shape, txn, "copySourceId")?,
@@ -4193,6 +4267,9 @@ fn shape_xml(
         },
         shape.source_id
     );
+    if let Some(master) = shape.master {
+        output.push_str(&format!(" Master=\"{master}\""));
+    }
     if let Some(name) = &shape.name {
         output.push_str(" Name=\"");
         xml_escape(&mut output, name);
@@ -4867,6 +4944,7 @@ mod tests {
         let context = EditCtx::local("t");
         let draft = ShapeDraft {
             name: None,
+            master: None,
             cells: ["Width", "Height", "PinX", "PinY"]
                 .into_iter()
                 .map(|name| CellSnapshot {

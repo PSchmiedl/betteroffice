@@ -6,7 +6,8 @@ use yrs::{Doc, Map, MapPrelim, Out, ReadTxn, Transact, WriteTxn};
 
 use super::{
     ShapeOrigin, insert_shape, largest_shape_id, map_ref, map_string, materialize_shape,
-    required_map, required_string, shape_from_snapshot, shape_origin, validate_shape_draft,
+    required_map, required_string, shape_from_snapshot, shape_origin, validate_draft_master,
+    validate_shape_draft,
 };
 use crate::{
     CONNECTS, ConnectedShapeReceipt, ConnectorGlue, DiagramSession, EditCtx, EditError, EditResult,
@@ -140,6 +141,7 @@ impl DiagramSession {
         from: &ConnectorGlue,
     ) -> EditResult<()> {
         let mut package = self.package()?;
+        validate_draft_master(&package, draft)?;
         let snapshot = self.snapshot()?;
         let page = snapshot
             .pages
@@ -162,6 +164,7 @@ impl DiagramSession {
             id: String::new(),
             source_id,
             name: draft.name.clone(),
+            master: draft.master,
             cells: draft.cells.clone(),
             children: Vec::new(),
             copy_source_id: None,
@@ -247,6 +250,8 @@ impl DiagramSession {
         to_cell: Option<&str>,
     ) -> EditResult<()> {
         let mut package = self.package()?;
+        validate_draft_master(&package, shape_draft)?;
+        validate_draft_master(&package, connector_draft)?;
         let snapshot = self.snapshot()?;
         let page = snapshot
             .pages
@@ -275,6 +280,7 @@ impl DiagramSession {
                 id: String::new(),
                 source_id,
                 name: draft.name.clone(),
+                master: draft.master,
                 cells: draft.cells.clone(),
                 children: Vec::new(),
                 copy_source_id: None,
@@ -330,6 +336,7 @@ impl DiagramSession {
         glue: &[(GlueEndpoint, &ConnectorGlue); 2],
     ) -> EditResult<()> {
         let mut package = self.package()?;
+        validate_draft_master(&package, draft)?;
         let snapshot = self.snapshot()?;
         let page = snapshot
             .pages
@@ -350,6 +357,7 @@ impl DiagramSession {
             id: String::new(),
             source_id,
             name: draft.name.clone(),
+            master: draft.master,
             cells: draft.cells.clone(),
             children: Vec::new(),
             copy_source_id: None,
@@ -739,6 +747,7 @@ mod tests {
     fn rect_draft(pin_x: &str, pin_y: &str) -> ShapeDraft {
         ShapeDraft {
             name: None,
+            master: None,
             cells: [
                 ("Width", "1"),
                 ("Height", "1"),
@@ -756,6 +765,7 @@ mod tests {
     fn connector_draft() -> ShapeDraft {
         ShapeDraft {
             name: Some("Connector".to_owned()),
+            master: None,
             cells: [
                 ("OneD", "1"),
                 ("BeginX", "1"),
@@ -868,6 +878,7 @@ mod tests {
                 "page:1",
                 &ShapeDraft {
                     name: None,
+                    master: None,
                     cells: target_cells,
                 },
             )
@@ -993,7 +1004,11 @@ mod tests {
         let mut cells = rect_draft(pin_x, pin_y).cells;
         cells.push(connection_cell("X", "0.5"));
         cells.push(connection_cell("Y", "0.5"));
-        ShapeDraft { name: None, cells }
+        ShapeDraft {
+            name: None,
+            master: None,
+            cells,
+        }
     }
 
     #[test]
@@ -1344,6 +1359,7 @@ mod tests {
                     "page:1",
                     &ShapeDraft {
                         name: None,
+                        master: None,
                         cells: Vec::new(),
                     },
                     &ConnectorGlue {

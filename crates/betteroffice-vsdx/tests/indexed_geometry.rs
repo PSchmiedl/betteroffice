@@ -87,6 +87,7 @@ fn indexed_geometry_drafts_keep_distinct_sections_when_added() {
     let snapshot = session.snapshot().unwrap();
     let draft = ShapeDraft {
         name: Some("copy".into()),
+        master: None,
         cells: snapshot.pages[0].shapes[0]
             .cells
             .iter()
@@ -138,6 +139,7 @@ fn concurrent_layer_reorders_and_deletion_remain_serializable() {
         "page:1",
         &ShapeDraft {
             name: Some("copy".into()),
+            master: None,
             cells,
         },
     )

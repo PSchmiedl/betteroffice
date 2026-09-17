@@ -1,6 +1,6 @@
 import initWasmModule, { VsdxDocument, VsdxRenderer, rendererVersion } from './generated/vsdx_wasm.js';
 import type { InitInput } from './generated/vsdx_wasm.js';
-import type { CellLocator, CellFormulaReceipt, CollaborationUpdateOrigin, ConnectedShapeReceipt, ConnectorGlue, ConnectorRoutePoint, ConnectorRouteReceipt, DiagramSnapshot, FormulaShapeDraft, FormulaShapeTreeDraft, HistoryResult, HitTestResult, PageDisplayList, PageLayer, ShapeReceipt, ShapeTreeGlue, TextReceipt, VsdxFontFace } from '../types';
+import type { CellLocator, CellFormulaReceipt, CollaborationUpdateOrigin, ConnectedShapeReceipt, ConnectorGlue, ConnectorRoutePoint, ConnectorRouteReceipt, DiagramSnapshot, DocumentMaster, FormulaShapeDraft, FormulaShapeTreeDraft, HistoryResult, HitTestResult, PageDisplayList, PageLayer, ShapeReceipt, ShapeTreeGlue, TextReceipt, VsdxFontFace } from '../types';
 
 export type WasmInitInput = InitInput | Promise<InitInput>;
 export interface OpenDiagramOptions { clientId?: number; fonts?: ReadonlyArray<VsdxFontFace>; initialUpdate?: Uint8Array; }
@@ -8,6 +8,7 @@ export interface CollaborationResync { update: Uint8Array; }
 export interface DiagramHandle {
   readonly clientId: number;
   snapshot(): DiagramSnapshot;
+  masters(): DocumentMaster[];
   registerFont(face: VsdxFontFace): number;
   layoutPage(pageIndex: number): PageDisplayList;
   exportPdf(): Uint8Array;
@@ -122,6 +123,13 @@ export function openDiagram(bytes: Uint8Array, options: OpenDiagramOptions = {})
   const json = <T>(operation: () => string, drainUpdates = false): T => JSON.parse(wasm(operation, drainUpdates)) as T;
   return {
     clientId: doc.clientId, snapshot: () => json(() => doc.snapshotJson()),
+    masters: () => {
+      const masters = json<DocumentMaster[]>(() => renderer.masterPreviewsJson(doc));
+      for (const master of masters) {
+        if (master.display && master.display.contractVersion !== 6) throw new Error(`unsupported VSDX display-list contract version ${master.display.contractVersion}`);
+      }
+      return masters;
+    },
     registerFont: face => wasm(() => renderer.registerFont(face.family, face.bold ?? false, face.italic ?? false, face.bytes)),
     pageLayers: pageIndex => json(() => renderer.pageLayersJson(doc, pageIndex)),
     setLayerVisible: (pagePartPath, layerIndex, visible) => wasm(() => renderer.setLayerVisible(pagePartPath, layerIndex, visible)),
