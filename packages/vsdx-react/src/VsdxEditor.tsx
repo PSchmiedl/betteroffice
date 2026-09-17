@@ -22,8 +22,8 @@ import { DrawingExplorer } from './components/explorer/DrawingExplorer';
 import { shapeStencils, stencilShapeById } from './components/shapes/shapeLibrary';
 import type { StandardShape } from './components/shapes/shapeLibrary';
 import { StatusBar, clampZoom } from './components/statusbar';
-import { paintDragPreview, paintSelectionFrame, passedDragThreshold, previewOutline, hitTestSelection, hitTestControlHandles, controlCellWriteBlocked, controlHandleCanvasPositions, controlHandlesForShape, isPrintableEntryKey, paintControlHandles, resolveControlDrag, resolveDragGeometry, resolveNudgeGeometry, resolveRotationAngle, resizeCursor, canvasKeyboardIntent, shapeLocalToPage, textEditOverlay, withoutTextBox } from './interactions';
-import type { ControlDrag, DragStart, ResizeHandle } from './interactions';
+import { paintDragPreview, paintSelectionFrame, passedDragThreshold, previewOutline, hitTestSelection, isOwnedBrowserShortcut, hitTestControlHandles, controlCellWriteBlocked, controlHandleCanvasPositions, controlHandlesForShape, isPrintableEntryKey, paintControlHandles, resolveControlDrag, resolveDragGeometry, resolveNudgeGeometry, resolveRotationAngle, resizeCursor, canvasKeyboardIntent, shapeLocalToPage, textEditOverlay, withoutTextBox } from './interactions';
+import type { CanvasKeyboardIntent, ControlDrag, DragStart, ResizeHandle } from './interactions';
 import { collectSnapTargets, paintGrid, paintSmartGuides, snapRelease, GRID_SPACING_IN } from './snap';
 import type { SnapTargets } from './snap';
 export { resolveDragGeometry };
@@ -254,6 +254,13 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   useEffect(() => {
     if (sessionSwitchBlocked) reportError(new Error('Save your changes before switching collaboration sessions.'));
   }, [sessionSwitchBlocked, reportError]);
+
+  useEffect(() => {
+    if ((!dirty && editing === null) || typeof window === 'undefined') return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [dirty, editing]);
 
   const hasDocument = model.snapshot !== null;
   useEffect(() => {
@@ -1100,6 +1107,15 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     clearAutoConnect();
     setConnectorMode((value) => !value);
   }, []);
+  const runKeyboardIntent = (intent: CanvasKeyboardIntent) => {
+    const commands = commandsRef.current;
+    if (intent.kind === 'undo') { if (commands?.undo.enabled) commands.undo.run(); return; }
+    if (intent.kind === 'redo') { if (commands?.redo.enabled) commands.redo.run(); return; }
+    if (intent.kind === 'delete') { if (commands?.delete.enabled) commands.delete.run(); return; }
+    if (intent.kind === 'save') { if (commands?.download.enabled) commands.download.run(); return; }
+    if (intent.kind === 'escape') { cancelActiveDrag(); hideAutoConnect(); closeContextMenu(); setSelection(null); return; }
+    nudgeSelection(intent.dx, intent.dy);
+  };
   const onCanvasKeyDown = (event: KeyboardEvent<HTMLCanvasElement>) => {
     if (event.altKey && event.key === '3') { event.preventDefault(); toggleConnector(); return; }
     const selected = selectionRef.current;
@@ -1109,13 +1125,21 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     }
     const intent = canvasKeyboardIntent(event, zoomRef.current);
     if (!intent) return;
+    if (editingRef.current) return;
     event.preventDefault();
-    const commands = commandsRef.current;
-    if (intent.kind === 'undo') { if (commands?.undo.enabled) commands.undo.run(); return; }
-    if (intent.kind === 'redo') { if (commands?.redo.enabled) commands.redo.run(); return; }
-    if (intent.kind === 'delete') { if (commands?.delete.enabled) commands.delete.run(); return; }
-    if (intent.kind === 'escape') { cancelActiveDrag(); hideAutoConnect(); closeContextMenu(); setSelection(null); return; }
-    nudgeSelection(intent.dx, intent.dy);
+    runKeyboardIntent(intent);
+  };
+  const onEditorKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.defaultPrevented) return;
+    const intent = canvasKeyboardIntent(event, zoomRef.current);
+    if (intent) {
+      if (intent.kind !== 'save' && intent.kind !== 'undo' && intent.kind !== 'redo') return;
+      event.preventDefault();
+      if (editingRef.current) return;
+      runKeyboardIntent(intent);
+      return;
+    }
+    if (isOwnedBrowserShortcut(event)) event.preventDefault();
   };
   const onCanvasFocus = (event: FocusEvent<HTMLCanvasElement>) => { event.currentTarget.style.outline = '2px solid #0f6cbd'; event.currentTarget.style.outlineOffset = '2px'; };
   const onCanvasBlur = (event: FocusEvent<HTMLCanvasElement>) => { event.currentTarget.style.outline = ''; event.currentTarget.style.outlineOffset = ''; };
@@ -1218,7 +1242,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const editOverlay = editing && model.frame && editedTextId ? textEditOverlay(model.frame, editedTextId, zoom) : null;
   const integrity = diagnostics.filter((diagnostic) => diagnostic.category === 'integrity');
   const fidelity = diagnostics.filter((diagnostic) => diagnostic.category === 'fidelity');
-  return <div className={className} style={styles.root} aria-label={t('editor.appLabel')}>
+  return <div className={className} style={styles.root} aria-label={t('editor.appLabel')} onKeyDown={onEditorKeyDown}>
     <header style={styles.titleBar}><strong>{t('ribbon.documentName')}</strong><span style={{ color: dirty ? '#a16207' : '#526273' }}>{dirty ? t('ribbon.dirty') : t('ribbon.saved')}</span></header>
     <RibbonCommandsProvider handle={handleRef.current} snapshot={model.snapshot} pageId={model.snapshot?.pages[model.pageIndex]?.id} selection={selection} frame={model.frame} pageBreaks={pageBreakToggle} onMutation={() => refresh(undefined, true)} onError={reportError} onDownload={download}>
     <RibbonCommandsBridge target={commandsRef} />
@@ -1258,7 +1282,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
                 ref={editBoxRef}
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
-                onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); commitTextEdit(); mainCanvasRef.current?.focus(); } else event.stopPropagation(); }}
+                onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); commitTextEdit(); mainCanvasRef.current?.focus(); return; } if (isOwnedBrowserShortcut(event)) event.preventDefault(); event.stopPropagation(); }}
                 aria-label={t('shapes.editingText', { name: editing.shapeId })}
                 rows={1}
                 style={{

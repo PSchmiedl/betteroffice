@@ -20,7 +20,7 @@ export const CONTROL_HANDLE_CSS = 7;
 export const ROTATION_SNAP_STEP = Math.PI / 12;
 export const CANVAS_KEYBOARD_DPI = 96;
 export const CANVAS_KEYBOARD_NUDGE_MULTIPLIER = 10;
-export type CanvasKeyboardIntent = { kind: 'undo' } | { kind: 'redo' } | { kind: 'delete' } | { kind: 'escape' } | { kind: 'nudge'; dx: number; dy: number };
+export type CanvasKeyboardIntent = { kind: 'undo' } | { kind: 'redo' } | { kind: 'delete' } | { kind: 'escape' } | { kind: 'save' } | { kind: 'nudge'; dx: number; dy: number };
 export interface CanvasKeyboardEventLike { key: string; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; target?: unknown; }
 /** One screen pixel in model inches at the given zoom. */
 export const keyboardNudgeStep = (zoom: number): number => {
@@ -42,6 +42,11 @@ export const isEditableKeyboardTarget = (target: unknown): boolean => {
   }
   return false;
 };
+/** Ctrl+S saves the diagram, so it must never reach the browser's own save. */
+export const isOwnedBrowserShortcut = (event: CanvasKeyboardEventLike): boolean => {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey) return false;
+  return event.key.toLowerCase() === 's';
+};
 /** Pure key-to-intent mapping for the editor canvas. Y is up, so ArrowUp yields +dy. */
 export const canvasKeyboardIntent = (event: CanvasKeyboardEventLike, zoom: number): CanvasKeyboardIntent | null => {
   if (isEditableKeyboardTarget(event.target)) return null;
@@ -54,6 +59,7 @@ export const canvasKeyboardIntent = (event: CanvasKeyboardEventLike, zoom: numbe
   if (key === 'Escape') return mod || alt ? null : { kind: 'escape' };
   if (mod && !alt) {
     const lower = key.toLowerCase();
+    if (lower === 's') return { kind: 'save' };
     if (lower === 'z' && !shift) return { kind: 'undo' };
     if (lower === 'y' && !shift) return { kind: 'redo' };
     if (lower === 'z' && shift) return { kind: 'redo' };

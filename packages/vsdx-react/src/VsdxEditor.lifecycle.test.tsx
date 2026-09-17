@@ -515,6 +515,32 @@ test('drag paints a live preview on the overlay and commits the release geometry
   } finally { cleanup(); canvasPrototype.getContext = getContext; }
 });
 
+test('Ctrl+S saves the diagram from anywhere in the editor and never reaches the browser', async () => {
+  const canvasPrototype = Object.getPrototypeOf(document.createElement('canvas')) as HTMLCanvasElement;
+  const getContext = canvasPrototype.getContext;
+  canvasPrototype.getContext = () => new Proxy({}, { get: () => () => {}, set: () => true }) as never;
+  const createObjectURL = URL.createObjectURL;
+  const revokeObjectURL = URL.revokeObjectURL;
+  URL.createObjectURL = (() => 'blob:diagram') as typeof URL.createObjectURL;
+  URL.revokeObjectURL = (() => {}) as typeof URL.revokeObjectURL;
+  let ready: { handle: DiagramHandle; refresh: () => void } | undefined;
+  const view = render(<VsdxEditor file={foundation} fonts={[]} onReady={(api) => { ready = api; }} />);
+  try {
+    await waitFor(() => expect(ready).toBeDefined());
+    const handle = ready!.handle;
+    let saves = 0;
+    const originalSave = handle.save.bind(handle);
+    handle.save = (() => { saves += 1; return originalSave(); }) as DiagramHandle['save'];
+    const header = view.container.querySelector('header') as HTMLElement;
+    expect(fireEvent.keyDown(header, { key: 's', ctrlKey: true })).toBe(false);
+    await act(async () => {});
+    expect(saves).toBe(1);
+    expect(fireEvent.keyDown(header, { key: 'r', ctrlKey: true })).toBe(true);
+    expect(fireEvent.keyDown(header, { key: 'l', ctrlKey: true })).toBe(true);
+    expect(saves).toBe(1);
+  } finally { cleanup(); canvasPrototype.getContext = getContext; URL.createObjectURL = createObjectURL; URL.revokeObjectURL = revokeObjectURL; }
+});
+
 test('a snapped drag commits the point the preview painted, and Alt keeps the raw release', async () => {
   const canvasPrototype = Object.getPrototypeOf(document.createElement('canvas')) as HTMLCanvasElement;
   const getContext = canvasPrototype.getContext;
