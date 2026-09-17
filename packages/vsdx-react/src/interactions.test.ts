@@ -400,3 +400,20 @@ test('enters text edit on a printable key but not on a shortcut or an editable t
   expect(isPrintableEntryKey({ key: 'a', ctrlKey: true })).toBe(false);
   expect(isPrintableEntryKey({ key: 'a', target: { tagName: 'TEXTAREA' } })).toBe(false);
 });
+
+test('a guarded rotation hides the grip stalk and circle but keeps resize handles', () => {
+  const corners = [{ x: 10, y: 40 }, { x: 30, y: 40 }, { x: 30, y: 20 }, { x: 10, y: 20 }];
+  const grip = rotationGripPosition(corners, 2);
+  const calls: string[] = [];
+  const context = new Proxy({ canvas: {} }, {
+    get(target, key) {
+      if (key in target) return Reflect.get(target, key);
+      return (...args: unknown[]) => { calls.push(`${String(key)}:${args.join(',')}`); };
+    },
+    set(target, key, value) { calls.push(`${String(key)}=${String(value)}`); Reflect.set(target, key, value); return true; },
+  }) as unknown as CanvasRenderingContext2D;
+  paintSelectionFrame(context, corners, 2, 2, RESIZE_HANDLES, false);
+  expect(calls.some((entry) => entry === `lineTo:${grip.x},${grip.y}`)).toBe(false);
+  expect(calls.some((entry) => entry.startsWith(`arc:${grip.x},${grip.y},`))).toBe(false);
+  expect(calls.filter((entry) => entry.startsWith('arc:'))).toHaveLength(8);
+});

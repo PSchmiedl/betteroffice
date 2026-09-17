@@ -47,7 +47,9 @@ pub fn paint(
         None
     };
     let stroke = if needs_stroke && value(shape, "LinePattern").is_some_and(|v| v != "0") {
-        let width = number(shape, "LineWeight").unwrap_or(DEFAULT_STROKE_WIDTH) as f32;
+        let width = number(shape, "LineWeight")
+            .filter(|candidate| *candidate > 0.0)
+            .unwrap_or(DEFAULT_STROKE_WIDTH) as f32;
         let width = if width.is_finite() {
             width
         } else {

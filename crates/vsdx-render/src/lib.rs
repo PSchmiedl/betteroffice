@@ -4946,6 +4946,25 @@ mod tests {
     }
 
     #[test]
+    fn non_positive_stroke_width_falls_back_to_the_default() {
+        for weight in ["0", "-2"] {
+            let mut line = shape(1, 1.0, 1.0);
+            with_cell(&mut line, "LineWeight", weight);
+            let list = render(vec![line]);
+            let Primitive::Shape {
+                stroke,
+                diagnostics,
+                ..
+            } = &list.primitives[0]
+            else {
+                panic!("non-positive stroke width did not render");
+            };
+            assert_eq!(stroke.as_ref().unwrap().width, 0.01);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
     fn unresolvable_stroke_defaults_stroke_and_keeps_fill() {
         let mut lined = shape(1, 1.0, 1.0);
         lined.children.retain(

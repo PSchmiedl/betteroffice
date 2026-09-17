@@ -12,12 +12,14 @@
     "fidelity": { "font-substituted": "A font was substituted.", "unsupported-effect": "An effect was rendered differently.", "unsupported-geometry": "A shape was approximated." },
     "unknown": "{category} notice: {code}"
   },
-  "errors": { "decodePageImage": "Could not decode page image", "openDiagram": "Could not open diagram", "resizeLocked": "Shape is locked and cannot be resized with handles." },
+  "errors": { "decodePageImage": "Could not decode page image", "openDiagram": "Could not open diagram", "resizeLocked": "Shape is locked and cannot be resized with handles.", "rotationGuarded": "Shape rotation is guarded and cannot be changed with the grip." },
   "ribbon": {
     "label": "Diagram ribbon",
     "tabsLabel": "Ribbon tabs",
     "empty": "No commands here yet",
     "documentName": "Diagram",
+    "lineWeightHint": "positive length, e.g. 0.018",
+    "linePattern": { "none": "None", "solid": "Solid", "indexed": "Pattern {index}", "custom": "Custom ({value})", "unset": "\u2014" },
     "saved": "Saved",
     "dirty": "Unsaved changes",
     "tabs": { "file": "File", "home": "Home", "insert": "Insert", "shape": "Shape", "design": "Design", "review": "Review", "view": "View", "help": "Help" },
