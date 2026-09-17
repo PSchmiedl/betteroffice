@@ -129,11 +129,24 @@ pub struct ShapeSnapshot {
     pub outline: Option<ShapeOutline>,
     pub resolved_outline_color: Option<String>,
     pub media_part_path: Option<String>,
+    /// A picture added locally: its bytes have no part of their own yet, so
+    /// `save` mints one. Absent for pictures loaded from the source package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_media: Option<PendingMedia>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blip_effects: Vec<BlipEffect>,
     pub graphic: Option<GraphicFrameData>,
     pub text_stories: Vec<StorySnapshot>,
     pub children: Vec<ShapeSnapshot>,
+}
+
+/// A locally added picture's bytes, kept base64-encoded so a `snapshotJson`
+/// call stays a JSON string rather than exploding into a number array.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingMedia {
+    pub content_type: String,
+    pub base64: String,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -259,6 +272,14 @@ pub struct PresetShapeDraft {
     pub geometry: String,
     pub rect: ShapeRect,
     pub fill: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PictureDraft {
+    pub name: String,
+    pub rect: ShapeRect,
+    pub content_type: String,
+    pub media_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

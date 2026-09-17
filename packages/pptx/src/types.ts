@@ -114,6 +114,8 @@ export interface ShapeSnapshot {
   outline: ShapeOutline | null;
   resolvedOutlineColor: string | null;
   mediaPartPath: string | null;
+  /** Set only for a picture added locally and not yet saved. */
+  pendingMedia?: { contentType: string; base64: string } | null;
   blipEffects?: BlipEffect[];
   graphic: unknown | null;
   textStories: StorySnapshot[];
@@ -207,6 +209,15 @@ export interface PresetShapeDraft {
   geometry: string;
   rect: ShapeRect;
   fill?: string | null;
+}
+
+export interface PictureDraft {
+  name: string;
+  rect: ShapeRect;
+  /** The image's MIME type, e.g. `image/png`. */
+  contentType: string;
+  /** The image bytes, base64-encoded. */
+  mediaBase64: string;
 }
 
 export interface ShapeStroke {

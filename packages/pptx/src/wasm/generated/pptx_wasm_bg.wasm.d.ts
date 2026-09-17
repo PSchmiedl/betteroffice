@@ -15,6 +15,7 @@ export const rendererVersion: () => [number, number];
 export const __wbg_pptxdocument_free: (a: number, b: number) => void;
 export const pptxdocument_acceptProposalJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_addCommentJson: (a: number, b: number, c: number) => [number, number, number, number];
+export const pptxdocument_addPictureJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_addShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_addTextBoxJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_applyUpdateJson: (a: number, b: number, c: number) => [number, number, number, number];

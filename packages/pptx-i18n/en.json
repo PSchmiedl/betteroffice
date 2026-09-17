@@ -18,6 +18,7 @@
     "deleteSlide": "Delete slide",
     "objectsLabel": "Objects",
     "addTextBox": "Add text box",
+    "insertImage": "Insert image",
     "groups": {
       "file": "File",
       "slides": "Slides",
@@ -95,7 +96,8 @@
     "openPrompt": "Open a PPTX file"
   },
   "objects": {
-    "defaultTextBoxName": "Text Box"
+    "defaultTextBoxName": "Text Box",
+    "defaultPictureName": "Picture"
   },
   "presentation": {
     "label": "Slide presentation",

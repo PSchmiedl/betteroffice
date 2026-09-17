@@ -7,6 +7,7 @@ export class PptxDocument {
     [Symbol.dispose](): void;
     acceptProposalJson(args: string): string;
     addCommentJson(args: string): string;
+    addPictureJson(args: string): string;
     addShapeJson(args: string): string;
     addTextBoxJson(args: string): string;
     applyUpdateJson(update: Uint8Array): string;
@@ -102,6 +103,7 @@ export interface InitOutput {
     readonly __wbg_pptxdocument_free: (a: number, b: number) => void;
     readonly pptxdocument_acceptProposalJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly pptxdocument_addCommentJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly pptxdocument_addPictureJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly pptxdocument_addShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly pptxdocument_addTextBoxJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly pptxdocument_applyUpdateJson: (a: number, b: number, c: number) => [number, number, number, number];

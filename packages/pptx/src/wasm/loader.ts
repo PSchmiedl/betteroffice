@@ -20,6 +20,7 @@ import type {
   HistoryResult,
   HitTestResult,
   ParagraphAlignment,
+  PictureDraft,
   PresetShapeDraft,
   PptxFontFace,
   PptxTextMatch,
@@ -93,6 +94,7 @@ export interface PresentationHandle extends CollaborationReplica {
   setSlideNotes(slideId: string, text: string): void;
   addTextBox(slideId: string, draft: ShapeDraft): ShapeReceipt;
   addShape(slideId: string, draft: PresetShapeDraft): ShapeReceipt;
+  addPicture(slideId: string, draft: PictureDraft): ShapeReceipt;
   setShapeFill(slideId: string, shapeId: string, color: string | null): ShapeFillReceipt;
   setShapeStroke(
     slideId: string,
@@ -471,6 +473,9 @@ export function openPresentation(
     },
     addShape(slideId, draft): ShapeReceipt {
       return jsonWasmCall(() => doc.addShapeJson(JSON.stringify({ slideId, draft })), true);
+    },
+    addPicture(slideId, draft): ShapeReceipt {
+      return jsonWasmCall(() => doc.addPictureJson(JSON.stringify({ slideId, ...draft })), true);
     },
     setShapeFill(slideId, shapeId, color): ShapeFillReceipt {
       return jsonWasmCall(

@@ -56,6 +56,7 @@ export type {
   Paint,
   ParagraphAlignment,
   ParagraphSnapshot,
+  PictureDraft,
   PlaceholderPrimitive,
   PositionedGlyph,
   PositionedTextLine,

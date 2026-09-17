@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use yrs::Subscription;
 
 use crate::{
-    CommentFlavor, DeckSession, DeckSnapshot, EditCtx, PresetShapeDraft, ShapeDraft, ShapeRect,
-    ShapeStroke, TextStyle, TextStylePatch, UpdateEvent, UpdateOrigin,
+    CommentFlavor, DeckSession, DeckSnapshot, EditCtx, PictureDraft, PresetShapeDraft, ShapeDraft,
+    ShapeRect, ShapeStroke, TextStyle, TextStylePatch, UpdateEvent, UpdateOrigin,
 };
 
 #[wasm_bindgen]
@@ -165,6 +166,17 @@ struct AddTextBoxArgs {
 struct AddShapeArgs {
     slide_id: String,
     draft: PresetShapeDraft,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddPictureArgs {
+    slide_id: String,
+    name: String,
+    rect: ShapeRect,
+    content_type: String,
+    /// The image bytes, base64-encoded: JSON has no binary payload of its own.
+    media_base64: String,
 }
 
 #[derive(Deserialize)]
@@ -347,6 +359,19 @@ impl PptxDocument {
 
     #[wasm_bindgen(js_name = mediaBytes)]
     pub fn media_bytes(&self, part_path: &str) -> Result<Vec<u8>, JsValue> {
+        if let Some(shape_id) = part_path.strip_prefix("pending-media:") {
+            let snapshot = self.session.snapshot().map_err(js_error)?;
+            let pending = snapshot
+                .slides
+                .iter()
+                .flat_map(|slide| &slide.shapes)
+                .find(|shape| shape.id == shape_id)
+                .and_then(|shape| shape.pending_media.as_ref())
+                .ok_or_else(|| JsValue::from_str("pending media was not found"))?;
+            return base64::engine::general_purpose::STANDARD
+                .decode(&pending.base64)
+                .map_err(|error| JsValue::from_str(&error.to_string()));
+        }
         self.session
             .package()
             .media
@@ -632,6 +657,25 @@ impl PptxDocument {
         json(
             self.session
                 .add_shape(&local_context(), &args.slide_id, &args.draft)
+                .map_err(js_error)?,
+        )
+    }
+
+    #[wasm_bindgen(js_name = addPictureJson)]
+    pub fn add_picture_json(&self, args: &str) -> Result<String, JsValue> {
+        let args: AddPictureArgs = parse_args(args)?;
+        let media_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&args.media_base64)
+            .map_err(|error| js_error(format!("invalid image data: {error}")))?;
+        let draft = PictureDraft {
+            name: args.name,
+            rect: args.rect,
+            content_type: args.content_type,
+            media_bytes,
+        };
+        json(
+            self.session
+                .add_picture(&local_context(), &args.slide_id, &draft)
                 .map_err(js_error)?,
         )
     }

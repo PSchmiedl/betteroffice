@@ -465,6 +465,70 @@ fn a_shape_added_to_an_emptied_slide_lands_after_the_group_properties() {
 }
 
 #[test]
+fn an_added_picture_mints_its_media_part_content_type_and_relationship() {
+    let session = open();
+    let slide_id = session.snapshot().unwrap().slides[0].id.clone();
+    let png_bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+    session
+        .add_picture(
+            &context(),
+            &slide_id,
+            &pptx_edit::PictureDraft {
+                name: "Logo".to_owned(),
+                rect: pptx_edit::ShapeRect {
+                    x: 10,
+                    y: 20,
+                    width: 3_000,
+                    height: 4_000,
+                },
+                content_type: "image/png".to_owned(),
+                media_bytes: png_bytes.clone(),
+            },
+        )
+        .unwrap();
+
+    let saved = parts(&session.save().unwrap());
+    assert_relationships_resolve(&saved);
+
+    let content_types = part_text(&saved, "[Content_Types].xml");
+    assert!(
+        content_types.contains(r#"Extension="png""#),
+        "{content_types}"
+    );
+    assert!(
+        content_types.contains(r#"ContentType="image/png""#),
+        "{content_types}"
+    );
+
+    let media = saved
+        .get("ppt/media/image1.png")
+        .expect("the picture's bytes land in a fresh media part");
+    assert_eq!(media, &png_bytes);
+
+    let slide_rels = part_text(&saved, "ppt/slides/_rels/slide1.xml.rels");
+    assert!(
+        slide_rels
+            .contains("http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"),
+        "{slide_rels}"
+    );
+    assert!(
+        slide_rels.contains(r#"Target="../media/image1.png""#),
+        "{slide_rels}"
+    );
+    // The slide already had rId1 (layout) and rId2 (hyperlink); the image gets its own id.
+    assert!(slide_rels.contains(r#"Id="rId3""#), "{slide_rels}");
+    assert!(slide_rels.contains(r#"Id="rId1""#), "{slide_rels}");
+    assert!(slide_rels.contains(r#"Id="rId2""#), "{slide_rels}");
+
+    let slide = part_text(&saved, "ppt/slides/slide1.xml");
+    assert!(slide.contains(r#"<p:pic>"#), "{slide}");
+    assert!(slide.contains(r#"name="Logo""#), "{slide}");
+    assert!(slide.contains(r#"r:embed="rId3""#), "{slide}");
+    assert!(slide.contains(r#"<a:off x="10" y="20"/>"#), "{slide}");
+    assert!(slide.contains(r#"<a:ext cx="3000" cy="4000"/>"#), "{slide}");
+}
+
+#[test]
 fn junk_style_values_are_rejected_at_the_edit() {
     let session = open();
     let snapshot = session.snapshot().unwrap();
