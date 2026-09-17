@@ -220,8 +220,8 @@ export function createRibbonCommands(
     undo: { id: 'undo', enabled: Boolean(handle?.canUndo()), run: execute((currentHandle) => { currentHandle.undo(); }) },
     redo: { id: 'redo', enabled: Boolean(handle?.canRedo()), run: execute((currentHandle) => { currentHandle.redo(); }) },
     delete: { id: 'delete', enabled: selected && !isDeleteBlocked(shape), run: execute((currentHandle, currentSelection) => { currentHandle.deleteShape(currentSelection!.pageId, currentSelection!.shapeId); }, true) },
-    fillColor: { id: 'fillColor', enabled: selected, value: swatch.fill ?? color(cellValue(shape, 'FillForegnd'), '#000000'), run: (value?: string) => formula('FillForegnd', colorFormula(value))() },
-    lineColor: { id: 'lineColor', enabled: selected, value: swatch.line ?? color(cellValue(shape, 'LineColor'), '#000000'), run: (value?: string) => formula('LineColor', colorFormula(value))() },
+    fillColor: { id: 'fillColor', enabled: selected && !isCellWriteBlocked(shape, 'FillForegnd'), value: swatch.fill ?? color(cellValue(shape, 'FillForegnd'), '#000000'), run: (value?: string) => formula('FillForegnd', colorFormula(value))() },
+    lineColor: { id: 'lineColor', enabled: selected && !isCellWriteBlocked(shape, 'LineColor'), value: swatch.line ?? color(cellValue(shape, 'LineColor'), '#000000'), run: (value?: string) => formula('LineColor', colorFormula(value))() },
     lineWeight: {
       id: 'lineWeight', enabled: selected, value: cellFormula(shape, 'LineWeight'), run: (value?: string) => {
         if (value === undefined) return;
