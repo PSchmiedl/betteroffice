@@ -32,6 +32,12 @@ export interface StandardShape {
   draft: (x: number, y: number, width: number, height: number) => FormulaShapeDraft;
 }
 
+export interface ShapeStencil {
+  id: string;
+  nameKey: TranslationKey;
+  shapes: readonly StandardShape[];
+}
+
 /** Height of every default insert box, in inches; the width follows the master's aspect ratio. */
 const DEFAULT_SHAPE_HEIGHT_IN = 1;
 
@@ -321,6 +327,135 @@ export const standardShapes: readonly StandardShape[] = [
   polygonShape('star16'),
 ];
 
+export const arrowVertices: Readonly<Record<string, readonly Point[]>> = {
+  arrowRight: [[0, 0.35], [0.6, 0.35], [0.6, 0.15], [1, 0.5], [0.6, 0.85], [0.6, 0.65], [0, 0.65]],
+  arrowLeft: [[1, 0.35], [0.4, 0.35], [0.4, 0.15], [0, 0.5], [0.4, 0.85], [0.4, 0.65], [1, 0.65]],
+  arrowUp: [[0.35, 0], [0.35, 0.6], [0.15, 0.6], [0.5, 1], [0.85, 0.6], [0.65, 0.6], [0.65, 0]],
+  arrowDown: [[0.35, 1], [0.35, 0.4], [0.15, 0.4], [0.5, 0], [0.85, 0.4], [0.65, 0.4], [0.65, 1]],
+  arrowDoubleHorizontal: [[0, 0.5], [0.2, 0.15], [0.2, 0.35], [0.8, 0.35], [0.8, 0.15], [1, 0.5], [0.8, 0.85], [0.8, 0.65], [0.2, 0.65], [0.2, 0.85]],
+  arrowDoubleVertical: [[0.5, 0], [0.15, 0.2], [0.35, 0.2], [0.35, 0.8], [0.15, 0.8], [0.5, 1], [0.85, 0.8], [0.65, 0.8], [0.65, 0.2], [0.85, 0.2]],
+};
+
+function arrowShape(id: keyof typeof arrowVertices, extraRows: readonly GeometryRow[] = []): StandardShape {
+  return shapeFrom(id, polygonPath(arrowVertices[id], extraRows));
+}
+
+function arcPoint(center: Point, radii: Point, angle: number): Point {
+  return [cleanNumber(center[0] + radii[0] * Math.cos(angle)), cleanNumber(center[1] + radii[1] * Math.sin(angle))];
+}
+
+const curvedArrowRadii: Point = [0.32, 0.32];
+const curvedArrowSweep = (140 * Math.PI) / 180;
+
+function curvedArrowPath(center: Point, start: number, sweep: number, head: readonly [Point, Point, Point]): GeometryPath {
+  return curvedPath([
+    { type: 'MoveTo', end: arcPoint(center, curvedArrowRadii, start) },
+    arc(center, curvedArrowRadii, start, sweep),
+    { type: 'MoveTo', end: head[0] },
+    { type: 'LineTo', end: head[1] },
+    { type: 'LineTo', end: head[2] },
+    { type: 'Close' },
+  ]);
+}
+
+const degrees = (value: number) => (value * Math.PI) / 180;
+
+const curvedArrowRightPath = curvedArrowPath([0.35, 0.2], degrees(160), -curvedArrowSweep, [[0.9, 0.31], [0.65, 0.43], [0.65, 0.19]]);
+const curvedArrowLeftPath = curvedArrowPath([0.65, 0.2], degrees(20), curvedArrowSweep, [[0.1, 0.31], [0.35, 0.19], [0.35, 0.43]]);
+const curvedArrowUpPath = curvedArrowPath([0.2, 0.35], degrees(-70), curvedArrowSweep, [[0.31, 0.9], [0.19, 0.65], [0.43, 0.65]]);
+const curvedArrowDownPath = curvedArrowPath([0.2, 0.65], degrees(70), -curvedArrowSweep, [[0.31, 0.1], [0.43, 0.35], [0.19, 0.35]]);
+
+const lineArrowRightPath = curvedPath([
+  { type: 'MoveTo', end: [0, 0.5] },
+  { type: 'LineTo', end: [0.76, 0.5] },
+  { type: 'MoveTo', end: [1, 0.5] },
+  { type: 'LineTo', end: [0.76, 0.62] },
+  { type: 'LineTo', end: [0.76, 0.38] },
+  { type: 'Close' },
+]);
+
+const lineArrowLeftPath = curvedPath([
+  { type: 'MoveTo', end: [1, 0.5] },
+  { type: 'LineTo', end: [0.24, 0.5] },
+  { type: 'MoveTo', end: [0, 0.5] },
+  { type: 'LineTo', end: [0.24, 0.38] },
+  { type: 'LineTo', end: [0.24, 0.62] },
+  { type: 'Close' },
+]);
+
+const lineArrowUpPath = curvedPath([
+  { type: 'MoveTo', end: [0.5, 0] },
+  { type: 'LineTo', end: [0.5, 0.76] },
+  { type: 'MoveTo', end: [0.5, 1] },
+  { type: 'LineTo', end: [0.38, 0.76] },
+  { type: 'LineTo', end: [0.62, 0.76] },
+  { type: 'Close' },
+]);
+
+const lineArrowDownPath = curvedPath([
+  { type: 'MoveTo', end: [0.5, 1] },
+  { type: 'LineTo', end: [0.5, 0.24] },
+  { type: 'MoveTo', end: [0.5, 0] },
+  { type: 'LineTo', end: [0.62, 0.24] },
+  { type: 'LineTo', end: [0.38, 0.24] },
+  { type: 'Close' },
+]);
+
+const lineHorizontalPath = curvedPath([
+  { type: 'MoveTo', end: [0, 0.5] },
+  { type: 'LineTo', end: [1, 0.5] },
+]);
+
+const lineVerticalPath = curvedPath([
+  { type: 'MoveTo', end: [0.5, 0] },
+  { type: 'LineTo', end: [0.5, 1] },
+]);
+
+const lineDiagonalPath = curvedPath([
+  { type: 'MoveTo', end: [0.05, 0.05] },
+  { type: 'LineTo', end: [0.95, 0.95] },
+]);
+
+const lineElbowPath = curvedPath([
+  { type: 'MoveTo', end: [0.05, 0.7] },
+  { type: 'LineTo', end: [0.55, 0.7] },
+  { type: 'LineTo', end: [0.55, 0.3] },
+]);
+
+export const arrowShapes: readonly StandardShape[] = [
+  arrowShape('arrowRight'),
+  arrowShape('arrowLeft'),
+  arrowShape('arrowUp'),
+  arrowShape('arrowDown'),
+  arrowShape('arrowDoubleHorizontal'),
+  arrowShape('arrowDoubleVertical'),
+  shapeFrom('curvedArrowRight', curvedArrowRightPath),
+  shapeFrom('curvedArrowLeft', curvedArrowLeftPath),
+  shapeFrom('curvedArrowUp', curvedArrowUpPath),
+  shapeFrom('curvedArrowDown', curvedArrowDownPath),
+  shapeFrom('lineArrowRight', lineArrowRightPath),
+  shapeFrom('lineArrowLeft', lineArrowLeftPath),
+  shapeFrom('lineArrowUp', lineArrowUpPath),
+  shapeFrom('lineArrowDown', lineArrowDownPath),
+  shapeFrom('lineHorizontal', lineHorizontalPath),
+  shapeFrom('lineVertical', lineVerticalPath),
+  shapeFrom('lineDiagonal', lineDiagonalPath),
+  shapeFrom('lineElbow', lineElbowPath),
+];
+
+export const shapeStencils: readonly ShapeStencil[] = [
+  { id: 'standard', nameKey: 'shapesPanel.standardShapes', shapes: standardShapes },
+  { id: 'arrows', nameKey: 'shapesPanel.arrowShapes', shapes: arrowShapes },
+];
+
 export function standardShapeById(id: string): StandardShape | undefined {
   return standardShapes.find((shape) => shape.id === id);
+}
+
+export function stencilShapeById(id: string): StandardShape | undefined {
+  for (const stencil of shapeStencils) {
+    const shape = stencil.shapes.find((candidate) => candidate.id === id);
+    if (shape) return shape;
+  }
+  return undefined;
 }

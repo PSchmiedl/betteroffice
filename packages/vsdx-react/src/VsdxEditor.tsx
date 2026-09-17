@@ -15,7 +15,7 @@ import { STENCIL_DRAG_MIME, ShapesPanel } from './components/shapes/ShapesPanel'
 import { LayersPanel } from './components/layers/LayersPanel';
 import { ShapeDataPanel } from './components/shapeData/ShapeDataPanel';
 import { DrawingExplorer } from './components/explorer/DrawingExplorer';
-import { standardShapeById, standardShapes } from './components/shapes/shapeLibrary';
+import { shapeStencils, stencilShapeById } from './components/shapes/shapeLibrary';
 import type { StandardShape } from './components/shapes/shapeLibrary';
 import { StatusBar, clampZoom } from './components/statusbar';
 import { paintDragPreview, paintSelectionFrame, passedDragThreshold, previewOutline, hitTestSelection, hitTestControlHandles, controlCellWriteBlocked, controlHandleCanvasPositions, controlHandlesForShape, isPrintableEntryKey, paintControlHandles, resolveControlDrag, resolveDragGeometry, resolveNudgeGeometry, resolveRotationAngle, resizeCursor, canvasKeyboardIntent, shapeLocalToPage, textEditOverlay, withoutTextBox } from './interactions';
@@ -95,6 +95,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const [explorerCollapsed, setExplorerCollapsed] = useState(false);
   const [showPageBreaks, setShowPageBreaks] = useState(false);
   const pageBreakToggle = useMemo(() => ({ shown: showPageBreaks, toggle: () => setShowPageBreaks((value) => !value) }), [showPageBreaks]);
+  const [activeStencilId, setActiveStencilId] = useState(shapeStencils[0].id);
   const [diagnostics, setDiagnostics] = useState<TextDiagnostic[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ top: number; left: number; kind: 'shape' | 'canvas' } | null>(null);
@@ -996,7 +997,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     } catch (value) { reportError(value); }
     hideAutoConnect();
   }, [refresh, reportError]);
-  const quickMenuShapes = useMemo(() => QUICK_SHAPE_IDS.map((id) => standardShapeById(id)).filter((shape): shape is StandardShape => Boolean(shape)), []);
+  const quickMenuShapes = useMemo(() => QUICK_SHAPE_IDS.map((id) => stencilShapeById(id)).filter((shape): shape is StandardShape => Boolean(shape)), []);
   const insertShape = useCallback((shape: StandardShape) => {
     const current = modelRef.current; const frame = current.frame;
     const page = current.snapshot?.pages[current.pageIndex];
@@ -1014,7 +1015,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const onCanvasDrop = (event: DragEvent<HTMLDivElement>) => {
     const frame = modelRef.current.frame; const canvas = mainCanvasRef.current;
     if (!frame || !canvas) return;
-    const shape = standardShapeById(event.dataTransfer.getData(STENCIL_DRAG_MIME).trim());
+    const shape = stencilShapeById(event.dataTransfer.getData(STENCIL_DRAG_MIME).trim());
     if (!shape) return;
     event.preventDefault();
     insertShapeAt(shape, clientPointToModel(frame, canvas.getBoundingClientRect(), event.clientX, event.clientY).model);
@@ -1072,7 +1073,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     {leftPanel === undefined ? (
       <div style={styles.leftColumn}>
         <div style={styles.shapesWrap}>
-          <ShapesPanel shapes={standardShapes} collapsed={shapesCollapsed} onToggleCollapsed={() => setShapesCollapsed((value) => !value)} onInsert={insertShape} t={t} />
+          <ShapesPanel stencils={shapeStencils} activeStencilId={activeStencilId} onSelectStencil={setActiveStencilId} collapsed={shapesCollapsed} onToggleCollapsed={() => setShapesCollapsed((value) => !value)} onInsert={insertShape} t={t} />
         </div>
         <LayersPanel layers={model.layers} collapsed={layersCollapsed} onToggleCollapsed={() => setLayersCollapsed((value) => !value)} onToggleLayer={toggleLayerVisible} t={t} />
       </div>

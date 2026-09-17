@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { createT, en } from '@betteroffice/vsdx-i18n';
-import { polygonVertices, previewPathForVertices, standardShapes } from './shapeLibrary';
+import { arrowShapes, arrowVertices, polygonVertices, previewPathForVertices, shapeStencils, standardShapes, stencilShapeById } from './shapeLibrary';
 
 const t = createT(en);
 
@@ -18,7 +18,7 @@ function defaultSize(shapeId: string) {
 }
 
 test('produces finite, complete formula-only drafts', () => {
-  for (const shape of standardShapes) {
+  for (const shape of [...standardShapes, ...arrowShapes]) {
     for (const cell of shape.draft(Number.NaN, Number.POSITIVE_INFINITY, Number.NaN, Number.NEGATIVE_INFINITY).cells) {
       expect(cell.formula).toBeTruthy();
       expect(cell.formula).not.toMatch(/(?:nan|infinity)/i);
@@ -174,4 +174,54 @@ test('follows the Visio gallery order', () => {
 
 test('resolves every shape name key', () => {
   for (const shape of standardShapes) expect(t(shape.nameKey)).not.toBe(shape.nameKey);
+});
+
+test('derives every arrow polygon preview and geometry from shared vertices', () => {
+  for (const [id, vertices] of Object.entries(arrowVertices)) {
+    const shape = arrowShapes.find((candidate) => candidate.id === id)!;
+    const cells = shape.draft(0, 0, 1, 1).cells.filter((cell) => cell.name === 'X' || cell.name === 'Y').slice(0, vertices.length * 2);
+    expect(shape.preview.startsWith(previewPathForVertices(vertices, shape.defaultSize.width / shape.defaultSize.height))).toBe(true);
+    expect(cells.map((cell) => cell.formula)).toEqual(vertices.flatMap(([x, y]) => [`Width*${x}`, `Height*${y}`]));
+  }
+});
+
+test('scales every arrow coordinate off Width and Height', () => {
+  for (const shape of arrowShapes) {
+    for (const cell of shape.draft(0, 0, 1, 1).cells.filter((cell) => cell.locator.section === 'Geometry')) {
+      if (cell.name === 'X') expect(cell.formula).toMatch(/^Width\*-?\d/);
+      if (cell.name === 'Y') expect(cell.formula).toMatch(/^Height\*-?\d/);
+    }
+  }
+});
+
+test('gives every stencil shape a one-inch box, a distinct preview and a resolved name', () => {
+  const shapes = shapeStencils.flatMap((stencil) => stencil.shapes);
+  expect(new Set(shapes.map((shape) => shape.preview)).size).toBe(shapes.length);
+  expect(new Set(shapes.map((shape) => shape.id)).size).toBe(shapes.length);
+  for (const shape of shapes) {
+    expect(shape.defaultSize.height).toBe(1);
+    expect(t(shape.nameKey)).not.toBe(shape.nameKey);
+  }
+});
+
+test('exposes two stencils covering every shape', () => {
+  expect(shapeStencils.map((stencil) => stencil.id)).toEqual(['standard', 'arrows']);
+  expect(shapeStencils[0].shapes).toEqual(standardShapes);
+  expect(shapeStencils[1].shapes).toEqual(arrowShapes);
+  expect(arrowShapes).toHaveLength(18);
+});
+
+test('follows the Visio arrow stencil order', () => {
+  expect(arrowShapes.map((shape) => shape.id)).toEqual([
+    'arrowRight', 'arrowLeft', 'arrowUp', 'arrowDown', 'arrowDoubleHorizontal', 'arrowDoubleVertical',
+    'curvedArrowRight', 'curvedArrowLeft', 'curvedArrowUp', 'curvedArrowDown',
+    'lineArrowRight', 'lineArrowLeft', 'lineArrowUp', 'lineArrowDown',
+    'lineHorizontal', 'lineVertical', 'lineDiagonal', 'lineElbow',
+  ]);
+});
+
+test('resolves a dropped tile from either stencil', () => {
+  expect(stencilShapeById('rectangle')?.id).toBe('rectangle');
+  expect(stencilShapeById('curvedArrowRight')?.id).toBe('curvedArrowRight');
+  expect(stencilShapeById('not a shape')).toBeUndefined();
 });
