@@ -604,6 +604,7 @@ impl Renderer {
             text_runs: 0,
             primitives: Vec::new(),
             jump_overrides: Vec::new(),
+            connectors: Vec::new(),
         };
         let mut cache = LayoutCache::default();
         let layers = self.effective_page_layers(package, page_part);
@@ -637,6 +638,7 @@ impl Renderer {
             print_height: print_tile.1 as f32 * PIXELS_PER_INCH,
             paint_transform: final_paint_transform(page_height as f32),
             primitives: state.primitives,
+            connectors: state.connectors,
         };
         if !display_list_finite(&list) {
             return Err(RenderError::PageDimensions(
@@ -1059,12 +1061,18 @@ impl Renderer {
         state
             .jump_overrides
             .push(line_jumps::ConnectorJumpOverride {
-                id,
+                id: id.clone(),
                 code: line_jumps::connector_override(package, resolved, "ConLineJumpCode"),
                 style: line_jumps::connector_override(package, resolved, "ConLineJumpStyle"),
                 dir_x: line_jumps::connector_override(package, resolved, "ConLineJumpDirX"),
                 dir_y: line_jumps::connector_override(package, resolved, "ConLineJumpDirY"),
             });
+        state.connectors.push(ConnectorChrome {
+            id,
+            begin: connector_glue(connector, vsdx_resolve::ConnectorEndpoint::Begin),
+            end: connector_glue(connector, vsdx_resolve::ConnectorEndpoint::End),
+            routable: connector_routable(package, references, resolved, shape.id, transforms),
+        });
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -1609,6 +1617,7 @@ struct State {
     text_runs: usize,
     primitives: Vec<Primitive>,
     jump_overrides: Vec<line_jumps::ConnectorJumpOverride>,
+    connectors: Vec<ConnectorChrome>,
 }
 impl State {
     fn next_z(&mut self) -> u32 {
@@ -1668,6 +1677,39 @@ fn connector_route_style(
         return style;
     }
     page_dimension(resolver, package, page_part, "RouteStyle").unwrap_or(0.0)
+}
+/// Free when unglued, point when tied to a connection row, shape otherwise.
+fn connector_glue(
+    connector: &vsdx_resolve::ResolvedConnector,
+    endpoint: vsdx_resolve::ConnectorEndpoint,
+) -> ConnectorEndpointGlue {
+    match connector.glue.iter().find(|glue| glue.endpoint == endpoint) {
+        Some(glue)
+            if glue
+                .to
+                .as_ref()
+                .is_some_and(|target| target.connection_point.is_some()) =>
+        {
+            ConnectorEndpointGlue::Point
+        }
+        Some(glue) if glue.to.is_some() => ConnectorEndpointGlue::Shape,
+        _ => ConnectorEndpointGlue::Free,
+    }
+}
+/// Whether a route filed on this connector would come back out of `connector_geometry`.
+fn connector_routable(
+    package: &VsdxPackage,
+    references: Option<&PageShapeReferences>,
+    resolved: &ResolvedShape,
+    shape_id: u32,
+    transforms: &BTreeMap<u32, SceneTransform>,
+) -> bool {
+    transforms.contains_key(&shape_id)
+        && bounds(package, references, resolved, shape_id).is_some_and(|size| {
+            [size.width, size.height].into_iter().all(f64::is_finite)
+                && size.width != 0.0
+                && size.height != 0.0
+        })
 }
 /// Filed connector waypoints in scene space, or nothing when the file route is unusable.
 fn connector_geometry(
@@ -4243,6 +4285,7 @@ mod tests {
             print_width: 100.0,
             print_height: 100.0,
             paint_transform: final_paint_transform(1.0),
+            connectors: Vec::new(),
             primitives: vec![
                 Primitive::Shape {
                     id: "bottom".into(),
@@ -4994,6 +5037,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn connector_chrome_reports_free_endpoints() {
+        let list = render(vec![unglued_connector(None)]);
+        assert_eq!(
+            list.connectors,
+            vec![ConnectorChrome {
+                id: "page:1".into(),
+                begin: ConnectorEndpointGlue::Free,
+                end: ConnectorEndpointGlue::Free,
+                routable: true,
+            }]
+        );
+    }
+
+    /// A connector drafted without transform cells paints, but a filed route would be dropped.
+    #[test]
+    fn connector_chrome_marks_a_frameless_connector_unroutable() {
+        let mut connector = unglued_connector(None);
+        connector.children.retain(|child| {
+            !matches!(child, ShapeChild::Cell(Cell { name, .. })
+                if matches!(name.as_str(), "Width" | "Height" | "PinX" | "PinY"))
+        });
+        let list = render(vec![connector]);
+        assert_eq!(list.connectors.len(), 1);
+        assert!(!list.connectors[0].routable);
+    }
+
+    #[test]
+    fn connector_chrome_marks_a_connection_point_begin() {
+        let package = glued_connector_package("Connections.X1");
+        let list = Renderer::default().layout_page(&package, "page").unwrap();
+        assert_eq!(
+            list.connectors,
+            vec![ConnectorChrome {
+                id: "page:1".into(),
+                begin: ConnectorEndpointGlue::Point,
+                end: ConnectorEndpointGlue::Free,
+                routable: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn connector_chrome_omits_placeholders() {
+        let package = glued_connector_package("Connections.X9");
+        let list = Renderer::default().layout_page(&package, "page").unwrap();
+        assert!(list.connectors.is_empty());
+    }
+
+    #[test]
+    fn connector_chrome_survives_a_wire_round_trip() {
+        let list = render(vec![unglued_connector(None)]);
+        let decoded: VsdxDisplayList =
+            serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
+        assert_eq!(decoded.connectors, list.connectors);
+        let legacy = serde_json::json!({
+            "contractVersion": CONTRACT_VERSION,
+            "width": 0.0,
+            "height": 0.0,
+            "printWidth": 0.0,
+            "printHeight": 0.0,
+            "paintTransform": { "a": 1.0, "b": 0.0, "c": 0.0, "d": 1.0, "e": 0.0, "f": 0.0 },
+            "primitives": [],
+        });
+        let decoded: VsdxDisplayList = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.connectors.is_empty());
+    }
+
     fn route_fixture_path(page: &str) -> Vec<GeometryPathCommand> {
         let source = include_bytes!("../../vsdx-parse/tests/fixtures/connector-route-style.vsdx");
         let package = vsdx_parse::parse_vsdx(source).unwrap();
@@ -5490,6 +5601,7 @@ mod tests {
             print_height: 0.0,
             paint_transform: final_paint_transform(0.0),
             primitives: vec![],
+            connectors: Vec::new(),
         };
         assert!(list.validate().is_err());
     }
@@ -6110,6 +6222,7 @@ mod tests {
                     lines: Vec::new(),
                     transform: Affine::identity(),
                 }],
+                connectors: Vec::new(),
             },
             expected,
         )

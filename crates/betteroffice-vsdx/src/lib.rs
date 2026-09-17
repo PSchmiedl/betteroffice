@@ -93,6 +93,7 @@ impl Diagram {
                         gesture: edit.gesture,
                         formula: Some(formula),
                         value,
+                        row_type: edit.row_type.clone(),
                     }
                 }
                 MutationOutcome::Refused { reason } | MutationOutcome::Unsupported { reason } => {

@@ -11,6 +11,8 @@ import { CanvasContextMenu } from './components/ribbon/CanvasContextMenu';
 import { ShapeContextMenu } from './components/ribbon/ShapeContextMenu';
 import { RibbonCommandsProvider, findShapePlacement, isCellWriteBlocked, isHandleResizeBlocked, numericCellValue, useRibbonCommands } from './components/ribbon/commands';
 import type { RibbonCommands } from './components/ribbon/commands';
+import { dragSegmentRoute, hitSegmentDot, paintConnectorChrome, previewChrome, selectedConnectorChrome } from './connectorChrome';
+import type { ChromePoint } from './connectorChrome';
 import { STENCIL_DRAG_MIME, ShapesPanel } from './components/shapes/ShapesPanel';
 import { LayersPanel } from './components/layers/LayersPanel';
 import { ShapeDataPanel } from './components/shapeData/ShapeDataPanel';
@@ -103,6 +105,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const dragPreviewRef = useRef<ModelPoint | null>(null);
   const dragSnapRef = useRef(false);
   const previewFrameRef = useRef<number | null>(null);
+  const segmentDragRef = useRef<SegmentDrag | null>(null);
   const insertCascadeRef = useRef<Map<string, number>>(new Map());
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
@@ -296,6 +299,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         if (corners) paintSelectionFrame(context, corners, dpr, zoom, blocked ? [] : undefined, !rotationBlocked);
         if (placement) paintControlHandles(context, controlHandleCanvasPositions(placement.shape, shapeDragStart(page, placement.shape, frame), frame.paintTransform), dpr, zoom);
       } catch { void 0; }
+      paintSelectedConnector(context, frame, page, selection, segmentDragRef.current, dpr, zoom);
     }
     const start = pointerRef.current; const release = dragPreviewRef.current;
     if (start && release) {
@@ -362,6 +366,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         if (corners) paintSelectionFrame(context, corners, window.devicePixelRatio || 1, zoomRef.current, blocked ? [] : undefined, !rotationBlocked);
         if (placement) paintControlHandles(context, controlHandleCanvasPositions(placement.shape, shapeDragStart(page, placement.shape, frame), frame.paintTransform), window.devicePixelRatio || 1, zoomRef.current);
       } catch { void 0; }
+      paintSelectedConnector(context, frame, page, currentSelection, segmentDragRef.current, window.devicePixelRatio || 1, zoomRef.current);
     }
   };
 
@@ -575,7 +580,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     if (!handle || !frame || !page) return;
     if (event.button === 2) return;
     if (pointerRef.current) return;
-    pointerRef.current = null; dragPreviewRef.current = null;
+    pointerRef.current = null; dragPreviewRef.current = null; segmentDragRef.current = null;
     if (connectorModeRef.current) {
       try {
         const point = canvasPointerPosition(event, frame);
@@ -687,6 +692,23 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       const hit = handle.hitTest(point.canvas.x, point.canvas.y);
       const next = hit ? selectionForHit(page, hit) : null;
       setSelection(next);
+      if (next && !selectionHiddenByLayers(page, modelRef.current.layers, next)) {
+        const chrome = selectedConnectorChrome(frame, page, next);
+        const segment = chrome?.draggable ? hitSegmentDot(chrome, point.model, grabTolerance(event.currentTarget, frame)) : null;
+        if (chrome?.draggable && segment) {
+          segmentDragRef.current = {
+            selection: next,
+            vertices: chrome.draggable,
+            segment: segment.index,
+            anchor: { ...segment.mid },
+            grab: { x: point.model.x - segment.mid.x, y: point.model.y - segment.mid.y },
+            pointerId: event.pointerId,
+            preview: null,
+          };
+          event.currentTarget.setPointerCapture(event.pointerId);
+          return;
+        }
+      }
       const placement = next ? findShapePlacement(page.shapes, next.shapeId) : null;
       pointerRef.current = next && placement ? {
         ...point,
@@ -700,6 +722,19 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     } catch (value) { reportError(value); }
   };
   const onPointerMove = (event: PointerEvent<HTMLCanvasElement>) => {
+    const drag = segmentDragRef.current;
+    if (drag) {
+      if (drag.pointerId !== event.pointerId) return;
+      try {
+        const liveFrame = modelRef.current.frame;
+        if (!liveFrame) return;
+        const point = canvasPointerPosition(event, liveFrame);
+        drag.preview = dragSegmentRoute(drag.vertices, drag.segment, { x: drag.anchor.x + drag.grab.x, y: drag.anchor.y + drag.grab.y }, point.model);
+        event.currentTarget.style.cursor = 'grabbing';
+        repaintOverlaySelection();
+      } catch (value) { reportError(value); }
+      return;
+    }
     const start = pointerRef.current;
     if (connectorModeRef.current) { onConnectorPointerMove(event); return; }
     if (start) {
@@ -730,7 +765,10 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         const target = hitTestSelection(point.canvas, corners, zoomRef.current);
         if (target === 'rotate' && placement && isCellWriteBlocked(placement.shape, 'Angle')) { event.currentTarget.style.cursor = ''; return; }
         if (target !== 'rotate' && target && placement && isHandleResizeBlocked(placement.shape)) { event.currentTarget.style.cursor = ''; return; }
-        event.currentTarget.style.cursor = target === 'rotate' ? 'grab' : target ? resizeCursor(target) : '';
+        if (target) { event.currentTarget.style.cursor = target === 'rotate' ? 'grab' : resizeCursor(target); return; }
+        const chrome = selectedConnectorChrome(frame, page, active);
+        const hover = chrome?.draggable ? hitSegmentDot(chrome, point.model, grabTolerance(event.currentTarget, frame)) : null;
+        event.currentTarget.style.cursor = hover ? 'grab' : '';
       } catch { void 0; }
       return;
     }
@@ -815,6 +853,20 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
 
   const onPointerUp = (event: PointerEvent<HTMLCanvasElement>) => {
     if (connectorDragRef.current) { commitConnectorDrag(event); return; }
+    const drag = segmentDragRef.current;
+    if (drag && drag.pointerId === event.pointerId) {
+      segmentDragRef.current = null;
+      const routeHandle = handleRef.current;
+      try {
+        if (routeHandle && drag.preview && !sameRoutePoints(drag.preview, drag.vertices)) {
+          routeHandle.setConnectorRoute(drag.selection.pageId, drag.selection.shapeId, drag.preview);
+          refresh(undefined, true);
+          return;
+        }
+      } catch (value) { reportError(value); }
+      repaintOverlaySelection();
+      return;
+    }
     const pointer = pointerRef.current;
     if (!pointer) return;
     if (pointer.pointerId !== undefined && pointer.pointerId !== event.pointerId) return;
@@ -865,8 +917,16 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     repaintOverlaySelection();
     return true;
   };
+  const cancelSegmentDrag = (event: PointerEvent<HTMLCanvasElement>): boolean => {
+    const drag = segmentDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return false;
+    segmentDragRef.current = null;
+    repaintOverlaySelection();
+    return true;
+  };
   const onPointerCancel = (event: PointerEvent<HTMLCanvasElement>) => {
     if (abandonConnectorDrag()) return;
+    if (cancelSegmentDrag(event)) return;
     const pointer = pointerRef.current;
     if (!pointer) return;
     if (pointer.pointerId !== undefined && pointer.pointerId !== event.pointerId) return;
@@ -874,6 +934,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   };
   const onLostPointerCapture = (event: PointerEvent<HTMLCanvasElement>) => {
     if (abandonConnectorDrag()) return;
+    if (cancelSegmentDrag(event)) return;
     const pointer = pointerRef.current;
     if (!pointer) return;
     if (pointer.pointerId !== undefined && pointer.pointerId !== event.pointerId) return;
@@ -1211,6 +1272,27 @@ export function inchFormula(value: number): string {
   if (!Number.isFinite(value)) throw new Error('Shape geometry must be finite.');
   const rounded = Number(value.toFixed(6));
   return String(Object.is(rounded, -0) ? 0 : rounded);
+}
+
+export interface SegmentDrag { selection: VsdxShapeSelection; vertices: ChromePoint[]; segment: number; anchor: ChromePoint; grab: ChromePoint; pointerId: number; preview: ChromePoint[] | null; }
+
+/** Pointer-grab radius for a segment dot, in model units. */
+export function grabTolerance(canvas: HTMLCanvasElement, frame: PageDisplayList): number {
+  const rect = canvas.getBoundingClientRect();
+  const scale = Math.hypot(frame.paintTransform.a, frame.paintTransform.b);
+  if (!Number.isFinite(scale) || scale <= 0) return 0;
+  return 12 * frame.width / (scale * Math.max(rect.width, 1));
+}
+
+export function sameRoutePoints(left: readonly ChromePoint[], right: readonly ChromePoint[]): boolean {
+  return left.length === right.length && left.every((point, index) => Math.hypot(point.x - right[index].x, point.y - right[index].y) < 1e-9);
+}
+
+function paintSelectedConnector(context: CanvasRenderingContext2D, frame: PageDisplayList, page: PageSnapshot, selection: VsdxShapeSelection, drag: SegmentDrag | null, dpr: number, zoom: number): void {
+  const chrome = selectedConnectorChrome(frame, page, selection);
+  if (!chrome) return;
+  const active = drag && drag.selection.shapeId === selection.shapeId ? previewChrome(chrome, drag.preview ?? drag.vertices) : chrome;
+  paintConnectorChrome(context, frame, active, dpr, zoom);
 }
 
 export function shapeParentTransforms(primitives: readonly PagePrimitive[], id: string, depth = 0): Affine[] | null {
