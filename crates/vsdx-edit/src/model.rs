@@ -87,6 +87,31 @@ pub struct CellFormulaReceipt {
     pub after: String,
 }
 
+/// One shape's pin move in a batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShapeMove {
+    pub page_id: String,
+    pub shape_id: String,
+    pub x: String,
+    pub y: String,
+}
+
+/// One shape's deletion in a batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShapeDelete {
+    pub page_id: String,
+    pub shape_id: String,
+}
+
+/// One cell write in a batch that may span shapes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellFormulaWrite {
+    pub page_id: String,
+    pub shape_id: String,
+    pub cell_name: String,
+    pub formula: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeReceipt {

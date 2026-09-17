@@ -713,6 +713,55 @@ describe('VSDX wasm boundary', () => {
     } finally { diagram.dispose(); peer.dispose(); }
   });
 
+  test('a batch move and delete is one undo entry, and a refused shape refuses the batch', () => {
+    const diagram = openDiagram(foundation, { clientId: 9017 });
+    try {
+      const shapeId = (formula?: string) => diagram.addShape('page:1', { cells: [
+        { locator: { cellName: 'PinX' }, formula: '1' },
+        { locator: { cellName: 'PinY' }, formula: '1' },
+        ...(formula ? [{ locator: { cellName: 'LockMoveX' }, formula }] : []),
+      ] }).shapeId;
+      const first = shapeId();
+      const second = shapeId();
+      const origins: string[] = [];
+      const stop = diagram.onUpdate((_update, origin) => { origins.push(origin); });
+      expect(diagram.moveShapes([
+        { pageId: 'page:1', shapeId: first, xFormula: '2', yFormula: '3' },
+        { pageId: 'page:1', shapeId: second, xFormula: '4', yFormula: '5' },
+      ])).toHaveLength(2);
+      expect(origins).toEqual(['local']);
+      stop();
+      const moved = diagram.snapshot();
+      expect(diagram.undo().applied).toBe(true);
+      for (const shape of diagram.snapshot().pages[0].shapes.filter((entry) => entry.id === first || entry.id === second)) {
+        expect(shape.cells.find((cell) => cell.name === 'PinX')?.formula).toBe('1');
+        expect(shape.cells.find((cell) => cell.name === 'PinY')?.formula).toBe('1');
+      }
+      expect(diagram.redo().applied).toBe(true);
+      expect(diagram.snapshot()).toEqual(moved);
+
+      const locked = shapeId('1');
+      const before = diagram.snapshot();
+      expect(() => diagram.moveShapes([
+        { pageId: 'page:1', shapeId: first, xFormula: '6', yFormula: '7' },
+        { pageId: 'page:1', shapeId: locked, xFormula: '8', yFormula: '9' },
+      ])).toThrow('LockMoveX protects this move gesture');
+      expect(diagram.snapshot()).toEqual(before);
+      expect(() => diagram.deleteShapes([
+        { pageId: 'page:1', shapeId: first },
+        { pageId: 'page:1', shapeId: 'page:1:shape:missing' },
+      ])).toThrow('page:1:shape:missing');
+      expect(diagram.snapshot()).toEqual(before);
+      expect(diagram.deleteShapes([
+        { pageId: 'page:1', shapeId: first },
+        { pageId: 'page:1', shapeId: second },
+      ])).toHaveLength(2);
+      expect(diagram.snapshot().pages[0].shapes.some((shape) => shape.id === first || shape.id === second)).toBe(false);
+      expect(diagram.undo().applied).toBe(true);
+      expect(diagram.snapshot()).toEqual(before);
+    } finally { diagram.dispose(); }
+  });
+
   test('aborts a guarded move batch without changing the save bytes', () => {
     const pageId = 'page:1';
     const shapeId = 'page:1:shape:1';

@@ -67,6 +67,7 @@ pub enum MutationGesture {
     ResizeWidth,
     ResizeHeight,
     ResizeAspect,
+    Rotate,
     TextEdit,
     Format,
     Delete,

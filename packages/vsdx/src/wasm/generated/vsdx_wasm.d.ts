@@ -16,6 +16,7 @@ export class VsdxDocument {
     canUndo(): boolean;
     clearUpdateObservation(): void;
     deleteShapeJson(args: string): string;
+    deleteShapesJson(args: string): string;
     /**
      * Returns `[2]` after overflow; discard queued observations and resync from a state vector.
      */
@@ -25,6 +26,7 @@ export class VsdxDocument {
     encodeStateVector(): Uint8Array;
     mediaBytes(part_path: string): Uint8Array;
     moveShapeJson(args: string): string;
+    moveShapesJson(args: string): string;
     static openCollaborative(bytes: Uint8Array, client_id: number): VsdxDocument;
     static openCollaborativeFromUpdate(update: Uint8Array, client_id: number): VsdxDocument;
     redoJson(): string;
@@ -34,6 +36,7 @@ export class VsdxDocument {
     resizeShapeJson(args: string): string;
     save(): Uint8Array;
     setCellFormulaJson(args: string): string;
+    setCellFormulasJson(args: string): string;
     setConnectorRouteJson(args: string): string;
     setControlHandleJson(args: string): string;
     setShapeBoundsJson(args: string): string;
@@ -105,12 +108,14 @@ export interface InitOutput {
     readonly vsdxdocument_clearUpdateObservation: (a: number) => void;
     readonly vsdxdocument_clientId: (a: number) => number;
     readonly vsdxdocument_deleteShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly vsdxdocument_deleteShapesJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_drainUpdateEvent: (a: number) => [number, number];
     readonly vsdxdocument_encodeDiff: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_encodeStateAsUpdate: (a: number) => [number, number];
     readonly vsdxdocument_encodeStateVector: (a: number) => [number, number];
     readonly vsdxdocument_mediaBytes: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_moveShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly vsdxdocument_moveShapesJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_openCollaborative: (a: number, b: number, c: number) => [number, number, number];
     readonly vsdxdocument_openCollaborativeFromUpdate: (a: number, b: number, c: number) => [number, number, number];
     readonly vsdxdocument_redoJson: (a: number) => [number, number, number, number];
@@ -120,6 +125,7 @@ export interface InitOutput {
     readonly vsdxdocument_resizeShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_save: (a: number) => [number, number, number, number];
     readonly vsdxdocument_setCellFormulaJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly vsdxdocument_setCellFormulasJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_setConnectorRouteJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_setControlHandleJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_setShapeBoundsJson: (a: number, b: number, c: number) => [number, number, number, number];

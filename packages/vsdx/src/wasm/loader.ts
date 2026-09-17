@@ -5,6 +5,9 @@ import type { CellLocator, CellFormulaReceipt, CollaborationUpdateOrigin, Connec
 export type WasmInitInput = InitInput | Promise<InitInput>;
 export interface OpenDiagramOptions { clientId?: number; fonts?: ReadonlyArray<VsdxFontFace>; initialUpdate?: Uint8Array; }
 export interface CollaborationResync { update: Uint8Array; }
+export interface ShapeMove { pageId: string; shapeId: string; xFormula: string; yFormula: string; }
+export interface ShapeDelete { pageId: string; shapeId: string; }
+export interface CellFormulaWrite { pageId: string; shapeId: string; cellName: string; formula: string; }
 export interface DiagramHandle {
   readonly clientId: number;
   snapshot(): DiagramSnapshot;
@@ -22,11 +25,14 @@ export interface DiagramHandle {
   hitTest(x: number, y: number): HitTestResult | null;
   mediaBytes(assetId: string): Uint8Array;
   setCellFormula(pageId: string, shapeId: string, locator: CellLocator, formula: string): CellFormulaReceipt;
+  setCellFormulas(writes: ReadonlyArray<CellFormulaWrite>): CellFormulaReceipt[];
   setControlHandle(pageId: string, shapeId: string, row: string, xFormula: string | null, yFormula: string | null): CellFormulaReceipt[];
   moveShape(pageId: string, shapeId: string, xFormula: string, yFormula: string): [CellFormulaReceipt, CellFormulaReceipt];
+  moveShapes(moves: ReadonlyArray<ShapeMove>): Array<[CellFormulaReceipt, CellFormulaReceipt]>;
   setShapeBounds(pageId: string, shapeId: string, xFormula: string, yFormula: string, widthFormula: string, heightFormula: string): [CellFormulaReceipt, CellFormulaReceipt, CellFormulaReceipt, CellFormulaReceipt];
   resizeLocPin(pageId: string, shapeId: string, width: number, height: number): { x: number; y: number };
   resizeShape(pageId: string, shapeId: string, widthFormula: string, heightFormula: string): [CellFormulaReceipt, CellFormulaReceipt];
+  deleteShapes(deletes: ReadonlyArray<ShapeDelete>): ShapeReceipt[];
   reorderShape(pageId: string, shapeId: string, toIndex: number): ShapeReceipt;
   reorderPage(pageId: string, toIndex: number): ShapeReceipt;
   addShape(pageId: string, draft: FormulaShapeDraft): ShapeReceipt;
@@ -167,8 +173,10 @@ export function openDiagram(bytes: Uint8Array, options: OpenDiagramOptions = {})
       return hit && shapeId ? { ...hit, shapeId } : null;
     }, mediaBytes: assetId => wasm(() => doc.mediaBytes(assetId).slice()),
     setCellFormula: (pageId, shapeId, locator, formula) => json(() => doc.setCellFormulaJson(JSON.stringify({ pageId, shapeId, locator, formula })), true),
+    setCellFormulas: (writes) => json(() => doc.setCellFormulasJson(JSON.stringify({ writes: [...writes] })), true),
     setControlHandle: (pageId, shapeId, row, xFormula, yFormula) => json(() => doc.setControlHandleJson(JSON.stringify({ pageId, shapeId, row, xFormula, yFormula })), true),
     moveShape: (pageId, shapeId, xFormula, yFormula) => json(() => doc.moveShapeJson(JSON.stringify({ pageId, shapeId, xFormula, yFormula })), true),
+    moveShapes: (moves) => json(() => doc.moveShapesJson(JSON.stringify({ moves: [...moves] })), true),
     setShapeBounds: (pageId, shapeId, xFormula, yFormula, widthFormula, heightFormula) => json(() => doc.setShapeBoundsJson(JSON.stringify({ pageId, shapeId, xFormula, yFormula, widthFormula, heightFormula })), true),
     resizeLocPin: (pageId, shapeId, width, height) => { const [x, y] = wasm(() => doc.resizeLocPin(pageId, shapeId, width, height)); return { x, y }; },
     resizeShape: (pageId, shapeId, widthFormula, heightFormula) => json(() => doc.resizeShapeJson(JSON.stringify({ pageId, shapeId, widthFormula, heightFormula })), true),
@@ -183,6 +191,7 @@ export function openDiagram(bytes: Uint8Array, options: OpenDiagramOptions = {})
     addConnectedShape: (pageId, shapeDraft, connectorDraft, from, toCell) => json(() => doc.addConnectedShapeJson(JSON.stringify({ pageId, shapeDraft, connectorDraft, from, toCell })), true),
     setConnectorRoute: (pageId, shapeId, points) => json(() => doc.setConnectorRouteJson(JSON.stringify({ pageId, shapeId, points })), true),
     deleteShape: (pageId, shapeId) => json(() => doc.deleteShapeJson(JSON.stringify({ pageId, shapeId })), true),
+    deleteShapes: (deletes) => json(() => doc.deleteShapesJson(JSON.stringify({ deletes: [...deletes] })), true),
     shapeText: (pageId, shapeId) => json(() => doc.shapeTextJson(JSON.stringify({ pageId, shapeId }))),
     setShapeText: (pageId, shapeId, text) => json(() => doc.setShapeTextJson(JSON.stringify({ pageId, shapeId, text })), true),
     save: () => wasm(() => doc.save().slice()),

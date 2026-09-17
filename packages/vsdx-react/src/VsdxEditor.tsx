@@ -1,7 +1,7 @@
 import { createT, deepMerge, diagnosticMessage, en } from '@betteroffice/vsdx-i18n';
-import type { Translations } from '@betteroffice/vsdx-i18n';
+import type { TFunction, Translations } from '@betteroffice/vsdx-i18n';
 import { canvasPointToModel, modelPointToCanvas, initWasm, openDiagram, paintPage, sizeCanvasForPage } from '@betteroffice/vsdx';
-import type { Affine, CellLocator, DocumentMaster, PageLayer, PagePrimitive, CollaborationReplica, DiagramHandle, DiagramSnapshot, HitTestResult, ModelPoint, PageDisplayList, PageSnapshot, ShapeDataRow, ShapeSnapshot, TextDiagnostic, VsdxFontFace, VsdxPresence } from '@betteroffice/vsdx';
+import type { Affine, CellLocator, DocumentMaster, PageLayer, PagePrimitive, CollaborationReplica, DiagramHandle, DiagramSnapshot, HitTestResult, ModelPoint, PageDisplayList, PageSnapshot, ShapeDataRow, ShapeMove, ShapeSnapshot, TextDiagnostic, VsdxFontFace, VsdxPresence } from '@betteroffice/vsdx';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent, FocusEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from 'react';
 import { AUTO_CONNECT_FADE_MS, HOVER_FREE_DRAG_INCHES, HOVER_PROXIMITY_PX, QUICK_SHAPE_IDS, autoConnectArrowAt, autoConnectArrowCss, autoConnectArrowsForShape, autoConnectHaloHit, connectionPointsForShape, connectorDraft, connectorEndpointGlue, connectorGlue, connectorRouteFromFrame, dropTargetForPoint, hoverPointAt, isConnectorShape, nearestConnectionPointAnywhere, paintAutoConnectOverlay, paintConnectorOverlay, quickShapePlacement, reroutePreviewForMove, routeConnector } from './connector';
@@ -10,7 +10,7 @@ import { Ribbon } from './components/ribbon/Ribbon';
 import type { ViewToggleKey } from './components/ribbon/Ribbon';
 import { CanvasContextMenu } from './components/ribbon/CanvasContextMenu';
 import { ShapeContextMenu } from './components/ribbon/ShapeContextMenu';
-import { RibbonCommandsProvider, copySelection, duplicateEntry, findShapePlacement, isCellWriteBlocked, isHandleResizeBlocked, numericCellValue, pasteEntry, useRibbonCommands } from './components/ribbon/commands';
+import { RibbonCommandsProvider, copySelection, duplicateEntry, findShapePlacement, isCellWriteBlocked, isHandleResizeBlocked, isRotateBlocked, numericCellValue, pasteEntry, useRibbonCommands } from './components/ribbon/commands';
 import type { RibbonCommands } from './components/ribbon/commands';
 import { dragSegmentRoute, hitSegmentDot, paintConnectorChrome, previewChrome, selectedConnectorChrome } from './connectorChrome';
 import type { ChromePoint } from './connectorChrome';
@@ -67,6 +67,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const onErrorRef = useRef(onError);
   const collaborationRef = useRef(collaboration);
   const attachedCollaborationRef = useRef<VsdxEditorCollaborationOptions | undefined>(undefined);
+  const editorRootRef = useRef<HTMLDivElement>(null);
   const mainCanvasRef = useRef<HTMLCanvasElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const workspaceRef = useRef<HTMLElement>(null);
@@ -81,7 +82,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const sessionRef = useRef({ file, clientId: requestedClientId, initialUpdate: requestedInitialUpdate });
   const [model, setModel] = useState<EditorModel>({ snapshot: null, pageIndex: 0, frame: null, layers: [] });
   const modelRef = useRef(model);
-  const [selection, setSelection] = useState<VsdxShapeSelection | null>(null);
+  const [selection, setSelection] = useState<VsdxShapeSelection[]>([]);
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
   const [clipboard, setClipboard] = useState<VsdxClipboardEntry | null>(null);
@@ -119,7 +120,10 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const [diagnostics, setDiagnostics] = useState<TextDiagnostic[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ top: number; left: number; kind: 'shape' | 'canvas' } | null>(null);
+  const contextMenuRef = useRef(contextMenu);
+  contextMenuRef.current = contextMenu;
   const pointerRef = useRef<DragStart | null>(null);
+  const dragShapeRef = useRef<VsdxShapeSelection | null>(null);
   const dragPreviewRef = useRef<ModelPoint | null>(null);
   const dragSnapRef = useRef(false);
   const guidesRef = useRef<SnapTargets>({ x: [], y: [] });
@@ -192,7 +196,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       setModel(modelRef.current);
       setDiagnostics(frame ? collectDiagnostics(frame) : []);
       setError(null);
-      setSelection((existing) => existing && stillSelectable(current, pageIndex, existing, layers) ? existing : null);
+      setSelection((existing) => { const kept = existing.filter((item) => stillSelectable(current, pageIndex, item, layers)); return kept.length === existing.length ? existing : kept; });
       const open = editingRef.current;
       if (open) {
         const committed = handle.shapeText(open.pageId, open.shapeId);
@@ -226,7 +230,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     let handle: DiagramHandle | null = null;
     let stopUpdates = () => {};
     let stopResync = () => {};
-    handleRef.current?.dispose(); handleRef.current = null; imageCache.current.clear(); setSelection(null); setContextMenu(null); setClipboard(null); setEditing(null); setDraft(''); modelRef.current = { snapshot: null, pageIndex: 0, frame: null, layers: [] }; setModel(modelRef.current); setError(null); setDirty(false); setDocumentStencil({ loaded: false, masters: [] }); setActiveStencilId('standard');
+    handleRef.current?.dispose(); handleRef.current = null; imageCache.current.clear(); setSelection([]); setContextMenu(null); setClipboard(null); setEditing(null); setDraft(''); modelRef.current = { snapshot: null, pageIndex: 0, frame: null, layers: [] }; setModel(modelRef.current); setError(null); setDirty(false); setDocumentStencil({ loaded: false, masters: [] }); setActiveStencilId('standard');
     if (!file) { setLoading(false); return; }
     setLoading(true);
     const openingFonts = fontsRef.current;
@@ -336,16 +340,19 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     const snapshot = model.snapshot;
     const page = snapshot?.pages[model.pageIndex];
     paintConnectorLayer(context, frame);
-    if (selection && page && !selectionHiddenByLayers(page, model.layers, selection)) {
-      try {
-        const corners = selectionCorners(page, frame, selection);
-        const placement = findShapePlacement(page.shapes, selection.shapeId);
-        const blocked = placement ? isHandleResizeBlocked(placement.shape) : false;
-        const rotationBlocked = placement ? isCellWriteBlocked(placement.shape, 'Angle') : false;
-        if (corners) paintSelectionFrame(context, corners, dpr, zoom, blocked ? [] : undefined, !rotationBlocked);
-        if (placement) paintControlHandles(context, controlHandleCanvasPositions(placement.shape, shapeDragStart(page, placement.shape, frame), frame.paintTransform), dpr, zoom);
-      } catch { void 0; }
-      paintSelectedConnector(context, frame, page, selection, segmentDragRef.current, dpr, zoom);
+    if (page) {
+      for (const item of selection) {
+        if (selectionHiddenByLayers(page, model.layers, item)) continue;
+        try {
+          const corners = selectionCorners(page, frame, item);
+          const placement = findShapePlacement(page.shapes, item.shapeId);
+          const blocked = placement ? isHandleResizeBlocked(placement.shape) : false;
+          const rotationBlocked = placement ? isRotateBlocked(placement.shape) : false;
+          if (corners) paintSelectionFrame(context, corners, dpr, zoom, blocked ? [] : undefined, !rotationBlocked);
+          if (placement && selection.length === 1) paintControlHandles(context, controlHandleCanvasPositions(placement.shape, shapeDragStart(page, placement.shape, frame), frame.paintTransform), dpr, zoom);
+        } catch { void 0; }
+        if (selection.length === 1) paintSelectedConnector(context, frame, page, item, segmentDragRef.current, dpr, zoom);
+      }
     }
     const start = pointerRef.current; const release = dragPreviewRef.current;
     if (start && release) {
@@ -356,7 +363,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
 
   useEffect(() => {
     if (!editing) return;
-    if (!selection || selection.pageId !== editing.pageId || selection.shapeId !== editing.shapeId) setEditing(null);
+    if (selection.length !== 1 || selection[0].pageId !== editing.pageId || selection[0].shapeId !== editing.shapeId) setEditing(null);
   }, [editing, selection]);
 
   useEffect(() => {
@@ -411,16 +418,19 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       try { paintGrid(context, frame, dpr, zoom); } catch { void 0; }
     }
     paintConnectorLayer(context, frame);
-    if (currentSelection && page && !selectionHiddenByLayers(page, current.layers, currentSelection)) {
-      try {
-        const corners = selectionCorners(page, frame, currentSelection);
-        const placement = findShapePlacement(page.shapes, currentSelection.shapeId);
-        const blocked = placement ? isHandleResizeBlocked(placement.shape) : false;
-        const rotationBlocked = placement ? isCellWriteBlocked(placement.shape, 'Angle') : false;
-        if (corners) paintSelectionFrame(context, corners, window.devicePixelRatio || 1, zoomRef.current, blocked ? [] : undefined, !rotationBlocked);
-        if (placement) paintControlHandles(context, controlHandleCanvasPositions(placement.shape, shapeDragStart(page, placement.shape, frame), frame.paintTransform), window.devicePixelRatio || 1, zoomRef.current);
-      } catch { void 0; }
-      paintSelectedConnector(context, frame, page, currentSelection, segmentDragRef.current, window.devicePixelRatio || 1, zoomRef.current);
+    if (page) {
+      for (const item of currentSelection) {
+        if (selectionHiddenByLayers(page, current.layers, item)) continue;
+        try {
+          const corners = selectionCorners(page, frame, item);
+          const placement = findShapePlacement(page.shapes, item.shapeId);
+          const blocked = placement ? isHandleResizeBlocked(placement.shape) : false;
+          const rotationBlocked = placement ? isRotateBlocked(placement.shape) : false;
+          if (corners) paintSelectionFrame(context, corners, window.devicePixelRatio || 1, zoomRef.current, blocked ? [] : undefined, !rotationBlocked);
+          if (placement && currentSelection.length === 1) paintControlHandles(context, controlHandleCanvasPositions(placement.shape, shapeDragStart(page, placement.shape, frame), frame.paintTransform), window.devicePixelRatio || 1, zoomRef.current);
+        } catch { void 0; }
+        if (currentSelection.length === 1) paintSelectedConnector(context, frame, page, item, segmentDragRef.current, window.devicePixelRatio || 1, zoomRef.current);
+      }
     }
     try { paintSmartGuides(context, frame, dpr, zoom, guidesRef.current); } catch { void 0; }
   };
@@ -446,7 +456,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const snapDragPoint = (start: DragStart, raw: ModelPoint, suppressed: boolean): { point: ModelPoint; guides: SnapTargets } => {
     const current = modelRef.current;
     const page = current.snapshot?.pages[current.pageIndex];
-    const selected = selectionRef.current;
+    const selected = dragShapeRef.current;
     const grouped = (start.parentTransforms?.length ?? 0) > 0;
     const targets = page && selected && !grouped ? collectSnapTargets(page.shapes, selected.shapeId) : { x: [], y: [] };
     return snapRelease(start, raw, {
@@ -466,13 +476,13 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     const connectors: ConnectorOverlayRoute[] = [];
     let hoverPoints: readonly ConnectionPoint[] = [];
     if (page) {
-      const selectedId = selectionRef.current?.pageId === page.id ? selectionRef.current.shapeId : null;
+      const selectedIds = new Set(selectionRef.current.filter((item) => item.pageId === page.id).map((item) => item.shapeId));
       for (const shape of page.shapes) {
         if (!isConnectorShape(shape)) continue;
         const route = connectorRouteFromFrame(frame, page.sourcePartPath, shape.sourceId);
         if (!route) continue;
         const [beginGlue, endGlue] = connectorEndpointGlue(route, page.shapes);
-        connectors.push({ route, selected: shape.id === selectedId, beginGlue, endGlue });
+        connectors.push({ route, selected: selectedIds.has(shape.id), beginGlue, endGlue });
       }
       const hoverId = drag?.from.shapeId ?? (connectorModeRef.current ? hoverShapeRef.current : pointHoverRef.current);
       const hovered = hoverId ? page.shapes.find((shape) => shape.id === hoverId) : undefined;
@@ -570,7 +580,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const gluedReroutePreview = (start: DragStart, release: ModelPoint): ReadonlyArray<readonly ModelPoint[]> => {
     const current = modelRef.current; const frame = current.frame;
     const page = current.snapshot?.pages[current.pageIndex];
-    const active = selectionRef.current;
+    const active = dragShapeRef.current;
     if (!frame || !page || !active || active.pageId !== page.id) return [];
     const placement = findShapePlacement(page.shapes, active.shapeId);
     if (!placement || placement.siblings !== page.shapes) return [];
@@ -677,11 +687,12 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         const target = connectorTargetForPoint(page.shapes, handle, point.canvas, point.model);
         if (target) {
           connectorDragRef.current = { pageId: page.id, from: target, current: point.model, snap: target };
-          setSelection({ pageId: page.id, shapeId: target.shapeId, hit: { kind: 'shape', shapeId: target.shapeId } });
+          setSelection([{ pageId: page.id, shapeId: target.shapeId, hit: { kind: 'shape', shapeId: target.shapeId } }]);
           capturePointer(event);
         } else {
           const hit = handle.hitTest(point.canvas.x, point.canvas.y);
-          setSelection(hit ? selectionForHit(page, hit) : null);
+          const connectorHit = hit ? selectionForHit(page, hit) : null;
+          setSelection(connectorHit ? [connectorHit] : []);
         }
         repaintOverlaySelection();
       } catch (value) { reportError(value); }
@@ -689,10 +700,10 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     }
     try {
       const point = canvasPointerPosition(event, frame);
-      const active = selectionRef.current;
-      if (active && active.pageId === page.id && !selectionHiddenByLayers(page, modelRef.current.layers, active)) {
+      for (const active of selectionRef.current) {
+        if (active.pageId !== page.id || selectionHiddenByLayers(page, modelRef.current.layers, active)) continue;
         try {
-          const placement = findShapePlacement(page.shapes, active.shapeId);
+          const placement = selectionRef.current.length === 1 ? findShapePlacement(page.shapes, active.shapeId) : null;
           if (placement) {
             const base = shapeDragStart(page, placement.shape, frame, handle);
             const controls = controlHandleCanvasPositions(placement.shape, base, frame.paintTransform);
@@ -709,6 +720,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
                 resize: false,
                 control: drag,
               };
+              dragShapeRef.current = active;
               event.currentTarget.setPointerCapture(event.pointerId);
               return;
             }
@@ -716,35 +728,34 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         } catch { void 0; }
         try {
           const corners = selectionCorners(page, frame, active);
-          if (corners) {
-            const target = hitTestSelection(point.canvas, corners, zoomRef.current);
-            if (target) {
-              const placement = findShapePlacement(page.shapes, active.shapeId);
-              if (placement) {
-                if (target === 'rotate' && isCellWriteBlocked(placement.shape, 'Angle')) {
-                  reportError(new Error(t('errors.rotationGuarded')));
-                  return;
-                }
-                if (target !== 'rotate' && isHandleResizeBlocked(placement.shape)) {
-                  reportError(new Error(t('errors.resizeLocked')));
-                  return;
-                }
-                const base = shapeDragStart(page, placement.shape, frame, handle);
-                pointerRef.current = {
-                  ...point,
-                  ...base,
-                  pointerId: event.pointerId,
-                  startX: event.clientX,
-                  startY: event.clientY,
-                  resize: false,
-                  handle: target === 'rotate' ? undefined : (target as ResizeHandle),
-                  rotate: target === 'rotate',
-                };
-                event.currentTarget.setPointerCapture(event.pointerId);
-                return;
-              }
-            }
+          if (!corners) continue;
+          const target = hitTestSelection(point.canvas, corners, zoomRef.current);
+          if (!target) continue;
+          const handlePlacement = findShapePlacement(page.shapes, active.shapeId);
+          if (!handlePlacement) continue;
+          if (target === 'rotate' && isRotateBlocked(handlePlacement.shape)) {
+            reportError(new Error(rotateBlockedMessage(t, handlePlacement.shape)));
+            return;
           }
+          if (target !== 'rotate' && isHandleResizeBlocked(handlePlacement.shape)) {
+            reportError(new Error(t('errors.resizeLocked')));
+            return;
+          }
+          const base = shapeDragStart(page, handlePlacement.shape, frame, handle);
+          pointerRef.current = {
+            ...point,
+            ...base,
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            resize: false,
+            handle: target === 'rotate' ? undefined : (target as ResizeHandle),
+            rotate: target === 'rotate',
+          };
+          dragShapeRef.current = active;
+          setSelection([active]);
+          event.currentTarget.setPointerCapture(event.pointerId);
+          return;
         } catch { void 0; }
       }
       if (!connectorModeRef.current) {
@@ -756,7 +767,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
           clearAutoConnect();
           pointHoverRef.current = grabbedShape.id;
           connectorDragRef.current = { pageId: page.id, from: { shapeId: grabbedShape.id, point: grabbed }, current: point.model, snap: null };
-          setSelection({ pageId: page.id, shapeId: grabbedShape.id, hit: { kind: 'shape', shapeId: grabbedShape.id } });
+          setSelection([{ pageId: page.id, shapeId: grabbedShape.id, hit: { kind: 'shape', shapeId: grabbedShape.id } }]);
           setPointCursor(true);
           capturePointer(event);
           repaintOverlaySelection();
@@ -771,7 +782,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
           const sourceId = autoHoverRef.current;
           connectorDragRef.current = { pageId: page.id, from: { shapeId: sourceId, point: arrow.point }, current: point.model, snap: null };
           clearAutoConnect();
-          setSelection({ pageId: page.id, shapeId: sourceId, hit: { kind: 'shape', shapeId: sourceId } });
+          setSelection([{ pageId: page.id, shapeId: sourceId, hit: { kind: 'shape', shapeId: sourceId } }]);
           capturePointer(event);
           repaintOverlaySelection();
           return;
@@ -781,7 +792,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       handle.layoutPage(model.pageIndex);
       const hit = handle.hitTest(point.canvas.x, point.canvas.y);
       const next = hit ? selectionForHit(page, hit) : null;
-      setSelection(next);
+      setSelection(next ? [next] : []);
       if (next && !selectionHiddenByLayers(page, modelRef.current.layers, next)) {
         const chrome = selectedConnectorChrome(frame, page, next);
         const segment = chrome?.draggable ? hitSegmentDot(chrome, point.model, grabTolerance(event.currentTarget, frame)) : null;
@@ -808,6 +819,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         startY: event.clientY,
         resize: event.shiftKey,
       } : null;
+      dragShapeRef.current = next && placement ? next : null;
       event.currentTarget.setPointerCapture(event.pointerId);
     } catch (value) { reportError(value); }
   };
@@ -843,28 +855,34 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       try {
         const current = modelRef.current; const frame = current.frame;
         const page = current.snapshot?.pages[current.pageIndex];
-        const active = selectionRef.current;
-        if (!frame || !page || !active || active.pageId !== page.id || selectionHiddenByLayers(page, current.layers, active)) { event.currentTarget.style.cursor = ''; return; }
+        const selected = selectionRef.current;
+        if (!frame || !page || selected.length === 0) { event.currentTarget.style.cursor = ''; return; }
         const point = canvasPointerPosition(event, frame);
-        const placement = findShapePlacement(page.shapes, active.shapeId);
-        if (placement) {
-          try {
-            const controls = controlHandleCanvasPositions(placement.shape, shapeDragStart(page, placement.shape, frame), frame.paintTransform);
-            const row = hitTestControlHandles(point.canvas, controls, zoomRef.current);
-            const hit = row ? controls.find((entry) => entry.row === row) : undefined;
-            const drag = hit && row ? controlDragStart(placement.shape, row, hit) : null;
-            if (drag && !(drag.lockedX && drag.lockedY)) { event.currentTarget.style.cursor = 'move'; return; }
-          } catch { void 0; }
+        for (const active of selected) {
+          if (active.pageId !== page.id || selectionHiddenByLayers(page, current.layers, active)) continue;
+          const placement = selected.length === 1 ? findShapePlacement(page.shapes, active.shapeId) : null;
+          if (placement) {
+            try {
+              const controls = controlHandleCanvasPositions(placement.shape, shapeDragStart(page, placement.shape, frame), frame.paintTransform);
+              const row = hitTestControlHandles(point.canvas, controls, zoomRef.current);
+              const hit = row ? controls.find((entry) => entry.row === row) : undefined;
+              const drag = hit && row ? controlDragStart(placement.shape, row, hit) : null;
+              if (drag && !(drag.lockedX && drag.lockedY)) { event.currentTarget.style.cursor = 'move'; return; }
+            } catch { void 0; }
+          }
+          const corners = selectionCorners(page, frame, active);
+          if (!corners) continue;
+          const target = hitTestSelection(point.canvas, corners, zoomRef.current);
+          const shape = findShapePlacement(page.shapes, active.shapeId)?.shape;
+          if (target && shape && (target === 'rotate' ? isRotateBlocked(shape) : isHandleResizeBlocked(shape))) continue;
+          if (target) { event.currentTarget.style.cursor = target === 'rotate' ? 'grab' : resizeCursor(target); return; }
+          if (selected.length === 1) {
+            const chrome = selectedConnectorChrome(frame, page, active);
+            const hover = chrome?.draggable ? hitSegmentDot(chrome, point.model, grabTolerance(event.currentTarget, frame)) : null;
+            if (hover) { event.currentTarget.style.cursor = 'grab'; return; }
+          }
         }
-        const corners = selectionCorners(page, frame, active);
-        if (!corners) { event.currentTarget.style.cursor = ''; return; }
-        const target = hitTestSelection(point.canvas, corners, zoomRef.current);
-        if (target === 'rotate' && placement && isCellWriteBlocked(placement.shape, 'Angle')) { event.currentTarget.style.cursor = ''; return; }
-        if (target !== 'rotate' && target && placement && isHandleResizeBlocked(placement.shape)) { event.currentTarget.style.cursor = ''; return; }
-        if (target) { event.currentTarget.style.cursor = target === 'rotate' ? 'grab' : resizeCursor(target); return; }
-        const chrome = selectedConnectorChrome(frame, page, active);
-        const hover = chrome?.draggable ? hitSegmentDot(chrome, point.model, grabTolerance(event.currentTarget, frame)) : null;
-        event.currentTarget.style.cursor = hover ? 'grab' : '';
+        event.currentTarget.style.cursor = '';
       } catch { void 0; }
       return;
     }
@@ -898,9 +916,10 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         try {
           if (liveStart.control) {
             const livePage = modelRef.current.snapshot?.pages[modelRef.current.pageIndex];
-            const liveSelection = selectionRef.current;
-            const livePlacement = livePage && liveSelection ? findShapePlacement(livePage.shapes, liveSelection.shapeId) : null;
-            const corners = selectionCorners(livePage!, liveFrame, liveSelection!);
+            const liveSelection = selectionRef.current[0];
+            if (!livePage || !liveSelection) return;
+            const livePlacement = findShapePlacement(livePage.shapes, liveSelection.shapeId);
+            const corners = selectionCorners(livePage, liveFrame, liveSelection);
             context.clearRect(0, 0, overlay.width, overlay.height);
             if (corners) paintSelectionFrame(context, corners, window.devicePixelRatio || 1, zoomRef.current);
             if (livePlacement) {
@@ -946,7 +965,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         if (!drop || Math.hypot(drop.x - drag.from.point.x, drop.y - drag.from.point.y) < HOVER_FREE_DRAG_INCHES) return;
         const receipt = handle.addFreeConnector(drag.pageId, connectorDraft(drag.from.point, drop), connectorGlue(drag.from.shapeId, drag.from.point));
         refresh(undefined, true);
-        setSelection({ pageId: drag.pageId, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } });
+        setSelection([{ pageId: drag.pageId, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } }]);
         pointHoverRef.current = drag.from.shapeId;
         return;
       }
@@ -955,7 +974,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       if (!live || !findShapePlacement(live.shapes, drag.from.shapeId) || !findShapePlacement(live.shapes, end.shapeId)) return;
       const receipt = handle.addConnector(drag.pageId, connectorDraft(drag.from.point, end.point), connectorGlue(drag.from.shapeId, drag.from.point), connectorGlue(end.shapeId, end.point));
       refresh(undefined, true);
-      setSelection({ pageId: drag.pageId, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } });
+      setSelection([{ pageId: drag.pageId, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } }]);
       pointHoverRef.current = end.shapeId;
     } catch (value) { reportError(value); }
     finally { setPointCursor(false); repaintOverlaySelection(); }
@@ -985,7 +1004,8 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     reroutePreviewRef.current = [];
     const previewedRelease = snappedReleaseRef.current;
     clearDragPreview();
-    const handle = handleRef.current; const selected = selection; const frame = model.frame;
+    const handle = handleRef.current; const selected = dragShapeRef.current; const frame = model.frame;
+    dragShapeRef.current = null;
     if (!handle || !selected || !frame) return;
     try {
       const point = canvasPointerPosition(event, frame);
@@ -1005,7 +1025,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       if (pointer.rotate) {
         const livePage = handle.snapshot().pages.find((page) => page.id === selected.pageId);
         const livePlacement = livePage ? findShapePlacement(livePage.shapes, selected.shapeId) : null;
-        if (livePlacement && isCellWriteBlocked(livePlacement.shape, 'Angle')) throw new Error(t('errors.rotationGuarded'));
+        if (livePlacement && isRotateBlocked(livePlacement.shape)) throw new Error(rotateBlockedMessage(t, livePlacement.shape));
         handle.setCellFormula(selected.pageId, selected.shapeId, { cellName: 'Angle' }, String(resolveRotationAngle(pointer, point.model, event.shiftKey)));
         refresh(undefined, true);
         return;
@@ -1064,7 +1084,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       const hit = handle.hitTest(point.canvas.x, point.canvas.y);
       const next = hit ? selectionForHit(page, hit) : null;
       if (!next) return;
-      setSelection(next);
+      setSelection([next]);
       enterTextEdit(next.pageId, next.shapeId);
     } catch (value) { reportError(value); }
   };
@@ -1079,12 +1099,12 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       const hit = handle.hitTest(point.canvas.x, point.canvas.y);
       const next = hit ? selectionForHit(page, hit) : null;
       if (!next) {
-        setSelection(null);
+        setSelection([]);
         setContextMenu({ top: event.clientY, left: event.clientX, kind: 'canvas' });
         return;
       }
       const active = selectionRef.current;
-      if (!active || active.pageId !== next.pageId || active.shapeId !== next.shapeId) setSelection(next);
+      if (!active.some((item) => item.pageId === next.pageId && item.shapeId === next.shapeId)) setSelection([next]);
       setContextMenu({ top: event.clientY, left: event.clientX, kind: 'shape' });
     } catch (value) { reportError(value); }
   };
@@ -1104,20 +1124,35 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   };
   const nudgeSelection = (dx: number, dy: number) => {
     const handle = handleRef.current; const selected = selectionRef.current;
-    if (!handle || !selected) return;
+    if (!handle || selected.length === 0) return;
     try {
       const snapshot = handle.snapshot();
-      const page = snapshot.pages.find((entry) => entry.id === selected.pageId);
-      if (!page) return;
-      const placement = findShapePlacement(page.shapes, selected.shapeId);
-      if (!placement) return;
       const frame = modelRef.current.frame;
       if (!frame) return;
-      const base = shapeDragStart(page, placement.shape, frame);
-      const geometry = resolveNudgeGeometry({ canvas: { x: 0, y: 0 }, model: { x: 0, y: 0 }, resize: false, ...base }, dx, dy);
-      handle.moveShape(selected.pageId, selected.shapeId, inchFormula(geometry.x), inchFormula(geometry.y));
+      const moves: ShapeMove[] = [];
+      for (const item of selected) {
+        const page = snapshot.pages.find((entry) => entry.id === item.pageId);
+        if (!page) continue;
+        const placement = findShapePlacement(page.shapes, item.shapeId);
+        if (!placement) continue;
+        const base = shapeDragStart(page, placement.shape, frame);
+        const geometry = resolveNudgeGeometry({ canvas: { x: 0, y: 0 }, model: { x: 0, y: 0 }, resize: false, ...base }, dx, dy);
+        moves.push({ pageId: item.pageId, shapeId: item.shapeId, xFormula: inchFormula(geometry.x), yFormula: inchFormula(geometry.y) });
+      }
+      if (moves.length > 0) handle.moveShapes(moves);
       refresh(undefined, true);
-    } catch (value) { reportError(value); }
+    } catch (value) {
+      try { refresh(undefined, false); } catch { void 0; }
+      reportError(value);
+    }
+  };
+  const selectAllShapes = () => {
+    const current = modelRef.current;
+    const page = current.snapshot?.pages[current.pageIndex];
+    if (!page || page.shapes.length === 0) return;
+    setSelection(page.shapes
+      .map((shape) => ({ pageId: page.id, shapeId: shape.id, hit: { kind: 'shape', shapeId: shape.id } as const }))
+      .filter((item) => !selectionHiddenByLayers(page, current.layers, item)));
   };
   const toggleConnector = useCallback(() => {
     connectorDragRef.current = null;
@@ -1131,20 +1166,21 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     if (intent.kind === 'redo') { if (commands?.redo.enabled) commands.redo.run(); return; }
     if (intent.kind === 'delete') { if (commands?.delete.enabled) commands.delete.run(); return; }
     if (intent.kind === 'save') { if (commands?.download.enabled) commands.download.run(); return; }
-    if (intent.kind === 'escape') { cancelActiveDrag(); hideAutoConnect(); closeContextMenu(); setSelection(null); return; }
+    if (intent.kind === 'escape') { cancelActiveDrag(); hideAutoConnect(); closeContextMenu(); setSelection([]); return; }
+    if (intent.kind === 'selectAll') { selectAllShapes(); return; }
     nudgeSelection(intent.dx, intent.dy);
   };
   const copySelected = useCallback(() => {
-    const handle = handleRef.current;
-    if (!handle || !selection) return;
-    try { setClipboard(copySelection(handle, selection)); } catch (value) { reportError(value); }
+    const handle = handleRef.current; const single = selection.length === 1 ? selection[0] : null;
+    if (!handle || !single) return;
+    try { setClipboard(copySelection(handle, single)); } catch (value) { reportError(value); }
   }, [selection, reportError]);
   const cutSelected = useCallback(() => {
-    const handle = handleRef.current;
-    if (!handle || !selection) return;
+    const handle = handleRef.current; const single = selection.length === 1 ? selection[0] : null;
+    if (!handle || !single) return;
     try {
-      setClipboard(copySelection(handle, selection));
-      handle.deleteShape(selection.pageId, selection.shapeId);
+      setClipboard(copySelection(handle, single));
+      handle.deleteShape(single.pageId, single.shapeId);
       refresh(undefined, true);
     } catch (value) { reportError(value); }
   }, [selection, refresh, reportError]);
@@ -1153,27 +1189,27 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     const entry = clipboardRef.current;
     if (!handle || !entry) return;
     try {
-      const target = modelRef.current.snapshot?.pages[modelRef.current.pageIndex]?.id ?? selection?.pageId ?? entry.pageId;
+      const target = modelRef.current.snapshot?.pages[modelRef.current.pageIndex]?.id ?? selection[0]?.pageId ?? entry.pageId;
       const step = entry.pasteCount + 1;
       const { receipt, entry: next } = pasteEntry(handle, target, entry, PASTE_OFFSET.x * step, PASTE_OFFSET.y * step);
       setClipboard(next);
-      setSelection({ pageId: target, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } });
+      setSelection([{ pageId: target, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } }]);
       refresh(undefined, true);
     } catch (value) { reportError(value); }
   }, [selection, refresh, reportError]);
   const duplicateSelected = useCallback(() => {
-    const handle = handleRef.current;
-    if (!handle || !selection) return;
+    const handle = handleRef.current; const single = selection.length === 1 ? selection[0] : null;
+    if (!handle || !single) return;
     try {
-      const entry = copySelection(handle, selection);
-      const receipt = duplicateEntry(handle, selection.pageId, entry, DUPLICATE_OFFSET.x, DUPLICATE_OFFSET.y);
-      setSelection({ pageId: selection.pageId, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } });
+      const entry = copySelection(handle, single);
+      const receipt = duplicateEntry(handle, single.pageId, entry, DUPLICATE_OFFSET.x, DUPLICATE_OFFSET.y);
+      setSelection([{ pageId: single.pageId, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } }]);
       refresh(undefined, true);
     } catch (value) { reportError(value); }
   }, [selection, refresh, reportError]);
   const onCanvasKeyDown = (event: KeyboardEvent<HTMLCanvasElement>) => {
     if (event.altKey && event.key === '3') { event.preventDefault(); toggleConnector(); return; }
-    const selected = selectionRef.current;
+    const selected = selectionRef.current.length === 1 ? selectionRef.current[0] : null;
     if (!editingRef.current && (event.ctrlKey || event.metaKey) && !event.altKey) {
       const key = event.key.toLowerCase();
       if (key === 'c' && selected) { event.preventDefault(); copySelected(); return; }
@@ -1191,11 +1227,14 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     event.preventDefault();
     runKeyboardIntent(intent);
   };
+  /** An open menu owns its own keys; the editor chrome owns the rest of the canvas shortcuts. */
+  const chromeOwnsIntent = () => !contextMenuRef.current
+    && !editorRootRef.current?.querySelector('[role="menu"], [role="dialog"], [role="listbox"], dialog[open], [aria-modal="true"]');
   const onEditorKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.defaultPrevented) return;
     const intent = canvasKeyboardIntent(event, zoomRef.current);
     if (intent) {
-      if (intent.kind !== 'save' && intent.kind !== 'undo' && intent.kind !== 'redo') return;
+      if (intent.kind !== 'save' && intent.kind !== 'undo' && intent.kind !== 'redo' && !chromeOwnsIntent()) return;
       event.preventDefault();
       if (editingRef.current) return;
       runKeyboardIntent(intent);
@@ -1217,7 +1256,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     try {
       const receipt = handle.addShape(page.id, shape.draft(point.x, point.y, shape.defaultSize.width, shape.defaultSize.height));
       refresh(undefined, true);
-      setSelection({ pageId: page.id, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } });
+      setSelection([{ pageId: page.id, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } }]);
     } catch (value) { reportError(value); }
   }, [refresh, reportError]);
   const insertQuickShape = useCallback((shape: StandardShape, sourceId: string, side: AutoConnectSide) => {
@@ -1233,7 +1272,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       if (!layout) return;
       const receipt = handle.addConnectedShape(page.id, shape.draft(layout.x, layout.y, layout.width, layout.height), connectorDraft(layout.from, layout.to), connectorGlue(source.id, layout.from), layout.to.toCell);
       refresh(undefined, true);
-      setSelection({ pageId: page.id, shapeId: receipt.shape.shapeId, hit: { kind: 'shape', shapeId: receipt.shape.shapeId } });
+      setSelection([{ pageId: page.id, shapeId: receipt.shape.shapeId, hit: { kind: 'shape', shapeId: receipt.shape.shapeId } }]);
     } catch (value) { reportError(value); }
     hideAutoConnect();
   }, [refresh, reportError]);
@@ -1274,7 +1313,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     try { handle.setLayerVisible(page.sourcePartPath, index, visible); refresh(); } catch (value) { reportError(value); }
   }, [refresh, reportError]);
   const commitShapeData = useCallback((row: ShapeDataRow, formula: string) => {
-    const handle = handleRef.current; const selected = selectionRef.current;
+    const handle = handleRef.current; const selected = selectionRef.current.length === 1 ? selectionRef.current[0] : null;
     if (!handle || !selected) return;
     const locator: CellLocator = {
       cellName: 'Value',
@@ -1288,12 +1327,12 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const selectFromExplorer = useCallback((next: VsdxShapeSelection | null) => {
     const { snapshot, pageIndex, layers } = modelRef.current;
     if (next && !(snapshot && stillSelectable(snapshot, pageIndex, next, layers))) return;
-    setSelection(next);
+    setSelection(next ? [next] : []);
   }, []);
   const selectedShape = (() => {
     const page = model.snapshot?.pages[model.pageIndex];
-    if (!page || !selection || selection.pageId !== page.id) return null;
-    return findShapePlacement(page.shapes, selection.shapeId)?.shape ?? null;
+    if (!page || selection.length !== 1 || selection[0].pageId !== page.id) return null;
+    return findShapePlacement(page.shapes, selection[0].shapeId)?.shape ?? null;
   })();
   const fitToWindow = useCallback(() => {
     const frame = modelRef.current.frame; const workspace = workspaceRef.current;
@@ -1305,11 +1344,11 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const editOverlay = editing && model.frame && editedTextId ? textEditOverlay(model.frame, editedTextId, zoom) : null;
   const integrity = diagnostics.filter((diagnostic) => diagnostic.category === 'integrity');
   const fidelity = diagnostics.filter((diagnostic) => diagnostic.category === 'fidelity');
-  return <div className={className} style={styles.root} aria-label={t('editor.appLabel')} onKeyDown={onEditorKeyDown}>
+  return <div ref={editorRootRef} className={className} style={styles.root} aria-label={t('editor.appLabel')} onKeyDown={onEditorKeyDown}>
     <header style={styles.titleBar}><strong>{t('ribbon.documentName')}</strong><span style={{ color: dirty ? '#a16207' : '#526273' }}>{dirty ? t('ribbon.dirty') : t('ribbon.saved')}</span></header>
-    <RibbonCommandsProvider handle={handleRef.current} snapshot={model.snapshot} pageId={model.snapshot?.pages[model.pageIndex]?.id} selection={selection} frame={model.frame} clipboard={clipboard} onClipboardChange={setClipboard} onSelectShape={setSelection} pageBreaks={pageBreakToggle} onMutation={() => refresh(undefined, true)} onError={reportError} onDownload={download}>
+    <RibbonCommandsProvider handle={handleRef.current} snapshot={model.snapshot} pageId={model.snapshot?.pages[model.pageIndex]?.id} selection={selection} frame={model.frame} clipboard={clipboard} onClipboardChange={setClipboard} onSelectShape={(next) => setSelection([next])} pageBreaks={pageBreakToggle} onMutation={() => refresh(undefined, true)} onError={reportError} onDownload={download}>
     <RibbonCommandsBridge target={commandsRef} />
-    <Ribbon t={t} hasSelection={selection !== null} connector={{ active: connectorMode, disabled: !model.frame, onToggle: toggleConnector }} view={{ grid: showGrid, snap: snapEnabled, rulers: showRulers }} onToggleView={toggleView} />
+    <Ribbon t={t} hasSelection={selection.length > 0} connector={{ active: connectorMode, disabled: !model.frame, onToggle: toggleConnector }} view={{ grid: showGrid, snap: snapEnabled, rulers: showRulers }} onToggleView={toggleView} />
     <div style={styles.contentRow}>
     {leftPanel === undefined ? (
       <div style={styles.leftColumn}>
@@ -1327,7 +1366,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         {showRulers && <div style={styles.rulerTop}>{model.frame && <RulerTop frame={model.frame} zoom={zoom} marker={rulerMark} />}</div>}
         {showRulers && <div style={styles.rulerLeft}>{model.frame && <RulerLeft frame={model.frame} zoom={zoom} marker={rulerMark} />}</div>}
         <div style={styles.canvasFrame} onDragOver={onCanvasDragOver} onDrop={onCanvasDrop}>
-          <canvas ref={mainCanvasRef} tabIndex={0} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerLeave={onPointerLeave} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel} onLostPointerCapture={onLostPointerCapture} onDoubleClick={onCanvasDoubleClick} onContextMenu={onCanvasContextMenu} onKeyDown={onCanvasKeyDown} onFocus={onCanvasFocus} onBlur={onCanvasBlur} aria-label={selection ? t('pages.canvasLabelWithSelection', { current: model.pageIndex + 1, total: model.snapshot?.pages.length ?? 0, name: selection.shapeId }) : t('pages.canvasLabel', { current: model.pageIndex + 1, total: model.snapshot?.pages.length ?? 0 })} style={connectorMode ? { ...styles.canvas, cursor: 'crosshair' } : styles.canvas} />
+          <canvas ref={mainCanvasRef} tabIndex={0} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerLeave={onPointerLeave} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel} onLostPointerCapture={onLostPointerCapture} onDoubleClick={onCanvasDoubleClick} onContextMenu={onCanvasContextMenu} onKeyDown={onCanvasKeyDown} onFocus={onCanvasFocus} onBlur={onCanvasBlur} aria-label={canvasLabel(t, model.pageIndex, model.snapshot?.pages.length ?? 0, selection)} style={connectorMode ? { ...styles.canvas, cursor: 'crosshair' } : styles.canvas} />
           {showPageBreaks && model.frame && <PageBreakGrid frame={model.frame} zoom={zoom} />}
           <canvas ref={overlayCanvasRef} aria-hidden="true" style={styles.overlay} />
           {quickMenu && model.frame && (
@@ -1361,7 +1400,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
           )}
         </div>
       </div>
-      {contextMenu?.kind === 'shape' && selection && <ShapeContextMenu t={t} position={contextMenu} onClose={closeContextMenu} onCloseAndFocus={closeContextMenuAndFocus} />}
+      {contextMenu?.kind === 'shape' && selection.length > 0 && <ShapeContextMenu t={t} position={contextMenu} onClose={closeContextMenu} onCloseAndFocus={closeContextMenuAndFocus} />}
       {contextMenu?.kind === 'canvas' && <CanvasContextMenu t={t} position={contextMenu} onClose={closeContextMenu} onCloseAndFocus={closeContextMenuAndFocus} />}
       {integrity.length > 0 && <section role="alert" style={styles.integrity}><strong>{t('diagnostics.integrityHeading')}</strong>{integrity.map((item, index) => <div key={`${item.code}-${index}`}>{diagnosticMessage(t, item.category, item.code)}</div>)}</section>}
       {fidelity.length > 0 && <details style={styles.fidelity}><summary>{t('diagnostics.fidelityHeading')}</summary>{fidelity.map((item, index) => <div key={`${item.code}-${index}`}>{diagnosticMessage(t, item.category, item.code)}</div>)}</details>}
@@ -1369,7 +1408,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     </main>
     {rightPanel === undefined ? (
       <div style={styles.rightColumn}>
-        <DrawingExplorer snapshot={model.snapshot} activePageIndex={model.pageIndex} selection={selection} onSelectPage={(index) => refresh(index)} onSelectShape={selectFromExplorer} collapsed={explorerCollapsed} onToggleCollapsed={() => setExplorerCollapsed((value) => !value)} t={t} />
+        <DrawingExplorer snapshot={model.snapshot} activePageIndex={model.pageIndex} selection={selection[0] ?? null} onSelectPage={(index) => refresh(index)} onSelectShape={selectFromExplorer} collapsed={explorerCollapsed} onToggleCollapsed={() => setExplorerCollapsed((value) => !value)} t={t} />
         <ShapeDataPanel shape={selectedShape} onCommit={commitShapeData} onError={reportError} t={t} />
       </div>
     ) : rightPanel}
@@ -1531,6 +1570,15 @@ export function stillSelectable(snapshot: DiagramSnapshot, pageIndex: number, se
   const page = snapshot.pages[pageIndex];
   if (!page || page.id !== selection.pageId || !findShapePlacement(page.shapes, selection.shapeId)) return false;
   return !layers || !selectionHiddenByLayers(page, layers, selection);
+}
+
+const rotateBlockedMessage = (t: TFunction, shape: ShapeSnapshot): string =>
+  isCellWriteBlocked(shape, 'Angle') ? t('errors.rotationGuarded') : t('errors.rotateLocked');
+
+export function canvasLabel(t: TFunction, pageIndex: number, total: number, selection: readonly VsdxShapeSelection[]): string {
+  if (selection.length > 1) return t('pages.canvasLabelWithMultiSelection', { current: pageIndex + 1, total, count: selection.length });
+  if (selection.length === 1) return t('pages.canvasLabelWithSelection', { current: pageIndex + 1, total, name: selection[0].shapeId });
+  return t('pages.canvasLabel', { current: pageIndex + 1, total });
 }
 
 export function selectionHiddenByLayers(page: PageSnapshot, layers: readonly PageLayer[], selection: VsdxShapeSelection): boolean {

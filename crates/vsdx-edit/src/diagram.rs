@@ -16,9 +16,10 @@ use yrs::{
 };
 
 use crate::{
-    CONNECTS, CellFormulaReceipt, CellSnapshot, ConnectorRouteReceipt, DiagramSession,
-    DiagramSnapshot, EditCtx, EditError, EditResult, META, PAGE_ORDER, PAGES, PageSnapshot, SHEETS,
-    STORIES, ShapeDraft, ShapeReceipt, ShapeSnapshot, ShapeTreeDraft, ShapeTreeGlue, TextReceipt,
+    CONNECTS, CellFormulaReceipt, CellFormulaWrite, CellSnapshot, ConnectorRouteReceipt,
+    DiagramSession, DiagramSnapshot, EditCtx, EditError, EditResult, META, PAGE_ORDER, PAGES,
+    PageSnapshot, SHEETS, STORIES, ShapeDelete, ShapeDraft, ShapeMove, ShapeReceipt, ShapeSnapshot,
+    ShapeTreeDraft, ShapeTreeGlue, TextReceipt,
 };
 
 mod connect;
@@ -38,6 +39,7 @@ type StoryTexts = (
     std::collections::BTreeMap<String, String>,
     std::collections::BTreeMap<String, Vec<TextToken>>,
 );
+type DeleteCandidate = (usize, String, String, ArrayRef, u32, usize, Vec<String>);
 
 pub(crate) fn seed_doc(
     doc: &Doc,
@@ -1248,7 +1250,7 @@ impl DiagramSession {
         x_formula: impl Into<String>,
         y_formula: impl Into<String>,
     ) -> EditResult<[CellFormulaReceipt; 2]> {
-        self.set_cell_formulas(
+        self.set_cell_formula_group(
             context,
             page_id,
             shape_id,
@@ -1267,7 +1269,7 @@ impl DiagramSession {
         width_formula: impl Into<String>,
         height_formula: impl Into<String>,
     ) -> EditResult<[CellFormulaReceipt; 2]> {
-        self.set_cell_formulas(
+        self.set_cell_formula_group(
             context,
             page_id,
             shape_id,
@@ -1290,7 +1292,7 @@ impl DiagramSession {
         formulas: [String; 4],
     ) -> EditResult<[CellFormulaReceipt; 4]> {
         let [x, y, width, height] = formulas;
-        self.set_cell_formulas(
+        self.set_cell_formula_group(
             context,
             page_id,
             shape_id,
@@ -1301,6 +1303,280 @@ impl DiagramSession {
                 ("Height", height, MutationGesture::ResizeHeight),
             ],
         )
+    }
+
+    pub fn move_shapes(
+        &self,
+        context: &EditCtx,
+        moves: &[ShapeMove],
+    ) -> EditResult<Vec<[CellFormulaReceipt; 2]>> {
+        if moves.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut txn = self.transact_for(context);
+        let mut pending = Vec::with_capacity(moves.len() * 2);
+        for shape_move in moves {
+            let context_for_policy =
+                CrdtMutationContext::new(&txn, &shape_move.page_id, &shape_move.shape_id)?;
+            for (name, formula, gesture) in [
+                ("PinX", shape_move.x.clone(), MutationGesture::MoveX),
+                ("PinY", shape_move.y.clone(), MutationGesture::MoveY),
+            ] {
+                match decide_mutation(
+                    &context_for_policy,
+                    context_for_policy.locator(CellLocator {
+                        sheet: CellSheet::Page(0),
+                        shape_id: None,
+                        section: None,
+                        section_index: None,
+                        row: None,
+                        cell_name: name.to_owned(),
+                    }),
+                    gesture,
+                    formula.clone(),
+                    &ParseLimits::default(),
+                ) {
+                    MutationOutcome::Allowed { target, .. } => pending.push((
+                        shape_move.page_id.clone(),
+                        shape_move.shape_id.clone(),
+                        target,
+                        formula,
+                    )),
+                    MutationOutcome::Refused { reason }
+                    | MutationOutcome::Unsupported { reason } => {
+                        return Err(EditError::InvalidState(reason));
+                    }
+                }
+            }
+        }
+        let mut receipts = Vec::with_capacity(moves.len());
+        for pair in pending.chunks(2) {
+            let [first, second] = pair else {
+                return Err(EditError::InvalidState(
+                    "cell group arity changed".to_owned(),
+                ));
+            };
+            let mut pair_receipts = Vec::with_capacity(2);
+            for (page_id, shape_id, target, formula) in [first, second] {
+                let cell = cell_map(&mut txn, page_id, shape_id, target)?;
+                let before = map_string(&cell, &txn, "formula");
+                cell.insert(&mut txn, "formula", formula.as_str());
+                pair_receipts.push(CellFormulaReceipt {
+                    page_id: page_id.clone(),
+                    shape_id: shape_id.clone(),
+                    cell_name: target.cell_name.clone(),
+                    before,
+                    after: formula.clone(),
+                });
+            }
+            let [first, second] = pair_receipts
+                .try_into()
+                .map_err(|_| EditError::InvalidState("cell group arity changed".to_owned()))?;
+            receipts.push([first, second]);
+        }
+        Ok(receipts)
+    }
+
+    pub fn delete_shapes(
+        &self,
+        context: &EditCtx,
+        deletes: &[ShapeDelete],
+    ) -> EditResult<Vec<ShapeReceipt>> {
+        if deletes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut txn = self.transact_for(context);
+        for entry in deletes {
+            let pages = txn
+                .get_map(PAGES)
+                .ok_or_else(|| EditError::InvalidState("missing pages map".to_owned()))?;
+            let page = map_ref(&pages, &txn, &entry.page_id)?;
+            let root_order = map_array(&page, &txn, "shapes")?;
+            let sheets = txn
+                .get_map(SHEETS)
+                .ok_or_else(|| EditError::InvalidState("missing sheets map".to_owned()))?;
+            if !shape_tree_entries(&sheets, &txn, &root_order)?
+                .iter()
+                .any(|shape| shape.id == entry.shape_id)
+            {
+                return Err(EditError::ShapeNotFound(entry.shape_id.clone()));
+            }
+        }
+        for entry in deletes {
+            let context_for_policy =
+                CrdtMutationContext::new(&txn, &entry.page_id, &entry.shape_id)?;
+            match decide_mutation(
+                &context_for_policy,
+                context_for_policy.locator(CellLocator {
+                    sheet: CellSheet::Page(0),
+                    shape_id: None,
+                    section: None,
+                    section_index: None,
+                    row: None,
+                    cell_name: "LockDelete".to_owned(),
+                }),
+                MutationGesture::Delete,
+                String::new(),
+                &ParseLimits::default(),
+            ) {
+                MutationOutcome::Allowed { .. } => {}
+                MutationOutcome::Refused { reason } | MutationOutcome::Unsupported { reason } => {
+                    return Err(EditError::InvalidState(reason));
+                }
+            }
+        }
+        let mut receipts = Vec::with_capacity(deletes.len());
+        let mut remaining: Vec<(String, String)> = deletes
+            .iter()
+            .map(|entry| (entry.page_id.clone(), entry.shape_id.clone()))
+            .collect();
+        while !remaining.is_empty() {
+            let mut best: Option<DeleteCandidate> = None;
+            for (position, (page_id, shape_id)) in remaining.iter().enumerate() {
+                let pages = txn
+                    .get_map(PAGES)
+                    .ok_or_else(|| EditError::InvalidState("missing pages map".to_owned()))?;
+                let page = match map_ref(&pages, &txn, page_id) {
+                    Ok(page) => page,
+                    Err(_) => continue,
+                };
+                let root_order = match map_array(&page, &txn, "shapes") {
+                    Ok(order) => order,
+                    Err(_) => continue,
+                };
+                let sheets = txn
+                    .get_map(SHEETS)
+                    .ok_or_else(|| EditError::InvalidState("missing sheets map".to_owned()))?;
+                let entries = shape_tree_entries(&sheets, &txn, &root_order)?;
+                let Some(target) = entries.iter().position(|entry| entry.id == *shape_id) else {
+                    continue;
+                };
+                let order = entries[target].order.clone();
+                let from = entries[target].index;
+                let depth = entries[target].depth;
+                let removed = entries
+                    .iter()
+                    .skip(target)
+                    .enumerate()
+                    .take_while(|(offset, entry)| *offset == 0 || entry.depth > depth)
+                    .map(|(_, entry)| entry)
+                    .map(|entry| entry.id.clone())
+                    .collect::<Vec<_>>();
+                let replace = match &best {
+                    None => true,
+                    Some((_, _, _, _, best_from, _, _)) => from > *best_from,
+                };
+                if replace {
+                    best = Some((
+                        position,
+                        page_id.clone(),
+                        shape_id.clone(),
+                        order,
+                        from,
+                        depth,
+                        removed,
+                    ));
+                }
+            }
+            let Some((position, page_id, shape_id, order, from, _, removed)) = best else {
+                let (page_id, shape_id) = &remaining[0];
+                if deletes
+                    .iter()
+                    .any(|entry| &entry.page_id == page_id && &entry.shape_id == shape_id)
+                {
+                    return Err(EditError::ShapeNotFound(shape_id.clone()));
+                }
+                remaining.remove(0);
+                continue;
+            };
+            {
+                let sheets = txn
+                    .get_map(SHEETS)
+                    .ok_or_else(|| EditError::InvalidState("missing sheets map".to_owned()))?;
+                order.remove_range(&mut txn, from, 1);
+                for id in &removed {
+                    sheets.remove(&mut txn, id.as_str());
+                }
+                if let Some(stories) = txn.get_map(STORIES) {
+                    for id in &removed {
+                        stories.remove(&mut txn, id.as_str());
+                    }
+                }
+            }
+            receipts.push(ShapeReceipt {
+                page_id: page_id.clone(),
+                shape_id: shape_id.clone(),
+                from_index: Some(from),
+                to_index: None,
+            });
+            remaining.remove(position);
+            remaining.retain(|(_, shape_id)| !removed.contains(shape_id));
+        }
+        receipts.sort_by(|left, right| {
+            deletes
+                .iter()
+                .position(|entry| entry.shape_id == left.shape_id)
+                .cmp(
+                    &deletes
+                        .iter()
+                        .position(|entry| entry.shape_id == right.shape_id),
+                )
+        });
+        Ok(receipts)
+    }
+
+    pub fn set_cell_formulas(
+        &self,
+        context: &EditCtx,
+        writes: &[CellFormulaWrite],
+    ) -> EditResult<Vec<CellFormulaReceipt>> {
+        if writes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut txn = self.transact_for(context);
+        let mut pending = Vec::with_capacity(writes.len());
+        for write in writes {
+            let context_for_policy =
+                CrdtMutationContext::new(&txn, &write.page_id, &write.shape_id)?;
+            match decide_mutation(
+                &context_for_policy,
+                context_for_policy.locator(CellLocator {
+                    sheet: CellSheet::Page(0),
+                    shape_id: None,
+                    section: None,
+                    section_index: None,
+                    row: None,
+                    cell_name: write.cell_name.clone(),
+                }),
+                gesture_for_cell(&write.cell_name),
+                write.formula.clone(),
+                &ParseLimits::default(),
+            ) {
+                MutationOutcome::Allowed { target, .. } => pending.push((
+                    write.page_id.clone(),
+                    write.shape_id.clone(),
+                    target,
+                    write.formula.clone(),
+                )),
+                MutationOutcome::Refused { reason } | MutationOutcome::Unsupported { reason } => {
+                    return Err(EditError::InvalidState(reason));
+                }
+            }
+        }
+        let mut receipts = Vec::with_capacity(pending.len());
+        for (page_id, shape_id, target, formula) in pending {
+            let cell = cell_map(&mut txn, &page_id, &shape_id, &target)?;
+            let before = map_string(&cell, &txn, "formula");
+            cell.insert(&mut txn, "formula", formula.as_str());
+            receipts.push(CellFormulaReceipt {
+                page_id,
+                shape_id,
+                cell_name: target.cell_name,
+                before,
+                after: formula,
+            });
+        }
+        Ok(receipts)
     }
 
     pub fn resize_loc_pin(
@@ -1901,7 +2177,7 @@ impl DiagramSession {
         })
     }
 
-    fn set_cell_formulas<const N: usize>(
+    fn set_cell_formula_group<const N: usize>(
         &self,
         context: &EditCtx,
         page_id: &str,
@@ -2747,6 +3023,7 @@ fn validate_new_cells(
                 "LockWidth",
                 "LockHeight",
                 "LockAspect",
+                "LockRotate",
                 "LockTextEdit",
                 "LockFormat",
                 "LockDelete",
@@ -3099,6 +3376,7 @@ fn protected_formulas(doc: &Doc) -> EditResult<std::collections::BTreeMap<String
                     "LockWidth",
                     "LockHeight",
                     "LockAspect",
+                    "LockRotate",
                     "LockTextEdit",
                     "LockFormat",
                     "LockDelete",
@@ -3145,6 +3423,7 @@ fn lock_target(lock: &str) -> Option<&str> {
         "LockWidth" => Some("Width"),
         "LockHeight" => Some("Height"),
         "LockAspect" => Some("Width"),
+        "LockRotate" => Some("Angle"),
         "LockTextEdit" => Some("Text"),
         "LockFormat" | "LockDelete" => None,
         _ => None,
@@ -3582,17 +3861,44 @@ fn numeric_reference(references: &impl References, name: &str) -> Option<f64> {
     }
 }
 
-fn references_pin(expression: &Expr) -> bool {
+fn expression_references_pin(
+    expression: &Expr,
+    base: &vsdx_resolve::ResolvedShape,
+    visited: &mut HashSet<String>,
+    depth: u8,
+) -> bool {
     match expression {
         Expr::Reference(name) => {
-            !name.contains('!') && {
-                let cell = name.rsplit('.').next().unwrap_or(name);
-                cell.eq_ignore_ascii_case("PinX") || cell.eq_ignore_ascii_case("PinY")
+            if name.contains('!') {
+                return false;
+            }
+            let cell = name.rsplit('.').next().unwrap_or(name);
+            if cell.eq_ignore_ascii_case("PinX") || cell.eq_ignore_ascii_case("PinY") {
+                return true;
+            }
+            if depth >= 32 || !visited.insert(name.to_ascii_uppercase()) {
+                return false;
+            }
+            let Some(formula) = base.formula(name) else {
+                return false;
+            };
+            let trimmed = formula.trim_start_matches('=').trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            match vsdx_eval::parse(trimmed, &ParseLimits::default()) {
+                Ok(nested) => expression_references_pin(&nested, base, visited, depth + 1),
+                Err(_) => false,
             }
         }
-        Expr::Unary(inner) => references_pin(inner),
-        Expr::Binary(left, _, right) => references_pin(left) || references_pin(right),
-        Expr::Call(_, arguments) => arguments.iter().any(references_pin),
+        Expr::Unary(inner) => expression_references_pin(inner, base, visited, depth),
+        Expr::Binary(left, _, right) => {
+            expression_references_pin(left, base, visited, depth)
+                || expression_references_pin(right, base, visited, depth)
+        }
+        Expr::Call(_, arguments) => arguments
+            .iter()
+            .any(|argument| expression_references_pin(argument, base, visited, depth)),
         Expr::Number(_, _) | Expr::String(_) => false,
     }
 }
@@ -3617,7 +3923,9 @@ fn loc_pin_component(
         return current;
     }
     match vsdx_eval::parse(trimmed, &ParseLimits::default()) {
-        Ok(expression) if references_pin(&expression) => current,
+        Ok(expression) if expression_references_pin(&expression, base, &mut HashSet::new(), 0) => {
+            current
+        }
         Ok(_) => match evaluate(trimmed, overrides, &ParseLimits::default()) {
             Evaluation::Evaluated(result) => match result.value {
                 Value::Number(number) => number.number,
@@ -4620,6 +4928,7 @@ fn gesture_for_cell(cell_name: &str) -> MutationGesture {
         "PinY" => MutationGesture::MoveY,
         "Width" => MutationGesture::ResizeWidth,
         "Height" => MutationGesture::ResizeHeight,
+        "Angle" => MutationGesture::Rotate,
         _ => MutationGesture::CellEdit,
     }
 }
