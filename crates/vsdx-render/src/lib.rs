@@ -5486,6 +5486,60 @@ mod tests {
     }
 
     #[test]
+    fn every_shape_transform_resolves() {
+        let renderer = Renderer::default();
+        let totals = |bytes: &[u8]| {
+            let package = vsdx_parse::parse_vsdx(bytes).unwrap();
+            package
+                .page_part_paths
+                .iter()
+                .map(|page| {
+                    transform_totals(&renderer.layout_page(&package, page).unwrap().primitives)
+                })
+                .fold((0usize, 0usize), |sum, page| {
+                    (sum.0 + page.0, sum.1 + page.1)
+                })
+        };
+        let mut files = 1usize;
+        let (painted, mut unresolvable) = totals(include_bytes!(
+            "../../vsdx-parse/tests/fixtures/transform-sources.vsdx"
+        ));
+        assert_eq!(painted, 5, "painted transform-source shapes");
+        if let Ok(directory) = std::env::var("VSDX_CORPUS_DIR") {
+            let mut paths = std::fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "vsdx" || extension == "vstx")
+                })
+                .collect::<Vec<_>>();
+            paths.sort();
+            assert!(!paths.is_empty(), "expected VSDX files in VSDX_CORPUS_DIR");
+            files += paths.len();
+            for path in &paths {
+                unresolvable += totals(&std::fs::read(path).unwrap()).1;
+            }
+        }
+        eprintln!("VSDX transforms: files={files} unresolvable={unresolvable}");
+        assert_eq!(unresolvable, 0, "unresolvable transforms");
+    }
+
+    fn transform_totals(primitives: &[Primitive]) -> (usize, usize) {
+        primitives
+            .iter()
+            .map(|primitive| match primitive {
+                Primitive::Shape { .. } => (1, 0),
+                Primitive::Placeholder { reason, .. } => {
+                    (0, usize::from(reason == "unresolvable transform"))
+                }
+                Primitive::Group { primitives, .. } => transform_totals(primitives),
+                _ => (0, 0),
+            })
+            .fold((0, 0), |sum, item| (sum.0 + item.0, sum.1 + item.1))
+    }
+
+    #[test]
     fn group_subshapes_render_master_geometry_and_text_with_page_formatting() {
         let package = vsdx_parse::parse_vsdx(include_bytes!(
             "../../vsdx-parse/tests/fixtures/group-master-shape.vsdx"
