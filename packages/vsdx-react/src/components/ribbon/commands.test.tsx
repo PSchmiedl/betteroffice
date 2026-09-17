@@ -311,6 +311,23 @@ test('prefers rendered display-list colours over unresolved palette indexes', ()
   expect(withoutFrame.fillColor.value).toBe('#000000');
 });
 
+test('a gradient fill shows its first stop instead of falling back to black', () => {
+  const frame = {
+    contractVersion: 5, width: 8, height: 8,
+    paintTransform: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+    primitives: [{
+      kind: 'shape', id: 'page:2', zOrder: 0, path: [],
+      fill: { kind: 'gradient', angleDeg: 90, stops: [{ position: 0, color: '#123456' }, { position: 1, color: '#ABCDEF' }] },
+    }],
+  } as unknown as Parameters<typeof frameSwatch>[0];
+  const state = snapshot({ FillForegnd: '5' });
+  state.pages[0].shapes[1].sourceId = 2;
+  state.pages[0].sourcePartPath = 'page';
+  const commands = createRibbonCommands(handle(state), selected, 'page', () => {}, () => {}, () => {}, frame);
+  expect(commands.fillColor.value).toBe('#123456');
+  expect(frameSwatch(frame, state.pages[0], state.pages[0].shapes[1]).line).toBeUndefined();
+});
+
 test('uses a shape root cell without confusing a same-named User cell', () => {
   const state = snapshot({ PinX: '4' });
   const shape = state.pages[0].shapes[1];

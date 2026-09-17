@@ -1,6 +1,6 @@
 import { createContext, createElement, useContext, useMemo } from 'react';
 import type { ReactNode } from 'react';
-import type { DiagramHandle, DiagramSnapshot, PageDisplayList, PagePrimitive, PageSnapshot, ShapePrimitive, ShapeSnapshot } from '@betteroffice/vsdx';
+import type { DiagramHandle, DiagramSnapshot, PageDisplayList, PagePrimitive, PageSnapshot, Paint, ShapePrimitive, ShapeSnapshot } from '@betteroffice/vsdx';
 import type { VsdxShapeSelection } from '../../VsdxEditor';
 import { standardShapeById } from '../shapes/shapeLibrary';
 
@@ -203,6 +203,14 @@ function findShapePrimitive(primitives: readonly PagePrimitive[], id: string, de
   return null;
 }
 
+const HEX_COLOUR = /^#[0-9a-f]{6}$/i;
+
+/** A gradient stands in for its first stop, the way Visio's fill swatch shows it. */
+function paintSwatch(paint: Paint | undefined): string | undefined {
+  const colour = paint?.kind === 'solid' ? paint.color : paint?.kind === 'gradient' ? paint.stops[0]?.color : undefined;
+  return colour !== undefined && HEX_COLOUR.test(colour) ? colour : undefined;
+}
+
 /** Rendered stroke/fill colours for a shape, when the display list resolves one. */
 export function frameSwatch(
   frame: PageDisplayList | null | undefined,
@@ -212,8 +220,8 @@ export function frameSwatch(
   if (!frame || !page || !shape) return {};
   const primitive = findShapePrimitive(frame.primitives, `${page.sourcePartPath}:${shape.sourceId}`);
   if (!primitive) return {};
-  const fill = primitive.fill?.kind === 'solid' && /^#[0-9a-f]{6}$/i.test(primitive.fill.color) ? primitive.fill.color : undefined;
-  const line = primitive.stroke && /^#[0-9a-f]{6}$/i.test(primitive.stroke.color) ? primitive.stroke.color : undefined;
+  const fill = paintSwatch(primitive.fill);
+  const line = primitive.stroke && HEX_COLOUR.test(primitive.stroke.color) ? primitive.stroke.color : undefined;
   return { fill, line };
 }
 
