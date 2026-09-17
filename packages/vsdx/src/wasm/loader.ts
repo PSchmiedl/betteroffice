@@ -1,6 +1,6 @@
 import initWasmModule, { VsdxDocument, VsdxRenderer, rendererVersion } from './generated/vsdx_wasm.js';
 import type { InitInput } from './generated/vsdx_wasm.js';
-import type { CellLocator, CellFormulaReceipt, CollaborationUpdateOrigin, ConnectorGlue, DiagramSnapshot, FormulaShapeDraft, HistoryResult, HitTestResult, PageDisplayList, PageLayer, ShapeReceipt, TextReceipt, VsdxFontFace } from '../types';
+import type { CellLocator, CellFormulaReceipt, CollaborationUpdateOrigin, ConnectedShapeReceipt, ConnectorGlue, DiagramSnapshot, FormulaShapeDraft, HistoryResult, HitTestResult, PageDisplayList, PageLayer, ShapeReceipt, TextReceipt, VsdxFontFace } from '../types';
 
 export type WasmInitInput = InitInput | Promise<InitInput>;
 export interface OpenDiagramOptions { clientId?: number; fonts?: ReadonlyArray<VsdxFontFace>; initialUpdate?: Uint8Array; }
@@ -26,6 +26,7 @@ export interface DiagramHandle {
   reorderPage(pageId: string, toIndex: number): ShapeReceipt;
   addShape(pageId: string, draft: FormulaShapeDraft): ShapeReceipt;
   addConnector(pageId: string, draft: FormulaShapeDraft, from: ConnectorGlue, to: ConnectorGlue): ShapeReceipt;
+  addConnectedShape(pageId: string, shapeDraft: FormulaShapeDraft, connectorDraft: FormulaShapeDraft, from: ConnectorGlue, toCell?: string): ConnectedShapeReceipt;
   deleteShape(pageId: string, shapeId: string): ShapeReceipt;
   shapeText(pageId: string, shapeId: string): string;
   setShapeText(pageId: string, shapeId: string, text: string): TextReceipt;
@@ -145,6 +146,7 @@ export function openDiagram(bytes: Uint8Array, options: OpenDiagramOptions = {})
     reorderPage: (pageId, toIndex) => json(() => doc.reorderPageJson(JSON.stringify({ pageId, toIndex })), true),
     addShape: (pageId, draft) => json(() => doc.addShapeJson(JSON.stringify({ pageId, draft })), true),
     addConnector: (pageId, draft, from, to) => json(() => doc.addConnectorJson(JSON.stringify({ pageId, draft, from, to })), true),
+    addConnectedShape: (pageId, shapeDraft, connectorDraft, from, toCell) => json(() => doc.addConnectedShapeJson(JSON.stringify({ pageId, shapeDraft, connectorDraft, from, toCell })), true),
     deleteShape: (pageId, shapeId) => json(() => doc.deleteShapeJson(JSON.stringify({ pageId, shapeId })), true),
     shapeText: (pageId, shapeId) => json(() => doc.shapeTextJson(JSON.stringify({ pageId, shapeId }))),
     setShapeText: (pageId, shapeId, text) => json(() => doc.setShapeTextJson(JSON.stringify({ pageId, shapeId, text })), true),

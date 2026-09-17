@@ -1,6 +1,10 @@
 export { VsdxEditor } from './VsdxEditor';
 export type { VsdxEditorApi, VsdxEditorCollaborationOptions, VsdxEditorProps, VsdxShapeSelection } from './VsdxEditor';
+export { connectorTargetForPoint, nearestPointOnShape } from './VsdxEditor';
+export { AUTO_CONNECT_FADE_MS, AUTO_CONNECT_GAP_PX, AUTO_CONNECT_HALO_PX, AUTO_CONNECT_HIT_PX, AUTO_CONNECT_SIDES, AUTO_CONNECT_SIZE_PX, CONNECTOR_GLUE_MATCH_INCHES, CONNECTOR_SNAP_INCHES, QUICK_SHAPE_GAP_INCHES, QUICK_SHAPE_IDS, arrowheadPolygon, autoConnectArrowAt, autoConnectArrowCenter, autoConnectArrowCss, autoConnectArrowsForShape, autoConnectHaloHit, autoConnectMetrics, classifyConnectorEndpoint, connectionPointsForShape, connectorDraft, connectorEndpointGlue, connectorGlue, connectorRouteFromFrame, dropTargetForPoint, formatInches, isConnectorShape, modelToPage, movedShapePoints, nearestConnectionPoint, nearestConnectionPointAnywhere, paintAutoConnectOverlay, paintConnectorEndpoint, paintConnectorOverlay, quickShapePlacement, reroutePreviewForMove, routeConnector } from './connector';
+export type { AutoConnectArrow, AutoConnectOverlayState, AutoConnectSide, ConnectionPoint, ConnectorDragEndpoint, ConnectorEndpointGlue, ConnectorOverlayRoute, ConnectorOverlayScene, ConnectorSide, MovedShapeGeometry, QuickShapePlacement } from './connector';
 export { Ribbon } from './components/ribbon/Ribbon';
+export type { RibbonConnectorToggle } from './components/ribbon/Ribbon';
 export { CommandMenu, CommandMenuItem } from './components/ribbon/CommandMenu';
 export type { CommandMenuEntry } from './components/ribbon/CommandMenu';
 export { ShapeContextMenu } from './components/ribbon/ShapeContextMenu';

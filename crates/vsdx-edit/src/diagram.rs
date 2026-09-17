@@ -1215,8 +1215,14 @@ fn insert_shape(
     largest.checked_add(1).ok_or_else(|| {
         EditError::InvalidState("cannot allocate a materialized source ID".to_owned())
     })?;
-    let sequence = txn.state_vector().get(&yrs::ClientID::new(client_id));
-    let id = format!("{id_prefix}{sequence}");
+    let mut sequence = txn.state_vector().get(&yrs::ClientID::new(client_id));
+    let id = loop {
+        let candidate = format!("{id_prefix}{sequence}");
+        if sheets.get(&*txn, candidate.as_str()).is_none() {
+            break candidate;
+        }
+        sequence += 1;
+    };
     let shape = sheets.insert(txn, id.as_str(), MapPrelim::default());
     shape.insert(txn, "id", id.as_str());
     shape.insert(txn, "pageId", page_id);

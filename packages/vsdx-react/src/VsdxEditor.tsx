@@ -4,6 +4,8 @@ import { canvasPointToModel, modelPointToCanvas, initWasm, openDiagram, paintPag
 import type { Affine, CellLocator, PageLayer, PagePrimitive, CollaborationReplica, DiagramHandle, DiagramSnapshot, HitTestResult, ModelPoint, PageDisplayList, PageSnapshot, ShapeDataRow, ShapeSnapshot, TextDiagnostic, VsdxFontFace, VsdxPresence } from '@betteroffice/vsdx';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent, FocusEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from 'react';
+import { AUTO_CONNECT_FADE_MS, QUICK_SHAPE_IDS, autoConnectArrowAt, autoConnectArrowCss, autoConnectArrowsForShape, autoConnectHaloHit, connectionPointsForShape, connectorDraft, connectorEndpointGlue, connectorGlue, connectorRouteFromFrame, dropTargetForPoint, isConnectorShape, nearestConnectionPointAnywhere, paintAutoConnectOverlay, paintConnectorOverlay, quickShapePlacement, reroutePreviewForMove, routeConnector } from './connector';
+import type { AutoConnectSide, ConnectionPoint, ConnectorDragEndpoint, ConnectorOverlayRoute, ConnectorOverlayScene } from './connector';
 import { Ribbon } from './components/ribbon/Ribbon';
 import { CanvasContextMenu } from './components/ribbon/CanvasContextMenu';
 import { ShapeContextMenu } from './components/ribbon/ShapeContextMenu';
@@ -103,6 +105,23 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const insertCascadeRef = useRef<Map<string, number>>(new Map());
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
+  const [connectorMode, setConnectorMode] = useState(false);
+  const connectorModeRef = useRef(connectorMode);
+  connectorModeRef.current = connectorMode;
+  const hoverShapeRef = useRef<string | null>(null);
+  const connectorDragRef = useRef<{ pageId: string; from: ConnectorDragEndpoint; current: ModelPoint; snap: ConnectorDragEndpoint | null } | null>(null);
+  const reroutePreviewRef = useRef<ReadonlyArray<readonly ModelPoint[]>>([]);
+  const connectorFrameRef = useRef<number | null>(null);
+  const autoHoverRef = useRef<string | null>(null);
+  const autoArrowRef = useRef<{ shapeId: string; side: AutoConnectSide } | null>(null);
+  const autoAlphaRef = useRef(0);
+  const autoFadeStartRef = useRef(0);
+  const autoFrameRef = useRef<number | null>(null);
+  const autoMoveRef = useRef<{ canvas: ModelPoint; model: ModelPoint } | null>(null);
+  const [quickMenu, setQuickMenu] = useState<{ shapeId: string; side: AutoConnectSide; x: number; y: number } | null>(null);
+  const quickMenuRef = useRef(quickMenu);
+  quickMenuRef.current = quickMenu;
+  const quickMenuNodeRef = useRef<HTMLDivElement | null>(null);
   const [loading, setLoading] = useState(Boolean(file));
   onReadyRef.current = onReady;
   onChangeRef.current = onChange;
@@ -263,6 +282,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     const dpr = window.devicePixelRatio || 1; sizeCanvasForPage(canvas, frame, dpr, zoom); context.clearRect(0, 0, canvas.width, canvas.height);
     const snapshot = model.snapshot;
     const page = snapshot?.pages[model.pageIndex];
+    paintConnectorLayer(context, frame);
     if (selection && page && !selectionHiddenByLayers(page, model.layers, selection)) {
       try {
         const corners = selectionCorners(page, frame, selection);
@@ -277,7 +297,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     if (start && release) {
       try { paintDragPreview(context, previewOutline(start, release, frame.paintTransform, dragSnapRef.current), dpr, zoom); } catch { void 0; }
     }
-  }, [model.frame, model.snapshot, model.pageIndex, selection, zoom]);
+  }, [model.frame, model.snapshot, model.pageIndex, model.layers, selection, zoom, connectorMode]);
 
   useEffect(() => {
     if (!editing) return;
@@ -309,7 +329,11 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     return () => document.removeEventListener('pointerdown', onDown, true);
   }, [editing, commitTextEdit]);
 
-  useEffect(() => () => { if (previewFrameRef.current !== null) cancelAnimationFrame(previewFrameRef.current); }, []);
+  useEffect(() => () => {
+    if (previewFrameRef.current !== null) cancelAnimationFrame(previewFrameRef.current);
+    if (connectorFrameRef.current !== null) cancelAnimationFrame(connectorFrameRef.current);
+    if (autoFrameRef.current !== null) cancelAnimationFrame(autoFrameRef.current);
+  }, []);
 
   const clearDragPreview = () => {
     if (previewFrameRef.current !== null) { cancelAnimationFrame(previewFrameRef.current); previewFrameRef.current = null; }
@@ -324,6 +348,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     const currentSelection = selectionRef.current;
     const page = current.snapshot?.pages[current.pageIndex];
     context.clearRect(0, 0, overlay.width, overlay.height);
+    paintConnectorLayer(context, frame);
     if (currentSelection && page && !selectionHiddenByLayers(page, current.layers, currentSelection)) {
       try {
         const corners = selectionCorners(page, frame, currentSelection);
@@ -336,12 +361,197 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     }
   };
 
+  const connectorScene = (frame: PageDisplayList): ConnectorOverlayScene => {
+    const current = modelRef.current;
+    const page = current.snapshot?.pages[current.pageIndex];
+    const drag = connectorDragRef.current;
+    const connectors: ConnectorOverlayRoute[] = [];
+    let hoverPoints: readonly ConnectionPoint[] = [];
+    if (page) {
+      const selectedId = selectionRef.current?.pageId === page.id ? selectionRef.current.shapeId : null;
+      for (const shape of page.shapes) {
+        if (!isConnectorShape(shape)) continue;
+        const route = connectorRouteFromFrame(frame, page.sourcePartPath, shape.sourceId);
+        if (!route) continue;
+        const [beginGlue, endGlue] = connectorEndpointGlue(route, page.shapes);
+        connectors.push({ route, selected: shape.id === selectedId, beginGlue, endGlue });
+      }
+      const hoverId = drag?.from.shapeId ?? hoverShapeRef.current;
+      const hovered = hoverId ? page.shapes.find((shape) => shape.id === hoverId) : undefined;
+      if (hovered) hoverPoints = connectionPointsForShape(hovered);
+    }
+    return {
+      hoverPoints,
+      snapPoint: drag?.snap?.point ?? null,
+      previewRoute: drag ? routeConnector(drag.from.point, drag.snap?.point ?? drag.current) : null,
+      reroutePreview: reroutePreviewRef.current,
+      connectors,
+    };
+  };
+
+  const paintConnectorLayer = (context: CanvasRenderingContext2D, frame: PageDisplayList) => {
+    const dpr = window.devicePixelRatio || 1;
+    try { paintConnectorOverlay(context, frame, dpr, zoomRef.current, connectorScene(frame)); } catch { void 0; }
+    if (connectorModeRef.current || connectorDragRef.current || !autoHoverRef.current) return;
+    const page = modelRef.current.snapshot?.pages[modelRef.current.pageIndex];
+    const placement = page ? findShapePlacement(page.shapes, autoHoverRef.current) : null;
+    if (!page || !placement || placement.siblings !== page.shapes || isConnectorShape(placement.shape)) return;
+    try {
+      paintAutoConnectOverlay(context, frame, dpr, zoomRef.current, {
+        arrows: autoConnectArrowsForShape(placement.shape),
+        hovered: autoArrowRef.current?.shapeId === placement.shape.id ? autoArrowRef.current.side : null,
+        alpha: autoAlphaRef.current,
+      });
+    } catch { void 0; }
+  };
+
+  const cancelAutoFade = () => {
+    if (autoFrameRef.current !== null) cancelAnimationFrame(autoFrameRef.current);
+    autoFrameRef.current = null;
+  };
+
+  const startAutoFade = () => {
+    cancelAutoFade();
+    autoFadeStartRef.current = performance.now();
+    autoAlphaRef.current = 0;
+    const tick = () => {
+      autoAlphaRef.current = Math.min(1, (performance.now() - autoFadeStartRef.current) / AUTO_CONNECT_FADE_MS);
+      repaintOverlaySelection();
+      autoFrameRef.current = autoAlphaRef.current < 1 ? requestAnimationFrame(tick) : null;
+    };
+    autoFrameRef.current = requestAnimationFrame(tick);
+  };
+
+  const clearAutoConnect = () => {
+    cancelAutoFade();
+    autoHoverRef.current = null;
+    autoArrowRef.current = null;
+    autoAlphaRef.current = 0;
+    autoMoveRef.current = null;
+    if (quickMenuRef.current) setQuickMenu(null);
+  };
+
+  const hideAutoConnect = () => { clearAutoConnect(); repaintOverlaySelection(); };
+
+  const scheduleConnectorRepaint = () => {
+    if (connectorFrameRef.current !== null) return;
+    connectorFrameRef.current = requestAnimationFrame(() => { connectorFrameRef.current = null; repaintOverlaySelection(); });
+  };
+
+  /** Routes for connectors glued to the shape being dragged, recomputed at its preview geometry. */
+  const gluedReroutePreview = (start: DragStart, release: ModelPoint): ReadonlyArray<readonly ModelPoint[]> => {
+    const current = modelRef.current; const frame = current.frame;
+    const page = current.snapshot?.pages[current.pageIndex];
+    const active = selectionRef.current;
+    if (!frame || !page || !active || active.pageId !== page.id) return [];
+    const placement = findShapePlacement(page.shapes, active.shapeId);
+    if (!placement || placement.siblings !== page.shapes) return [];
+    try { return reroutePreviewForMove(page.shapes, frame, page.sourcePartPath, placement.shape, resolveDragGeometry(start, release)); }
+    catch { return []; }
+  };
+
+  /** Connector mode owns the pointer: a live drag updates its snap, otherwise only a hover change repaints. */
+  const onConnectorPointerMove = (event: PointerEvent<HTMLCanvasElement>) => {
+    const handle = handleRef.current; const current = modelRef.current; const frame = current.frame;
+    const page = current.snapshot?.pages[current.pageIndex];
+    if (!handle || !frame || !page) return;
+    try {
+      const point = canvasPointerPosition(event, frame);
+      const drag = connectorDragRef.current;
+      if (drag) {
+        drag.current = point.model;
+        drag.snap = connectorTargetForPoint(page.shapes, handle, point.canvas, point.model);
+        scheduleConnectorRepaint();
+        return;
+      }
+      const hit = handle.hitTest(point.canvas.x, point.canvas.y);
+      const placement = hit ? findShapePlacement(page.shapes, hit.shapeId) : null;
+      const hovered = placement && placement.siblings === page.shapes && !isConnectorShape(placement.shape) ? placement.shape.id : null;
+      if (hovered !== hoverShapeRef.current) { hoverShapeRef.current = hovered; repaintOverlaySelection(); }
+    } catch (value) { reportError(value); }
+  };
+
+  /** Coalesces AutoConnect hover to one hit-test per frame; a pointer move alone never calls wasm. */
+  const scheduleAutoConnectHover = (event: PointerEvent<HTMLCanvasElement>, frame: PageDisplayList) => {
+    autoMoveRef.current = canvasPointerPosition(event, frame);
+    if (connectorFrameRef.current !== null) return;
+    connectorFrameRef.current = requestAnimationFrame(() => {
+      connectorFrameRef.current = null;
+      const point = autoMoveRef.current;
+      if (point) resolveAutoConnectHover(point);
+    });
+  };
+
+  const resolveAutoConnectHover = (point: { canvas: ModelPoint; model: ModelPoint }) => {
+    const handle = handleRef.current; const current = modelRef.current; const frame = current.frame;
+    const page = current.snapshot?.pages[current.pageIndex];
+    if (!handle || !frame || !page || connectorModeRef.current || connectorDragRef.current || pointerRef.current) return;
+    const arrowsFor = (shapeId: string | null) => {
+      const placement = shapeId ? findShapePlacement(page.shapes, shapeId) : null;
+      return placement && placement.siblings === page.shapes && !isConnectorShape(placement.shape) ? autoConnectArrowsForShape(placement.shape) : [];
+    };
+    try {
+      if (autoHoverRef.current) {
+        const arrow = autoConnectArrowAt(arrowsFor(autoHoverRef.current), frame, zoomRef.current, point.canvas);
+        const next = arrow ? { shapeId: autoHoverRef.current, side: arrow.side } : null;
+        const previous = autoArrowRef.current;
+        if (next?.shapeId !== previous?.shapeId || next?.side !== previous?.side) {
+          autoArrowRef.current = next;
+          if (next && arrow) setQuickMenu({ shapeId: next.shapeId, side: next.side, ...autoConnectArrowCss(arrow, frame, zoomRef.current) });
+          else if (quickMenuRef.current) setQuickMenu(null);
+          repaintOverlaySelection();
+        }
+        if (arrow) return;
+      }
+      const hit = handle.hitTest(point.canvas.x, point.canvas.y);
+      const placement = hit ? findShapePlacement(page.shapes, hit.shapeId) : null;
+      const hovered = placement && placement.siblings === page.shapes && !isConnectorShape(placement.shape) ? placement.shape.id : null;
+      if (hovered === autoHoverRef.current) return;
+      if (!hovered && autoHoverRef.current) {
+        const kept = findShapePlacement(page.shapes, autoHoverRef.current);
+        if (kept && kept.siblings === page.shapes && !isConnectorShape(kept.shape) && autoConnectHaloHit(kept.shape, frame, zoomRef.current, point.canvas)) return;
+      }
+      autoHoverRef.current = hovered;
+      autoArrowRef.current = null;
+      if (quickMenuRef.current) setQuickMenu(null);
+      if (hovered) startAutoFade();
+      else { cancelAutoFade(); autoAlphaRef.current = 0; repaintOverlaySelection(); }
+    } catch (value) { reportError(value); }
+  };
+
+  const onPointerLeave = (event: PointerEvent<HTMLCanvasElement>) => {
+    if (!connectorModeRef.current && !connectorDragRef.current) {
+      const next = event.relatedTarget as Node | null;
+      if (next && quickMenuNodeRef.current?.contains(next)) return;
+      if (autoHoverRef.current || autoArrowRef.current || quickMenuRef.current) hideAutoConnect();
+      return;
+    }
+    if (!connectorModeRef.current || connectorDragRef.current) return;
+    if (hoverShapeRef.current) { hoverShapeRef.current = null; repaintOverlaySelection(); }
+  };
+
   const onPointerDown = (event: PointerEvent<HTMLCanvasElement>) => {
     const handle = handleRef.current; const frame = model.frame; const page = model.snapshot?.pages[model.pageIndex];
     if (!handle || !frame || !page) return;
     if (event.button === 2) return;
     if (pointerRef.current) return;
     pointerRef.current = null; dragPreviewRef.current = null;
+    if (connectorModeRef.current) {
+      try {
+        const point = canvasPointerPosition(event, frame);
+        const target = connectorTargetForPoint(page.shapes, handle, point.canvas, point.model);
+        if (target) {
+          connectorDragRef.current = { pageId: page.id, from: target, current: point.model, snap: target };
+          setSelection({ pageId: page.id, shapeId: target.shapeId, hit: { kind: 'shape', shapeId: target.shapeId } });
+          capturePointer(event);
+        } else {
+          const hit = handle.hitTest(point.canvas.x, point.canvas.y);
+          setSelection(hit ? selectionForHit(page, hit) : null);
+        }
+        repaintOverlaySelection();
+      } catch (value) { reportError(value); }
+      return;
+    }
     try {
       const point = canvasPointerPosition(event, frame);
       const active = selectionRef.current;
@@ -402,6 +612,21 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
           }
         } catch { void 0; }
       }
+      if (autoHoverRef.current) {
+        const hovered = findShapePlacement(page.shapes, autoHoverRef.current);
+        const arrows = hovered && hovered.siblings === page.shapes && !isConnectorShape(hovered.shape) ? autoConnectArrowsForShape(hovered.shape) : [];
+        const arrow = autoConnectArrowAt(arrows, frame, zoomRef.current, point.canvas);
+        if (arrow) {
+          const sourceId = autoHoverRef.current;
+          connectorDragRef.current = { pageId: page.id, from: { shapeId: sourceId, point: arrow.point }, current: point.model, snap: null };
+          clearAutoConnect();
+          setSelection({ pageId: page.id, shapeId: sourceId, hit: { kind: 'shape', shapeId: sourceId } });
+          capturePointer(event);
+          repaintOverlaySelection();
+          return;
+        }
+      }
+      if (autoHoverRef.current || autoArrowRef.current || quickMenuRef.current) clearAutoConnect();
       handle.layoutPage(model.pageIndex);
       const hit = handle.hitTest(point.canvas.x, point.canvas.y);
       const next = hit ? selectionForHit(page, hit) : null;
@@ -420,6 +645,13 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   };
   const onPointerMove = (event: PointerEvent<HTMLCanvasElement>) => {
     const start = pointerRef.current;
+    if (connectorModeRef.current) { onConnectorPointerMove(event); return; }
+    if (start) {
+      if (autoHoverRef.current || autoArrowRef.current || quickMenuRef.current) clearAutoConnect();
+    } else {
+      const hoverFrame = modelRef.current.frame;
+      if (hoverFrame) { try { scheduleAutoConnectHover(event, hoverFrame); } catch { void 0; } }
+    }
     if (!start) {
       try {
         const current = modelRef.current; const frame = current.frame;
@@ -483,19 +715,45 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
             return;
           }
           const corners = previewOutline(liveStart, release, liveFrame.paintTransform, dragSnapRef.current);
+          reroutePreviewRef.current = gluedReroutePreview(liveStart, release);
           context.clearRect(0, 0, overlay.width, overlay.height);
+          paintConnectorLayer(context, liveFrame);
           paintDragPreview(context, corners, window.devicePixelRatio || 1, zoomRef.current);
           paintSelectionFrame(context, corners, window.devicePixelRatio || 1, zoomRef.current);
         } catch (value) { reportError(value); }
       });
     } catch (value) { reportError(value); }
   };
+  const commitConnectorDrag = (event: PointerEvent<HTMLCanvasElement>) => {
+    const drag = connectorDragRef.current;
+    connectorDragRef.current = null;
+    const handle = handleRef.current; const current = modelRef.current; const frame = current.frame;
+    const page = current.snapshot?.pages[current.pageIndex];
+    try {
+      if (!drag || !handle || !frame || !page) return;
+      let end = drag.snap;
+      try {
+        const point = canvasPointerPosition(event, frame);
+        end = connectorTargetForPoint(page.shapes, handle, point.canvas, point.model) ?? drag.snap;
+      } catch { end = drag.snap; }
+      if (!end || (end.shapeId === drag.from.shapeId && end.point.side === drag.from.point.side)) return;
+      const live = handle.snapshot().pages.find((item) => item.id === drag.pageId);
+      if (!live || !findShapePlacement(live.shapes, drag.from.shapeId) || !findShapePlacement(live.shapes, end.shapeId)) return;
+      const receipt = handle.addConnector(drag.pageId, connectorDraft(drag.from.point, end.point), connectorGlue(drag.from.shapeId, drag.from.point), connectorGlue(end.shapeId, end.point));
+      refresh(undefined, true);
+      setSelection({ pageId: drag.pageId, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } });
+    } catch (value) { reportError(value); }
+    finally { repaintOverlaySelection(); }
+  };
+
   const onPointerUp = (event: PointerEvent<HTMLCanvasElement>) => {
+    if (connectorDragRef.current) { commitConnectorDrag(event); return; }
     const pointer = pointerRef.current;
     if (!pointer) return;
     if (pointer.pointerId !== undefined && pointer.pointerId !== event.pointerId) return;
     pointerRef.current = null;
     const hadPreview = dragPreviewRef.current !== null;
+    reroutePreviewRef.current = [];
     clearDragPreview();
     const handle = handleRef.current; const selected = selection; const frame = model.frame;
     if (!handle || !selected || !frame) return;
@@ -534,17 +792,25 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       refresh(undefined, true);
     } catch (value) { reportError(value); }
   };
+  const abandonConnectorDrag = () => {
+    if (!connectorDragRef.current) return false;
+    connectorDragRef.current = null;
+    repaintOverlaySelection();
+    return true;
+  };
   const onPointerCancel = (event: PointerEvent<HTMLCanvasElement>) => {
+    if (abandonConnectorDrag()) return;
     const pointer = pointerRef.current;
     if (!pointer) return;
     if (pointer.pointerId !== undefined && pointer.pointerId !== event.pointerId) return;
-    pointerRef.current = null; clearDragPreview();
+    pointerRef.current = null; reroutePreviewRef.current = []; clearDragPreview();
   };
   const onLostPointerCapture = (event: PointerEvent<HTMLCanvasElement>) => {
+    if (abandonConnectorDrag()) return;
     const pointer = pointerRef.current;
     if (!pointer) return;
     if (pointer.pointerId !== undefined && pointer.pointerId !== event.pointerId) return;
-    pointerRef.current = null; clearDragPreview();
+    pointerRef.current = null; reroutePreviewRef.current = []; clearDragPreview();
   };
   const closeContextMenu = () => setContextMenu(null);
   const closeContextMenuAndFocus = () => { setContextMenu(null); mainCanvasRef.current?.focus(); };
@@ -613,7 +879,14 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       refresh(undefined, true);
     } catch (value) { reportError(value); }
   };
+  const toggleConnector = useCallback(() => {
+    connectorDragRef.current = null;
+    hoverShapeRef.current = null;
+    clearAutoConnect();
+    setConnectorMode((value) => !value);
+  }, []);
   const onCanvasKeyDown = (event: KeyboardEvent<HTMLCanvasElement>) => {
+    if (event.altKey && event.key === '3') { event.preventDefault(); toggleConnector(); return; }
     const selected = selectionRef.current;
     if (selected && !editingRef.current) {
       if (event.key === 'Enter') { event.preventDefault(); enterTextEdit(selected.pageId, selected.shapeId); return; }
@@ -626,7 +899,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     if (intent.kind === 'undo') { if (commands?.undo.enabled) commands.undo.run(); return; }
     if (intent.kind === 'redo') { if (commands?.redo.enabled) commands.redo.run(); return; }
     if (intent.kind === 'delete') { if (commands?.delete.enabled) commands.delete.run(); return; }
-    if (intent.kind === 'escape') { cancelActiveDrag(); closeContextMenu(); setSelection(null); return; }
+    if (intent.kind === 'escape') { cancelActiveDrag(); hideAutoConnect(); closeContextMenu(); setSelection(null); return; }
     nudgeSelection(intent.dx, intent.dy);
   };
   const onCanvasFocus = (event: FocusEvent<HTMLCanvasElement>) => { event.currentTarget.style.outline = '2px solid #0f6cbd'; event.currentTarget.style.outlineOffset = '2px'; };
@@ -641,6 +914,24 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       setSelection({ pageId: page.id, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } });
     } catch (value) { reportError(value); }
   }, [refresh, reportError]);
+  const insertQuickShape = useCallback((shape: StandardShape, sourceId: string, side: AutoConnectSide) => {
+    const handle = handleRef.current; const current = modelRef.current;
+    const page = current.snapshot?.pages[current.pageIndex];
+    if (!handle || !page) return;
+    try {
+      const live = handle.snapshot().pages.find((item) => item.id === page.id);
+      const placement = live ? findShapePlacement(live.shapes, sourceId) : null;
+      if (!live || !placement || placement.siblings !== live.shapes || isConnectorShape(placement.shape)) return;
+      const source = placement.shape;
+      const layout = quickShapePlacement(source, side, Math.max(0.25, numericCellValue(source, 'Width', 1)), Math.max(0.25, numericCellValue(source, 'Height', 1)));
+      if (!layout) return;
+      const receipt = handle.addConnectedShape(page.id, shape.draft(layout.x, layout.y, layout.width, layout.height), connectorDraft(layout.from, layout.to), connectorGlue(source.id, layout.from), layout.to.toCell);
+      refresh(undefined, true);
+      setSelection({ pageId: page.id, shapeId: receipt.shape.shapeId, hit: { kind: 'shape', shapeId: receipt.shape.shapeId } });
+    } catch (value) { reportError(value); }
+    hideAutoConnect();
+  }, [refresh, reportError]);
+  const quickMenuShapes = useMemo(() => QUICK_SHAPE_IDS.map((id) => standardShapeById(id)).filter((shape): shape is StandardShape => Boolean(shape)), []);
   const insertShape = useCallback((shape: StandardShape) => {
     const current = modelRef.current; const frame = current.frame;
     const page = current.snapshot?.pages[current.pageIndex];
@@ -711,7 +1002,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     <header style={styles.titleBar}><strong>{t('ribbon.documentName')}</strong><span style={{ color: dirty ? '#a16207' : '#526273' }}>{dirty ? t('ribbon.dirty') : t('ribbon.saved')}</span></header>
     <RibbonCommandsProvider handle={handleRef.current} snapshot={model.snapshot} pageId={model.snapshot?.pages[model.pageIndex]?.id} selection={selection} frame={model.frame} pageBreaks={pageBreakToggle} onMutation={() => refresh(undefined, true)} onError={reportError} onDownload={download}>
     <RibbonCommandsBridge target={commandsRef} />
-    <Ribbon t={t} hasSelection={selection !== null} />
+    <Ribbon t={t} hasSelection={selection !== null} connector={{ active: connectorMode, disabled: !model.frame, onToggle: toggleConnector }} />
     <div style={styles.contentRow}>
     {leftPanel === undefined ? (
       <div style={styles.leftColumn}>
@@ -725,9 +1016,18 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       {loading && <span>{t('editor.opening')}</span>}
       {!loading && !model.frame && <span>{file ? t('editor.noPages') : t('editor.openPrompt')}</span>}
       <div style={styles.canvasFrame} onDragOver={onCanvasDragOver} onDrop={onCanvasDrop}>
-        <canvas ref={mainCanvasRef} tabIndex={0} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel} onLostPointerCapture={onLostPointerCapture} onDoubleClick={onCanvasDoubleClick} onContextMenu={onCanvasContextMenu} onKeyDown={onCanvasKeyDown} onFocus={onCanvasFocus} onBlur={onCanvasBlur} aria-label={selection ? t('pages.canvasLabelWithSelection', { current: model.pageIndex + 1, total: model.snapshot?.pages.length ?? 0, name: selection.shapeId }) : t('pages.canvasLabel', { current: model.pageIndex + 1, total: model.snapshot?.pages.length ?? 0 })} style={styles.canvas} />
+        <canvas ref={mainCanvasRef} tabIndex={0} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerLeave={onPointerLeave} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel} onLostPointerCapture={onLostPointerCapture} onDoubleClick={onCanvasDoubleClick} onContextMenu={onCanvasContextMenu} onKeyDown={onCanvasKeyDown} onFocus={onCanvasFocus} onBlur={onCanvasBlur} aria-label={selection ? t('pages.canvasLabelWithSelection', { current: model.pageIndex + 1, total: model.snapshot?.pages.length ?? 0, name: selection.shapeId }) : t('pages.canvasLabel', { current: model.pageIndex + 1, total: model.snapshot?.pages.length ?? 0 })} style={connectorMode ? { ...styles.canvas, cursor: 'crosshair' } : styles.canvas} />
         {showPageBreaks && model.frame && <PageBreakGrid frame={model.frame} zoom={zoom} />}
         <canvas ref={overlayCanvasRef} aria-hidden="true" style={styles.overlay} />
+        {quickMenu && model.frame && (
+          <div ref={quickMenuNodeRef} role="menu" aria-label={t('shapesPanel.quickShapes')} style={{ ...styles.quickMenu, left: Math.max(4, Math.min(quickMenu.x + 16, model.frame.width * zoom - 44)), top: Math.max(100, Math.min(quickMenu.y, model.frame.height * zoom - 100)) }} onMouseLeave={() => { autoArrowRef.current = null; setQuickMenu(null); repaintOverlaySelection(); }}>
+            {quickMenuShapes.map((shape) => (
+              <button key={shape.id} type="button" role="menuitem" aria-label={t(shape.nameKey)} title={t(shape.nameKey)} onClick={() => insertQuickShape(shape, quickMenu.shapeId, quickMenu.side)} style={styles.quickShape}>
+                <svg aria-hidden="true" viewBox="0 0 1 1" preserveAspectRatio="xMidYMid meet" style={styles.quickPreview}><path d={shape.preview} /></svg>
+              </button>
+            ))}
+          </div>
+        )}
         {editing && editOverlay && (
           <div ref={editWrapRef} style={{ ...styles.textEditWrap, width: editOverlay.width, height: editOverlay.height, transform: `matrix(${editOverlay.matrix.a}, ${editOverlay.matrix.b}, ${editOverlay.matrix.c}, ${editOverlay.matrix.d}, ${editOverlay.matrix.e}, ${editOverlay.matrix.f})` }}>
             <textarea
@@ -857,6 +1157,29 @@ export function shapeParentTransforms(primitives: readonly PagePrimitive[], id: 
 }
 
 /** Visio selects the outermost shape a hit falls in; only a top-level shape carries page-space bounds. */
+/** Nearest connection point of a known shape, in model inches. */
+export function nearestPointOnShape(shapes: readonly ShapeSnapshot[], shapeId: string, at: ModelPoint): ConnectionPoint | null {
+  const placement = findShapePlacement(shapes, shapeId);
+  if (!placement || placement.siblings !== shapes || isConnectorShape(placement.shape)) return null;
+  return nearestConnectionPointAnywhere(connectionPointsForShape(placement.shape), at);
+}
+
+/** Drop target forgiving of interior drops; falls back to the hit-tested shape. */
+export function connectorTargetForPoint(shapes: readonly ShapeSnapshot[], handle: DiagramHandle, canvas: ModelPoint, at: ModelPoint): ConnectorDragEndpoint | null {
+  const direct = dropTargetForPoint(shapes, at);
+  if (direct) return direct;
+  let shapeId: string | null = null;
+  try { shapeId = handle.hitTest(canvas.x, canvas.y)?.shapeId ?? null; } catch { shapeId = null; }
+  if (!shapeId) return null;
+  const point = nearestPointOnShape(shapes, shapeId, at);
+  return point ? { shapeId, point } : null;
+}
+
+/** Pointer capture is best-effort; synthetic pointers must not fail the gesture. */
+function capturePointer(event: PointerEvent<HTMLCanvasElement>): void {
+  try { event.currentTarget.setPointerCapture(event.pointerId); } catch { void 0; }
+}
+
 function selectionForHit(page: PageSnapshot, hit: HitTestResult): VsdxShapeSelection | null {
   const top = page.shapes.find((shape) => shape.id === hit.shapeId || findShapePlacement(shape.children, hit.shapeId) !== null);
   return top ? { pageId: page.id, shapeId: top.id, hit } : null;
@@ -965,4 +1288,4 @@ function fontFaceEqual(left: VsdxFontFace, right: VsdxFontFace): boolean { retur
 function bytesEqual(left: Uint8Array, right: Uint8Array): boolean { return left === right || (left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index])); }
 function resolveImage(assetId: string, handle: DiagramHandle | null, cache: { current: Map<string, Promise<CanvasImageSource | null>> }, message: string): Promise<CanvasImageSource | null> { const existing = cache.current.get(assetId); if (existing) return existing; const pending = decodeImage(handle?.mediaBytes(assetId), message); cache.current.set(assetId, pending); return pending; }
 async function decodeImage(bytes: Uint8Array | undefined, message: string): Promise<CanvasImageSource | null> { if (!bytes) return null; const blob = new Blob([bytes.slice()]); if (typeof createImageBitmap === 'function') return createImageBitmap(blob); const url = URL.createObjectURL(blob); try { return await new Promise<HTMLImageElement>((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = () => reject(new Error(message)); image.src = url; }); } finally { URL.revokeObjectURL(url); } }
-const styles: Record<string, CSSProperties> = { root: { display: 'flex', flexDirection: 'column', width: '100%', height: '100%', minHeight: 480, color: '#172033', background: '#f3f5f8', fontFamily: 'ui-sans-serif, system-ui, sans-serif' }, titleBar: { display: 'flex', alignItems: 'center', gap: 12, minHeight: 32, padding: '0 14px', background: '#f8fafc', borderBottom: '1px solid #d8dee9', fontSize: 13 }, contentRow: { display: 'flex', flex: 1, minHeight: 0 }, leftColumn: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }, rightColumn: { display: 'flex', height: '100%', minHeight: 0 }, shapesWrap: { display: 'flex', flex: '1 1 auto', minHeight: 0 }, workspace: { position: 'relative', display: 'flex', flex: 1, alignItems: 'center', justifyContent: 'center', overflow: 'auto' }, canvasFrame: { position: 'relative', flex: '0 0 auto' }, canvas: { display: 'block', background: '#fff', boxShadow: '0 8px 32px rgba(27, 39, 61, 0.2)', touchAction: 'none' }, overlay: { position: 'absolute', inset: 0, pointerEvents: 'none' }, pageBreakLine: { position: 'absolute', pointerEvents: 'none', background: '#c3ccd9' }, textEditWrap: { position: 'absolute', left: 0, top: 0, transformOrigin: '0 0', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'visible', background: 'transparent', border: '1px dashed #1d4ed8', zIndex: 2 }, textEditBox: { width: '100%', background: 'transparent', border: 'none', outline: 'none', resize: 'none', overflow: 'visible', textAlign: 'center', whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word', lineHeight: 1.2, padding: 0, margin: 0 }, integrity: { position: 'absolute', right: 14, bottom: 14, maxWidth: 340, padding: 12, color: '#7f1d1d', background: '#fef2f2', border: '1px solid #fca5a5' }, fidelity: { position: 'absolute', right: 14, bottom: 14, maxWidth: 340, padding: 8, color: '#475569', background: '#fff', fontSize: 12 }, error: { position: 'absolute', left: 14, right: 14, bottom: 14, padding: 10, color: '#8b1e2d', background: '#fff0f2', border: '1px solid #efb8c0' } };
+const styles: Record<string, CSSProperties> = { root: { display: 'flex', flexDirection: 'column', width: '100%', height: '100%', minHeight: 480, color: '#172033', background: '#f3f5f8', fontFamily: 'ui-sans-serif, system-ui, sans-serif' }, titleBar: { display: 'flex', alignItems: 'center', gap: 12, minHeight: 32, padding: '0 14px', background: '#f8fafc', borderBottom: '1px solid #d8dee9', fontSize: 13 }, contentRow: { display: 'flex', flex: 1, minHeight: 0 }, leftColumn: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }, rightColumn: { display: 'flex', height: '100%', minHeight: 0 }, shapesWrap: { display: 'flex', flex: '1 1 auto', minHeight: 0 }, workspace: { position: 'relative', display: 'flex', flex: 1, alignItems: 'center', justifyContent: 'center', overflow: 'auto' }, canvasFrame: { position: 'relative', flex: '0 0 auto' }, canvas: { display: 'block', background: '#fff', boxShadow: '0 8px 32px rgba(27, 39, 61, 0.2)', touchAction: 'none' }, overlay: { position: 'absolute', inset: 0, pointerEvents: 'none' }, pageBreakLine: { position: 'absolute', pointerEvents: 'none', background: '#c3ccd9' }, quickMenu: { position: 'absolute', zIndex: 3, display: 'flex', flexDirection: 'column', gap: 4, padding: 4, background: '#fff', border: '1px solid #d8dee9', borderRadius: 6, boxShadow: '0 8px 24px rgba(27, 39, 61, 0.18)', transform: 'translateY(-50%)' }, quickShape: { appearance: 'none', display: 'grid', placeItems: 'center', width: 32, height: 32, padding: 3, border: '1px solid transparent', borderRadius: 4, background: 'transparent', cursor: 'pointer' }, quickPreview: { width: 24, height: 24, overflow: 'visible', fill: '#fff', stroke: '#172033', strokeWidth: 0.05 }, textEditWrap: { position: 'absolute', left: 0, top: 0, transformOrigin: '0 0', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'visible', background: 'transparent', border: '1px dashed #1d4ed8', zIndex: 2 }, textEditBox: { width: '100%', background: 'transparent', border: 'none', outline: 'none', resize: 'none', overflow: 'visible', textAlign: 'center', whiteSpace: 'pre-wrap', overflowWrap: 'break-word', wordBreak: 'break-word', lineHeight: 1.2, padding: 0, margin: 0 }, integrity: { position: 'absolute', right: 14, bottom: 14, maxWidth: 340, padding: 12, color: '#7f1d1d', background: '#fef2f2', border: '1px solid #fca5a5' }, fidelity: { position: 'absolute', right: 14, bottom: 14, maxWidth: 340, padding: 8, color: '#475569', background: '#fff', fontSize: 12 }, error: { position: 'absolute', left: 14, right: 14, bottom: 14, padding: 10, color: '#8b1e2d', background: '#fff0f2', border: '1px solid #efb8c0' } };
