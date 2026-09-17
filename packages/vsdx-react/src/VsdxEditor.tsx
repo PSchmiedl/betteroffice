@@ -25,8 +25,8 @@ import { shapeStencils, stencilShapeById } from './components/shapes/shapeLibrar
 import type { ShapeStencil, StandardShape } from './components/shapes/shapeLibrary';
 import { documentStencilEntries } from './components/shapes/documentStencil';
 import { StatusBar, clampZoom } from './components/statusbar';
-import { paintDragPreview, paintSelectionFrame, passedDragThreshold, previewOutline, hitTestSelection, isOwnedBrowserShortcut, hitTestControlHandles, controlCellWriteBlocked, controlHandleCanvasPositions, controlHandlesForShape, isPrintableEntryKey, paintControlHandles, resolveControlDrag, resolveDragGeometry, resolveNudgeGeometry, resolveRotationAngle, resizeCursor, canvasKeyboardIntent, shapeLocalToPage, textEditOverlay, withoutTextBox } from './interactions';
-import type { CanvasKeyboardIntent, ControlDrag, DragStart, ResizeHandle } from './interactions';
+import { paintDragPreview, paintMarquee, paintSelectionFrame, passedDragThreshold, previewOutline, hitTestSelection, isOwnedBrowserShortcut, hitTestControlHandles, controlCellWriteBlocked, controlHandleCanvasPositions, controlHandlesForShape, isPrintableEntryKey, marqueeEnclosesQuad, normalizeMarquee, paintControlHandles, resolveControlDrag, resolveDragGeometry, resolveNudgeGeometry, resolveRotationAngle, resizeCursor, canvasKeyboardIntent, shapeLocalToPage, textEditOverlay, withoutTextBox } from './interactions';
+import type { CanvasKeyboardIntent, ControlDrag, DragStart, MarqueeRect, ResizeHandle } from './interactions';
 import { collectSnapTargets, paintGrid, paintSmartGuides, snapRelease, GRID_SPACING_IN } from './snap';
 import type { SnapTargets } from './snap';
 export { resolveDragGeometry };
@@ -130,6 +130,8 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const previewFrameRef = useRef<number | null>(null);
   const segmentDragRef = useRef<SegmentDrag | null>(null);
   const insertCascadeRef = useRef<Map<string, number>>(new Map());
+  const marqueeRef = useRef<{ startCanvas: ModelPoint; currentCanvas: ModelPoint; pointerId?: number; startX: number; startY: number; thresholdPassed: boolean; additive: boolean } | null>(null);
+  const marqueeFrameRef = useRef<number | null>(null);
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
   const [connectorMode, setConnectorMode] = useState(false);
@@ -358,6 +360,10 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     if (start && release) {
       try { paintDragPreview(context, previewOutline(start, release, frame.paintTransform, dragSnapRef.current), dpr, zoom); } catch { void 0; }
     }
+    const marquee = marqueeRef.current;
+    if (marquee && marquee.thresholdPassed) {
+      try { paintMarquee(context, normalizeMarquee(marquee.startCanvas, marquee.currentCanvas), dpr, zoom); } catch { void 0; }
+    }
     try { paintSmartGuides(context, frame, dpr, zoom, guidesRef.current); } catch { void 0; }
   }, [model.frame, model.snapshot, model.pageIndex, model.layers, selection, zoom, connectorMode, showGrid]);
 
@@ -395,6 +401,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     if (previewFrameRef.current !== null) cancelAnimationFrame(previewFrameRef.current);
     if (connectorFrameRef.current !== null) cancelAnimationFrame(connectorFrameRef.current);
     if (autoFrameRef.current !== null) cancelAnimationFrame(autoFrameRef.current);
+    if (marqueeFrameRef.current !== null) cancelAnimationFrame(marqueeFrameRef.current);
   }, []);
 
   const clearDragPreview = () => {
@@ -403,6 +410,13 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     guidesRef.current = { x: [], y: [] };
     snappedReleaseRef.current = null;
     repaintOverlaySelection();
+  };
+
+  const paintMarqueeState = () => {
+    const marquee = marqueeRef.current; const overlay = overlayCanvasRef.current;
+    if (!marquee || !overlay || !marquee.thresholdPassed) return;
+    const context = overlay.getContext('2d'); if (!context) return;
+    try { paintMarquee(context, normalizeMarquee(marquee.startCanvas, marquee.currentCanvas), window.devicePixelRatio || 1, zoomRef.current); } catch { void 0; }
   };
 
   const repaintOverlaySelection = () => {
@@ -433,6 +447,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       }
     }
     try { paintSmartGuides(context, frame, dpr, zoom, guidesRef.current); } catch { void 0; }
+    paintMarqueeState();
   };
 
   /** Coalesces ruler marker updates onto one animation frame. */
@@ -679,8 +694,8 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     const handle = handleRef.current; const frame = model.frame; const page = model.snapshot?.pages[model.pageIndex];
     if (!handle || !frame || !page) return;
     if (event.button === 2) return;
-    if (pointerRef.current) return;
-    pointerRef.current = null; dragPreviewRef.current = null; segmentDragRef.current = null;
+    if (pointerRef.current || marqueeRef.current) return;
+    pointerRef.current = null; dragPreviewRef.current = null; dragShapeRef.current = null; segmentDragRef.current = null; marqueeRef.current = null;
     if (connectorModeRef.current) {
       try {
         const point = canvasPointerPosition(event, frame);
@@ -792,8 +807,15 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       handle.layoutPage(model.pageIndex);
       const hit = handle.hitTest(point.canvas.x, point.canvas.y);
       const next = hit ? selectionForHit(page, hit) : null;
-      setSelection(next ? [next] : []);
-      if (next && !selectionHiddenByLayers(page, modelRef.current.layers, next)) {
+      if (!next) {
+        const additive = event.shiftKey;
+        if (!additive) setSelection([]);
+        marqueeRef.current = { startCanvas: point.canvas, currentCanvas: point.canvas, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, thresholdPassed: false, additive };
+        event.currentTarget.setPointerCapture(event.pointerId);
+        return;
+      }
+      setSelection([next]);
+      if (!selectionHiddenByLayers(page, modelRef.current.layers, next)) {
         const chrome = selectedConnectorChrome(frame, page, next);
         const segment = chrome?.draggable ? hitSegmentDot(chrome, point.model, grabTolerance(event.currentTarget, frame)) : null;
         if (chrome?.draggable && segment) {
@@ -810,8 +832,8 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
           return;
         }
       }
-      const placement = next ? findShapePlacement(page.shapes, next.shapeId) : null;
-      pointerRef.current = next && placement ? {
+      const placement = findShapePlacement(page.shapes, next.shapeId);
+      pointerRef.current = placement ? {
         ...point,
         ...shapeDragStart(page, placement.shape, frame, handle),
         pointerId: event.pointerId,
@@ -819,11 +841,30 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         startY: event.clientY,
         resize: event.shiftKey,
       } : null;
-      dragShapeRef.current = next && placement ? next : null;
+      dragShapeRef.current = placement ? next : null;
       event.currentTarget.setPointerCapture(event.pointerId);
     } catch (value) { reportError(value); }
   };
   const onPointerMove = (event: PointerEvent<HTMLCanvasElement>) => {
+    const marquee = marqueeRef.current;
+    if (marquee) {
+      if (marquee.pointerId !== undefined && marquee.pointerId !== event.pointerId) return;
+      if (!marquee.thresholdPassed) {
+        if (!passedDragThreshold(marquee.startX, marquee.startY, event.clientX, event.clientY)) return;
+        marquee.thresholdPassed = true;
+      }
+      const marqueeFrame = modelRef.current.frame;
+      if (!marqueeFrame) return;
+      try {
+        marquee.currentCanvas = canvasPointerPosition(event, marqueeFrame).canvas;
+        if (marqueeFrameRef.current !== null) return;
+        marqueeFrameRef.current = requestAnimationFrame(() => {
+          marqueeFrameRef.current = null;
+          repaintOverlaySelection();
+        });
+      } catch (value) { reportError(value); }
+      return;
+    }
     const drag = segmentDragRef.current;
     if (drag) {
       if (drag.pointerId !== event.pointerId) return;
@@ -982,6 +1023,26 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
 
   const onPointerUp = (event: PointerEvent<HTMLCanvasElement>) => {
     if (connectorDragRef.current) { commitConnectorDrag(event); return; }
+    const marquee = marqueeRef.current;
+    if (marquee) {
+      if (marquee.pointerId !== undefined && marquee.pointerId !== event.pointerId) return;
+      marqueeRef.current = null;
+      if (marqueeFrameRef.current !== null) { cancelAnimationFrame(marqueeFrameRef.current); marqueeFrameRef.current = null; }
+      repaintOverlaySelection();
+      if (!marquee.thresholdPassed) return;
+      try {
+        const current = modelRef.current;
+        const marqueePage = current.snapshot?.pages[current.pageIndex];
+        const marqueeFrame = current.frame;
+        if (!marqueePage || !marqueeFrame) return;
+        const enclosed = marqueeEnclosedShapes(marqueePage, marqueeFrame, normalizeMarquee(marquee.startCanvas, marquee.currentCanvas), current.layers);
+        if (marquee.additive) {
+          const known = new Set(selectionRef.current.map((item) => `${item.pageId}:${item.shapeId}`));
+          setSelection([...selectionRef.current, ...enclosed.filter((item) => !known.has(`${item.pageId}:${item.shapeId}`))]);
+        } else setSelection(enclosed);
+      } catch (value) { reportError(value); }
+      return;
+    }
     const drag = segmentDragRef.current;
     if (drag && drag.pointerId === event.pointerId) {
       segmentDragRef.current = null;
@@ -1043,6 +1104,15 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       refresh(undefined, true);
     } catch (value) { reportError(value); }
   };
+  const clearMarquee = (event: PointerEvent<HTMLCanvasElement>): boolean => {
+    const marquee = marqueeRef.current;
+    if (!marquee) return false;
+    if (marquee.pointerId !== undefined && marquee.pointerId !== event.pointerId) return false;
+    marqueeRef.current = null;
+    if (marqueeFrameRef.current !== null) { cancelAnimationFrame(marqueeFrameRef.current); marqueeFrameRef.current = null; }
+    repaintOverlaySelection();
+    return true;
+  };
   const abandonConnectorDrag = () => {
     if (!connectorDragRef.current) return false;
     connectorDragRef.current = null;
@@ -1059,6 +1129,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const onPointerCancel = (event: PointerEvent<HTMLCanvasElement>) => {
     if (abandonConnectorDrag()) return;
     if (cancelSegmentDrag(event)) return;
+    if (clearMarquee(event)) return;
     const pointer = pointerRef.current;
     if (!pointer) return;
     if (pointer.pointerId !== undefined && pointer.pointerId !== event.pointerId) return;
@@ -1067,6 +1138,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const onLostPointerCapture = (event: PointerEvent<HTMLCanvasElement>) => {
     if (abandonConnectorDrag()) return;
     if (cancelSegmentDrag(event)) return;
+    if (clearMarquee(event)) return;
     const pointer = pointerRef.current;
     if (!pointer) return;
     if (pointer.pointerId !== undefined && pointer.pointerId !== event.pointerId) return;
@@ -1092,7 +1164,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     event.preventDefault();
     const handle = handleRef.current; const frame = model.frame; const page = model.snapshot?.pages[model.pageIndex];
     if (!handle || !frame || !page) return;
-    if (pointerRef.current) return;
+    if (pointerRef.current || marqueeRef.current) return;
     try {
       const point = canvasPointerPosition(event, frame);
       handle.layoutPage(model.pageIndex);
@@ -1111,13 +1183,19 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const commandsRef = useRef<RibbonCommands | null>(null);
   const cancelActiveDrag = () => {
     const pointer = pointerRef.current;
-    if (!pointer) return false;
+    const marquee = marqueeRef.current;
+    if (!pointer && !marquee) return false;
     pointerRef.current = null;
+    marqueeRef.current = null;
+    dragShapeRef.current = null;
     clearDragPreview();
+    if (marqueeFrameRef.current !== null) { cancelAnimationFrame(marqueeFrameRef.current); marqueeFrameRef.current = null; }
+    repaintOverlaySelection();
     const canvas = mainCanvasRef.current;
-    if (canvas && pointer.pointerId !== undefined) {
+    const captured = pointer?.pointerId ?? marquee?.pointerId;
+    if (canvas && captured !== undefined) {
       try {
-        if (typeof canvas.hasPointerCapture !== 'function' || canvas.hasPointerCapture(pointer.pointerId)) canvas.releasePointerCapture(pointer.pointerId);
+        if (typeof canvas.hasPointerCapture !== 'function' || canvas.hasPointerCapture(captured)) canvas.releasePointerCapture(captured);
       } catch { void 0; }
     }
     return true;
@@ -1579,6 +1657,20 @@ export function canvasLabel(t: TFunction, pageIndex: number, total: number, sele
   if (selection.length > 1) return t('pages.canvasLabelWithMultiSelection', { current: pageIndex + 1, total, count: selection.length });
   if (selection.length === 1) return t('pages.canvasLabelWithSelection', { current: pageIndex + 1, total, name: selection[0].shapeId });
   return t('pages.canvasLabel', { current: pageIndex + 1, total });
+}
+
+/** Top-level shapes fully enclosed by the marquee, matching click selection's rule and layer visibility. */
+export function marqueeEnclosedShapes(page: PageSnapshot, frame: PageDisplayList, rect: MarqueeRect, layers: readonly PageLayer[] = []): VsdxShapeSelection[] {
+  const enclosed: VsdxShapeSelection[] = [];
+  for (const shape of page.shapes) {
+    const item: VsdxShapeSelection = { pageId: page.id, shapeId: shape.id, hit: { kind: 'shape', shapeId: shape.id } };
+    if (selectionHiddenByLayers(page, layers, item)) continue;
+    try {
+      const corners = selectionCorners(page, frame, item);
+      if (corners && marqueeEnclosesQuad(corners, rect)) enclosed.push(item);
+    } catch { void 0; }
+  }
+  return enclosed;
 }
 
 export function selectionHiddenByLayers(page: PageSnapshot, layers: readonly PageLayer[], selection: VsdxShapeSelection): boolean {
