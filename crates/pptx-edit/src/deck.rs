@@ -19,7 +19,7 @@ use crate::{
     DeckSession, DeckSnapshot, EditCtx, EditError, EditResult, META, MIGRATE_ORIGIN, PendingMedia,
     PictureDraft, PresetShapeDraft, SHAPES, SLIDE_ORDER, SLIDES, STORIES, ShapeAdjustReceipt,
     ShapeDraft, ShapeFillReceipt, ShapeKind, ShapeReceipt, ShapeRect, ShapeSnapshot, ShapeStroke,
-    ShapeStrokeReceipt, SlideReceipt, SlideSnapshot, TransformReceipt,
+    ShapeStrokeReceipt, ShapeZOrderReceipt, SlideReceipt, SlideSnapshot, TransformReceipt,
 };
 
 const SCHEMA_VERSION: f64 = 2.1;
@@ -716,6 +716,76 @@ impl DeckSession {
             shape_id: shape_id.to_owned(),
             before,
             after: ShapeRect { x, y, ..before },
+        })
+    }
+
+    /// Moves a shape to the top of its slide's paint order (drawn last).
+    pub fn bring_to_front(
+        &self,
+        context: &EditCtx,
+        slide_id: &str,
+        shape_id: &str,
+    ) -> EditResult<ShapeZOrderReceipt> {
+        self.reorder_shape(context, slide_id, shape_id, |length, _from| length - 1)
+    }
+
+    /// Moves a shape to the bottom of its slide's paint order (drawn first).
+    pub fn send_to_back(
+        &self,
+        context: &EditCtx,
+        slide_id: &str,
+        shape_id: &str,
+    ) -> EditResult<ShapeZOrderReceipt> {
+        self.reorder_shape(context, slide_id, shape_id, |_length, _from| 0)
+    }
+
+    /// Swaps a shape one step later in its slide's paint order.
+    pub fn bring_forward(
+        &self,
+        context: &EditCtx,
+        slide_id: &str,
+        shape_id: &str,
+    ) -> EditResult<ShapeZOrderReceipt> {
+        self.reorder_shape(context, slide_id, shape_id, |length, from| {
+            (from + 1).min(length - 1)
+        })
+    }
+
+    /// Swaps a shape one step earlier in its slide's paint order.
+    pub fn send_backward(
+        &self,
+        context: &EditCtx,
+        slide_id: &str,
+        shape_id: &str,
+    ) -> EditResult<ShapeZOrderReceipt> {
+        self.reorder_shape(context, slide_id, shape_id, |_length, from| {
+            from.saturating_sub(1)
+        })
+    }
+
+    fn reorder_shape(
+        &self,
+        context: &EditCtx,
+        slide_id: &str,
+        shape_id: &str,
+        to_index: impl FnOnce(u32, u32) -> u32,
+    ) -> EditResult<ShapeZOrderReceipt> {
+        let mut txn = self.transact_for(context);
+        let slide = slide_ref(&txn, slide_id)?;
+        let order = slide_shape_order(&slide, &txn)?;
+        let length = order.len(&txn);
+        let from_index = array_index(&order, &txn, shape_id)
+            .ok_or_else(|| EditError::ShapeNotFound(shape_id.to_owned()))?;
+        let target = to_index(length, from_index).min(length - 1);
+        if target != from_index {
+            order.remove(&mut txn, from_index);
+            order.insert(&mut txn, target, shape_id);
+        }
+        Ok(ShapeZOrderReceipt {
+            slide_id: slide_id.to_owned(),
+            shape_id: shape_id.to_owned(),
+            from_index,
+            to_index: target,
         })
     }
 

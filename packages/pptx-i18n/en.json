@@ -63,6 +63,11 @@
     "noBorder": "No border",
     "cornerRadius": "Corner radius",
     "shapeAdjustment": "Shape adjustment",
+    "arrange": "Arrange",
+    "bringToFront": "Bring to front",
+    "bringForward": "Bring forward",
+    "sendBackward": "Send backward",
+    "sendToBack": "Send to back",
     "shapes": {
       "rect": "Rectangle",
       "roundRect": "Rounded rectangle",

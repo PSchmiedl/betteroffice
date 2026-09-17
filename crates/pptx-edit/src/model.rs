@@ -232,6 +232,15 @@ pub struct ShapeReceipt {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShapeZOrderReceipt {
+    pub slide_id: String,
+    pub shape_id: String,
+    pub from_index: u32,
+    pub to_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransformReceipt {
     pub slide_id: String,
     pub shape_id: String,

@@ -32,6 +32,7 @@ import type {
   ShapeRect,
   ShapeStroke,
   ShapeStrokeReceipt,
+  ShapeZOrderReceipt,
   SlideDisplayList,
   SlideReceipt,
   StorySnapshot,
@@ -107,6 +108,14 @@ export interface PresentationHandle extends CollaborationReplica {
     adjustments: Record<string, number>
   ): ShapeAdjustReceipt;
   removeShape(slideId: string, shapeId: string): ShapeReceipt;
+  /** Moves a shape to the top of its slide's paint order (drawn last). */
+  bringShapeToFront(slideId: string, shapeId: string): ShapeZOrderReceipt;
+  /** Moves a shape to the bottom of its slide's paint order (drawn first). */
+  sendShapeToBack(slideId: string, shapeId: string): ShapeZOrderReceipt;
+  /** Swaps a shape one step later in its slide's paint order. */
+  bringShapeForward(slideId: string, shapeId: string): ShapeZOrderReceipt;
+  /** Swaps a shape one step earlier in its slide's paint order. */
+  sendShapeBackward(slideId: string, shapeId: string): ShapeZOrderReceipt;
   /** Adds a slide comment; coordinates are EMU. */
   addComment(
     slideId: string,
@@ -498,6 +507,30 @@ export function openPresentation(
     removeShape(slideId, shapeId): ShapeReceipt {
       return jsonWasmCall(
         () => doc.removeShapeJson(JSON.stringify({ slideId, shapeId })),
+        true
+      );
+    },
+    bringShapeToFront(slideId, shapeId): ShapeZOrderReceipt {
+      return jsonWasmCall(
+        () => doc.bringShapeToFrontJson(JSON.stringify({ slideId, shapeId })),
+        true
+      );
+    },
+    sendShapeToBack(slideId, shapeId): ShapeZOrderReceipt {
+      return jsonWasmCall(
+        () => doc.sendShapeToBackJson(JSON.stringify({ slideId, shapeId })),
+        true
+      );
+    },
+    bringShapeForward(slideId, shapeId): ShapeZOrderReceipt {
+      return jsonWasmCall(
+        () => doc.bringShapeForwardJson(JSON.stringify({ slideId, shapeId })),
+        true
+      );
+    },
+    sendShapeBackward(slideId, shapeId): ShapeZOrderReceipt {
+      return jsonWasmCall(
+        () => doc.sendShapeBackwardJson(JSON.stringify({ slideId, shapeId })),
         true
       );
     },

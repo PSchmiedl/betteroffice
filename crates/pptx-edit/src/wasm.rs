@@ -690,6 +690,46 @@ impl PptxDocument {
         )
     }
 
+    #[wasm_bindgen(js_name = bringShapeToFrontJson)]
+    pub fn bring_shape_to_front_json(&self, args: &str) -> Result<String, JsValue> {
+        let args: ShapeArgs = parse_args(args)?;
+        json(
+            self.session
+                .bring_to_front(&local_context(), &args.slide_id, &args.shape_id)
+                .map_err(js_error)?,
+        )
+    }
+
+    #[wasm_bindgen(js_name = sendShapeToBackJson)]
+    pub fn send_shape_to_back_json(&self, args: &str) -> Result<String, JsValue> {
+        let args: ShapeArgs = parse_args(args)?;
+        json(
+            self.session
+                .send_to_back(&local_context(), &args.slide_id, &args.shape_id)
+                .map_err(js_error)?,
+        )
+    }
+
+    #[wasm_bindgen(js_name = bringShapeForwardJson)]
+    pub fn bring_shape_forward_json(&self, args: &str) -> Result<String, JsValue> {
+        let args: ShapeArgs = parse_args(args)?;
+        json(
+            self.session
+                .bring_forward(&local_context(), &args.slide_id, &args.shape_id)
+                .map_err(js_error)?,
+        )
+    }
+
+    #[wasm_bindgen(js_name = sendShapeBackwardJson)]
+    pub fn send_shape_backward_json(&self, args: &str) -> Result<String, JsValue> {
+        let args: ShapeArgs = parse_args(args)?;
+        json(
+            self.session
+                .send_backward(&local_context(), &args.slide_id, &args.shape_id)
+                .map_err(js_error)?,
+        )
+    }
+
     #[wasm_bindgen(js_name = moveShapeJson)]
     pub fn move_shape_json(&self, args: &str) -> Result<String, JsValue> {
         let args: MoveShapeArgs = parse_args(args)?;

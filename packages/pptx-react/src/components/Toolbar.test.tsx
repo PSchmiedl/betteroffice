@@ -70,6 +70,31 @@ describe('Toolbar alignment controls', () => {
   });
 });
 
+describe('Toolbar insert image control', () => {
+  it('invokes onInsertImage when clicked', () => {
+    let clicks = 0;
+    const { getByTestId } = render(
+      <LocaleProvider>
+        <Toolbar onInsertImage={() => (clicks += 1)} />
+      </LocaleProvider>
+    );
+
+    fireEvent.click(getByTestId('pptx-insert-image'));
+
+    expect(clicks).toBe(1);
+  });
+
+  it('is disabled without an onInsertImage handler', () => {
+    const { getByTestId } = render(
+      <LocaleProvider>
+        <Toolbar />
+      </LocaleProvider>
+    );
+
+    expect(getByTestId('pptx-insert-image').hasAttribute('disabled')).toBe(true);
+  });
+});
+
 describe('Toolbar shape controls', () => {
   it('arms a preset shape placement tool', () => {
     const tools: string[] = [];
@@ -120,6 +145,31 @@ describe('Toolbar shape controls', () => {
     expect(actions).toContainEqual({ type: 'strokeColor', value: '#ea4335' });
     expect(actions).toContainEqual({ type: 'strokeWidth', value: 3 });
     expect(actions).toContainEqual({ type: 'adjust', name: 'adj', value: 0.4 });
+  });
+
+  it('emits a z-order action for each arrange menu item', () => {
+    const actions: ShapeFormattingAction[] = [];
+    const { getByLabelText, getByTestId } = render(
+      <LocaleProvider>
+        <Toolbar shapeSelectionActive onShapeFormat={(action) => actions.push(action)} />
+      </LocaleProvider>
+    );
+
+    fireEvent.click(getByTestId('pptx-shape-arrange'));
+    fireEvent.click(getByLabelText('Bring to front'));
+    fireEvent.click(getByTestId('pptx-shape-arrange'));
+    fireEvent.click(getByLabelText('Bring forward'));
+    fireEvent.click(getByTestId('pptx-shape-arrange'));
+    fireEvent.click(getByLabelText('Send backward'));
+    fireEvent.click(getByTestId('pptx-shape-arrange'));
+    fireEvent.click(getByLabelText('Send to back'));
+
+    expect(actions).toEqual([
+      { type: 'zOrder', value: 'front' },
+      { type: 'zOrder', value: 'forward' },
+      { type: 'zOrder', value: 'backward' },
+      { type: 'zOrder', value: 'back' },
+    ]);
   });
 
   it('exposes the primary adjustment for non-round presets', () => {

@@ -78,6 +78,7 @@ export type {
   ShapeSnapshot,
   ShapeStroke,
   ShapeStrokeReceipt,
+  ShapeZOrderReceipt,
   SlideDisplayList,
   SlidePrimitive,
   SlideReceipt,

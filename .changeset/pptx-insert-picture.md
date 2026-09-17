@@ -5,4 +5,4 @@
 "@betteroffice/rust-crates": minor
 ---
 
-Insert a picture onto a slide from the editor. The image mints its own media part, content-type default and relationship on save; `PptxEditor` gains an "Insert image" toolbar button and `PresentationHandle` gains `addPicture`.
+Insert a picture onto a slide from the editor. The image mints its own media part, content-type default and relationship on save; `PptxEditor` gains a small "Insert image" icon button next to the text-box tool, and `PresentationHandle` gains `addPicture`.

@@ -1723,11 +1723,19 @@ function PptxEditorContent({
           shapeSelection.shapeId,
           action.value === null ? {} : { widthPt: action.value }
         );
-      } else {
+      } else if (action.type === 'adjust') {
         handle.setShapeAdjust(shapeSelection.slideId, shapeSelection.shapeId, {
           ...selectedShape.adjustValues,
           [action.name]: action.value,
         });
+      } else if (action.type === 'zOrder') {
+        const zOrder = {
+          front: handle.bringShapeToFront,
+          back: handle.sendShapeToBack,
+          forward: handle.bringShapeForward,
+          backward: handle.sendShapeBackward,
+        }[action.value];
+        zOrder(shapeSelection.slideId, shapeSelection.shapeId);
       }
       refreshAt(undefined, true);
     } catch (value) {
@@ -1966,6 +1974,7 @@ function PptxEditorContent({
           shapeSelectionActive={!canvasReview.reviewing && selectedShape?.kind === 'shape'}
           onShapeFormat={formatShape}
           onInsertSlide={addSlide}
+          onInsertImage={() => pictureInputRef.current?.click()}
           slideLayouts={slideLayouts}
           currentLayoutPartPath={model?.snapshot.slides[currentSlide]?.layoutPartPath}
           onSave={save}
@@ -2043,18 +2052,6 @@ function PptxEditorContent({
             if (file) void insertPicture(file);
           }}
         />
-        <button
-          type="button"
-          onClick={() => pictureInputRef.current?.click()}
-          disabled={slideCount === 0}
-          data-testid="pptx-insert-image"
-          style={styles.presentButton}
-        >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-            <path d="M4 5h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm1 2v10.2L9.5 12l2.7 3.2L16 10l3 4.8V7H5Zm2.5 2.5A1.5 1.5 0 1 0 7.5 6.5a1.5 1.5 0 0 0 0 3Z" />
-          </svg>
-          {t('toolbar.insertImage')}
-        </button>
         <button
           type="button"
           onClick={startPresenting}

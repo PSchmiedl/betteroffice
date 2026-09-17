@@ -81,7 +81,12 @@
       "downArrow": null,
       "chevron": null
     },
-    "insertImage": null
+    "insertImage": null,
+    "arrange": null,
+    "bringToFront": null,
+    "bringForward": null,
+    "sendBackward": null,
+    "sendToBack": null
   },
   "slides": {
     "panelLabel": null,

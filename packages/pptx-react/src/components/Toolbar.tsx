@@ -68,11 +68,14 @@ export interface ShapeFormatting {
   adjustments?: Record<string, number>;
 }
 
+export type ShapeZOrder = 'front' | 'forward' | 'backward' | 'back';
+
 export type ShapeFormattingAction =
   | { type: 'fillColor'; value: string | null }
   | { type: 'strokeColor'; value: string | null }
   | { type: 'strokeWidth'; value: number | null }
-  | { type: 'adjust'; name: string; value: number };
+  | { type: 'adjust'; name: string; value: number }
+  | { type: 'zOrder'; value: ShapeZOrder };
 
 export interface SlideLayoutOption {
   partPath: string | null;
@@ -87,6 +90,7 @@ export interface ToolbarProps {
   shapeSelectionActive?: boolean;
   onShapeFormat?: (action: ShapeFormattingAction) => void;
   onInsertSlide?: (layoutPartPath?: string | null) => void;
+  onInsertImage?: () => void;
   slideLayouts?: readonly SlideLayoutOption[];
   currentLayoutPartPath?: string | null;
   onSave?: () => void;
@@ -177,6 +181,7 @@ export function Toolbar(explicitProps: ToolbarProps) {
     shapeSelectionActive = false,
     onShapeFormat,
     onInsertSlide,
+    onInsertImage,
     slideLayouts = [],
     currentLayoutPartPath,
     onSave,
@@ -202,6 +207,7 @@ export function Toolbar(explicitProps: ToolbarProps) {
   const shapeFormattingEnabled = !disabled && shapeSelectionActive && Boolean(onShapeFormat);
   const slideEnabled = !disabled && Boolean(onInsertSlide);
   const toolEnabled = !disabled && Boolean(onToolChange);
+  const insertImageEnabled = !disabled && Boolean(onInsertImage);
   const fontSize = currentFormatting.fontSize ?? 24;
   const fitLabel = t('toolbar.fit');
   const zoomValue = zoom === 'fit' ? fitLabel : `${Math.round(zoom * 100)}%`;
@@ -365,7 +371,7 @@ export function Toolbar(explicitProps: ToolbarProps) {
     },
     {
       key: 'tools',
-      width: 127,
+      width: 169,
       node: (
         <>
           <ToolbarSeparator />
@@ -387,6 +393,14 @@ export function Toolbar(explicitProps: ToolbarProps) {
               testId="pptx-tool-text-box"
             >
               <ToolbarIcon name="textBox" />
+            </ToolbarButton>
+            <ToolbarButton
+              title={t('toolbar.insertImage')}
+              disabled={!insertImageEnabled}
+              onClick={() => onInsertImage?.()}
+              testId="pptx-insert-image"
+            >
+              <ToolbarIcon name="insertImage" />
             </ToolbarButton>
             <ToolbarDropdown
               title={t('toolbar.shapeTool')}
@@ -607,7 +621,7 @@ export function Toolbar(explicitProps: ToolbarProps) {
     },
     {
       key: 'shape-formatting',
-      width: shapeAdjustment ? 244 : 172,
+      width: (shapeAdjustment ? 244 : 172) + 40,
       node: (
         <>
           <ToolbarSeparator />
@@ -702,6 +716,42 @@ export function Toolbar(explicitProps: ToolbarProps) {
                 }
               />
             ) : null}
+            <ToolbarDropdown
+              title={t('toolbar.arrange')}
+              disabled={!shapeFormattingEnabled}
+              menuWidth={190}
+              testId="pptx-shape-arrange"
+              trigger={<ToolbarIcon name="bringToFront" />}
+            >
+              {(close) => (
+                <>
+                  <ToolbarMenuItem
+                    label={t('toolbar.bringToFront')}
+                    icon={<ToolbarIcon name="bringToFront" size={16} />}
+                    onClick={() => applyShape({ type: 'zOrder', value: 'front' })}
+                    close={close}
+                  />
+                  <ToolbarMenuItem
+                    label={t('toolbar.bringForward')}
+                    icon={<ToolbarIcon name="bringForward" size={16} />}
+                    onClick={() => applyShape({ type: 'zOrder', value: 'forward' })}
+                    close={close}
+                  />
+                  <ToolbarMenuItem
+                    label={t('toolbar.sendBackward')}
+                    icon={<ToolbarIcon name="sendBackward" size={16} />}
+                    onClick={() => applyShape({ type: 'zOrder', value: 'backward' })}
+                    close={close}
+                  />
+                  <ToolbarMenuItem
+                    label={t('toolbar.sendToBack')}
+                    icon={<ToolbarIcon name="sendToBack" size={16} />}
+                    onClick={() => applyShape({ type: 'zOrder', value: 'back' })}
+                    close={close}
+                  />
+                </>
+              )}
+            </ToolbarDropdown>
           </ToolbarGroup>
         </>
       ),

@@ -176,6 +176,13 @@ export interface ShapeReceipt {
   index: number;
 }
 
+export interface ShapeZOrderReceipt {
+  slideId: string;
+  shapeId: string;
+  fromIndex: number;
+  toIndex: number;
+}
+
 export interface ShapeRect {
   x: number;
   y: number;

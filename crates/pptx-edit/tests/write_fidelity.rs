@@ -529,6 +529,84 @@ fn an_added_picture_mints_its_media_part_content_type_and_relationship() {
 }
 
 #[test]
+fn shape_z_order_operations_reorder_within_the_slide() {
+    let session = open();
+    let snapshot = session.snapshot().unwrap();
+    let slide = snapshot.slides[0].clone();
+    let names: Vec<&str> = slide
+        .shapes
+        .iter()
+        .map(|shape| shape.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["Title", "Connector", "Box", "Halfway", "Script", "Tracked"]
+    );
+    let box_id = slide.shapes[2].id.clone();
+
+    let names_after = |session: &DeckSession| -> Vec<String> {
+        session.snapshot().unwrap().slides[0]
+            .shapes
+            .iter()
+            .map(|shape| shape.name.clone())
+            .collect()
+    };
+
+    let receipt = session
+        .bring_to_front(&context(), &slide.id, &box_id)
+        .unwrap();
+    assert_eq!((receipt.from_index, receipt.to_index), (2, 5));
+    assert_eq!(
+        names_after(&session),
+        ["Title", "Connector", "Halfway", "Script", "Tracked", "Box"]
+    );
+
+    let receipt = session
+        .send_to_back(&context(), &slide.id, &box_id)
+        .unwrap();
+    assert_eq!((receipt.from_index, receipt.to_index), (5, 0));
+    assert_eq!(
+        names_after(&session),
+        ["Box", "Title", "Connector", "Halfway", "Script", "Tracked"]
+    );
+
+    let receipt = session
+        .bring_forward(&context(), &slide.id, &box_id)
+        .unwrap();
+    assert_eq!((receipt.from_index, receipt.to_index), (0, 1));
+    assert_eq!(
+        names_after(&session),
+        ["Title", "Box", "Connector", "Halfway", "Script", "Tracked"]
+    );
+
+    let receipt = session
+        .send_backward(&context(), &slide.id, &box_id)
+        .unwrap();
+    assert_eq!((receipt.from_index, receipt.to_index), (1, 0));
+    assert_eq!(
+        names_after(&session),
+        ["Box", "Title", "Connector", "Halfway", "Script", "Tracked"]
+    );
+
+    // Already at the edge: stepping further is a clamped no-op.
+    let receipt = session
+        .send_backward(&context(), &slide.id, &box_id)
+        .unwrap();
+    assert_eq!((receipt.from_index, receipt.to_index), (0, 0));
+
+    let saved = parts(&session.save().unwrap());
+    let slide_xml = part_text(&saved, "ppt/slides/slide1.xml");
+    let box_pos = slide_xml.find(r#"name="Box""#).unwrap();
+    let title_pos = slide_xml.find(r#"name="Title""#).unwrap();
+    assert!(box_pos < title_pos, "{slide_xml}");
+
+    let error = session
+        .bring_to_front(&context(), &slide.id, "missing-shape")
+        .unwrap_err();
+    assert!(matches!(error, EditError::ShapeNotFound(_)));
+}
+
+#[test]
 fn junk_style_values_are_rejected_at_the_edit() {
     let session = open();
     let snapshot = session.snapshot().unwrap();
