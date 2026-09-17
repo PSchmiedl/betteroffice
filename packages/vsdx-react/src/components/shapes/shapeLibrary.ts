@@ -334,6 +334,12 @@ export const arrowVertices: Readonly<Record<string, readonly Point[]>> = {
   arrowDown: [[0.35, 1], [0.35, 0.4], [0.15, 0.4], [0.5, 0], [0.85, 0.4], [0.65, 0.4], [0.65, 1]],
   arrowDoubleHorizontal: [[0, 0.5], [0.2, 0.15], [0.2, 0.35], [0.8, 0.35], [0.8, 0.15], [1, 0.5], [0.8, 0.85], [0.8, 0.65], [0.2, 0.65], [0.2, 0.85]],
   arrowDoubleVertical: [[0.5, 0], [0.15, 0.2], [0.35, 0.2], [0.35, 0.8], [0.15, 0.8], [0.5, 1], [0.85, 0.8], [0.65, 0.8], [0.65, 0.2], [0.85, 0.2]],
+  sharpBent: [[0, 0.25], [0.7, 0.25], [0.7, 0.62], [0.85, 0.62], [0.6, 1], [0.35, 0.62], [0.5, 0.62], [0.5, 0.45], [0, 0.45]],
+  stripedArrow: [[0.45, 0.15], [1, 0.5], [0.45, 0.85]],
+  notched: [[0.25, 0.35], [0.6, 0.35], [0.6, 0.15], [1, 0.5], [0.6, 0.85], [0.6, 0.65], [0.25, 0.65], [0.4, 0.5]],
+  blockArrow: [[0, 0.3], [0.55, 0.3], [0.55, 0.1], [1, 0.5], [0.55, 0.9], [0.55, 0.7], [0, 0.7]],
+  quadArrow: [[0.5, 1], [0.7, 0.76], [0.6, 0.76], [0.6, 0.6], [0.76, 0.6], [0.76, 0.7], [1, 0.5], [0.76, 0.3], [0.76, 0.4], [0.6, 0.4], [0.6, 0.24], [0.7, 0.24], [0.5, 0], [0.3, 0.24], [0.4, 0.24], [0.4, 0.4], [0.24, 0.4], [0.24, 0.3], [0, 0.5], [0.24, 0.7], [0.24, 0.6], [0.4, 0.6], [0.4, 0.76], [0.3, 0.76]],
+  leftRightUp: [[0.38, 0], [0.38, 0.38], [0.12, 0.38], [0, 0.5], [0.12, 0.62], [0.38, 0.62], [0.38, 0.7], [0.3, 0.7], [0.5, 1], [0.7, 0.7], [0.62, 0.7], [0.62, 0.62], [0.88, 0.62], [1, 0.5], [0.88, 0.38], [0.62, 0.38], [0.62, 0]],
 };
 
 function arrowShape(id: keyof typeof arrowVertices, extraRows: readonly GeometryRow[] = []): StandardShape {
@@ -422,6 +428,69 @@ const lineElbowPath = curvedPath([
   { type: 'LineTo', end: [0.55, 0.3] },
 ]);
 
+const stripedArrowStripes: readonly GeometryRow[] = [
+  { type: 'MoveTo', end: [0, 0.32] },
+  { type: 'LineTo', end: [0.42, 0.32] },
+  { type: 'MoveTo', end: [0, 0.5] },
+  { type: 'LineTo', end: [0.42, 0.5] },
+  { type: 'MoveTo', end: [0, 0.68] },
+  { type: 'LineTo', end: [0.42, 0.68] },
+];
+
+const bentArrowPath = curvedPath([
+  { type: 'MoveTo', end: [0, 0.25] },
+  { type: 'LineTo', end: [0.5, 0.25] },
+  arc([0.5, 0.45], [0.2, 0.2], degrees(-90), degrees(90)),
+  { type: 'LineTo', end: [0.7, 0.62] },
+  { type: 'LineTo', end: [0.85, 0.62] },
+  { type: 'LineTo', end: [0.6, 1] },
+  { type: 'LineTo', end: [0.35, 0.62] },
+  { type: 'LineTo', end: [0.5, 0.62] },
+  { type: 'LineTo', end: [0.5, 0.45] },
+  { type: 'LineTo', end: [0, 0.45] },
+  { type: 'Close' },
+]);
+
+const uTurnArrowPath = curvedPath([
+  { type: 'MoveTo', end: [0, 0.1] },
+  { type: 'LineTo', end: [0.6, 0.1] },
+  arc([0.6, 0.5], [0.4, 0.4], degrees(-90), degrees(90)),
+  arc([0.6, 0.5], [0.4, 0.4], 0, degrees(90)),
+  { type: 'LineTo', end: [0.3, 0.9] },
+  { type: 'LineTo', end: [0.3, 0.98] },
+  { type: 'LineTo', end: [0, 0.8] },
+  { type: 'LineTo', end: [0.3, 0.62] },
+  { type: 'LineTo', end: [0.3, 0.7] },
+  { type: 'LineTo', end: [0.6, 0.7] },
+  arc([0.6, 0.5], [0.2, 0.2], degrees(90), degrees(-90)),
+  arc([0.6, 0.5], [0.2, 0.2], 0, degrees(-90)),
+  { type: 'LineTo', end: [0, 0.3] },
+  { type: 'Close' },
+]);
+
+const circularArrowCenter: Point = [0.5, 0.52];
+const circularArrowPath = curvedPath([
+  { type: 'MoveTo', end: arcPoint(circularArrowCenter, [0.44, 0.44], degrees(-60)) },
+  arc(circularArrowCenter, [0.44, 0.44], degrees(-60), degrees(100)),
+  arc(circularArrowCenter, [0.44, 0.44], degrees(40), degrees(100)),
+  arc(circularArrowCenter, [0.44, 0.44], degrees(140), degrees(100)),
+  { type: 'LineTo', end: [0.409903810568, 0.063948822335] },
+  { type: 'LineTo', end: arcPoint(circularArrowCenter, [0.24, 0.24], degrees(-120)) },
+  arc(circularArrowCenter, [0.24, 0.24], degrees(-120), degrees(-100)),
+  arc(circularArrowCenter, [0.24, 0.24], degrees(140), degrees(-100)),
+  arc(circularArrowCenter, [0.24, 0.24], degrees(40), degrees(-100)),
+  { type: 'Close' },
+]);
+
+const arcedLinePath = curvedPath([
+  { type: 'MoveTo', end: [0.2, 0.9] },
+  arc([0.2, 0.3], [0.6, 0.6], degrees(90), degrees(-90)),
+  { type: 'MoveTo', end: [0.8, 0.16] },
+  { type: 'LineTo', end: [0.72, 0.3] },
+  { type: 'LineTo', end: [0.88, 0.3] },
+  { type: 'Close' },
+]);
+
 export const arrowShapes: readonly StandardShape[] = [
   arrowShape('arrowRight'),
   arrowShape('arrowLeft'),
@@ -441,6 +510,16 @@ export const arrowShapes: readonly StandardShape[] = [
   shapeFrom('lineVertical', lineVerticalPath),
   shapeFrom('lineDiagonal', lineDiagonalPath),
   shapeFrom('lineElbow', lineElbowPath),
+  shapeFrom('bentArrow', bentArrowPath),
+  shapeFrom('uTurnArrow', uTurnArrowPath),
+  arrowShape('sharpBent'),
+  arrowShape('stripedArrow', stripedArrowStripes),
+  arrowShape('notched'),
+  arrowShape('blockArrow'),
+  shapeFrom('circularArrow', circularArrowPath),
+  arrowShape('quadArrow'),
+  arrowShape('leftRightUp'),
+  shapeFrom('arcedLine', arcedLinePath),
 ];
 
 export const shapeStencils: readonly ShapeStencil[] = [

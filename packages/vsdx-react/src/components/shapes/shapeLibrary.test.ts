@@ -137,7 +137,7 @@ test('builds the cube as a 4:3 box whose inner edges meet at the front corner', 
 });
 
 function subpathAreas(shapeId: string): number[] {
-  const cells = standardShapes.find((shape) => shape.id === shapeId)!.draft(0, 0, 1, 1).cells
+  const cells = shapeStencils.flatMap((stencil) => stencil.shapes).find((shape) => shape.id === shapeId)!.draft(0, 0, 1, 1).cells
     .filter((cell) => cell.locator.section === 'Geometry' && (cell.name === 'X' || cell.name === 'Y'));
   const areas: number[] = [];
   let points: Array<[number, number]> = [];
@@ -208,7 +208,7 @@ test('exposes two stencils covering every shape', () => {
   expect(shapeStencils.map((stencil) => stencil.id)).toEqual(['standard', 'arrows']);
   expect(shapeStencils[0].shapes).toEqual(standardShapes);
   expect(shapeStencils[1].shapes).toEqual(arrowShapes);
-  expect(arrowShapes).toHaveLength(18);
+  expect(arrowShapes).toHaveLength(28);
 });
 
 test('follows the Visio arrow stencil order', () => {
@@ -217,6 +217,8 @@ test('follows the Visio arrow stencil order', () => {
     'curvedArrowRight', 'curvedArrowLeft', 'curvedArrowUp', 'curvedArrowDown',
     'lineArrowRight', 'lineArrowLeft', 'lineArrowUp', 'lineArrowDown',
     'lineHorizontal', 'lineVertical', 'lineDiagonal', 'lineElbow',
+    'bentArrow', 'uTurnArrow', 'sharpBent', 'stripedArrow', 'notched', 'blockArrow',
+    'circularArrow', 'quadArrow', 'leftRightUp', 'arcedLine',
   ]);
 });
 
@@ -224,4 +226,31 @@ test('resolves a dropped tile from either stencil', () => {
   expect(stencilShapeById('rectangle')?.id).toBe('rectangle');
   expect(stencilShapeById('curvedArrowRight')?.id).toBe('curvedArrowRight');
   expect(stencilShapeById('not a shape')).toBeUndefined();
+});
+
+test('gives every arrow arc a control point off its chord', () => {
+  for (const shape of arrowShapes) {
+    const cells = shape.draft(0, 0, 1, 1).cells.filter((cell) => cell.locator.section === 'Geometry');
+    const at = (rowIndex: number, name: string) => Number((cells.find((cell) => cell.locator.rowIndex === rowIndex && cell.name === name)?.formula ?? '').split('*')[1]);
+    let previous: [number, number] | undefined;
+    for (const rowIndex of [...new Set(cells.map((cell) => cell.locator.rowIndex as number))].sort((left, right) => left - right)) {
+      const rowType = cells.find((cell) => cell.locator.rowIndex === rowIndex)?.locator.rowType;
+      const end: [number, number] = [at(rowIndex, 'X'), at(rowIndex, 'Y')];
+      if (rowType === 'EllipticalArcTo') {
+        const control: [number, number] = [at(rowIndex, 'A'), at(rowIndex, 'B')];
+        expect(Number.isFinite(control[0]) && Number.isFinite(control[1])).toBe(true);
+        expect(cells.some((cell) => cell.locator.rowIndex === rowIndex && cell.name === 'D')).toBe(true);
+        const [startX, startY] = previous!;
+        expect(Math.abs((end[0] - startX) * (control[1] - startY) - (end[1] - startY) * (control[0] - startX))).toBeGreaterThan(1e-6);
+      }
+      if (rowType !== 'Close') previous = end;
+    }
+  }
+});
+
+test('winds every filled subpath with its outline so no stencil shape has a hole', () => {
+  for (const shape of shapeStencils.flatMap((stencil) => stencil.shapes)) {
+    const [outline, ...inner] = subpathAreas(shape.id).filter((area) => Math.abs(area) > 1e-9);
+    for (const area of inner) expect({ id: shape.id, sign: Math.sign(area) }).toEqual({ id: shape.id, sign: Math.sign(outline) });
+  }
 });

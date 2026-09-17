@@ -100,7 +100,17 @@
       "lineHorizontal": "Horizontal Line",
       "lineVertical": "Vertical Line",
       "lineDiagonal": "Diagonal Line",
-      "lineElbow": "Elbow Line"
+      "lineElbow": "Elbow Line",
+      "bentArrow": "Bent Arrow",
+      "uTurnArrow": "U-Turn Arrow",
+      "sharpBent": "Sharp Bent",
+      "stripedArrow": "Striped Arrow",
+      "notched": "Notched",
+      "blockArrow": "Block Arrow",
+      "circularArrow": "Circular Arrow",
+      "quadArrow": "Quad Arrow",
+      "leftRightUp": "Left-Right-Up",
+      "arcedLine": "Arced Line"
     }
   },
   "shapeData": {

@@ -139,10 +139,40 @@ export function cellIsGuarded(shape: ShapeSnapshot | null, name: string): boolea
   return GUARD_CALL.test(cellFormula(shape, name) ?? '');
 }
 
+const SETATREF_REDIRECT = /^\s*=?\s*setatref\s*\(\s*([^()]*?)\s*\)\s*$/i;
+
+/** Matches any SETATREF call without matching reference names containing setatref. */
+const SETATREF_CALL = /(^|[^A-Z0-9_.])SETATREF[A-Z]*\s*\(/i;
+
+function singleSetatrefTarget(formula: string): string | undefined {
+  const target = SETATREF_REDIRECT.exec(formula)?.[1].trim();
+  if (!target || target.includes(',') || target.includes('!') || target.includes('.')) return undefined;
+  return target;
+}
+
+/** Blocked when a GUARD sits on the cell or on any SETATREF hop to it. */
+function guardChainBlocked(shape: ShapeSnapshot | null, name: string): boolean {
+  if (!shape) return false;
+  const seen = new Set<string>();
+  let current = name;
+  for (let hop = 0; hop <= 10; hop += 1) {
+    if (seen.has(current)) return true;
+    seen.add(current);
+    const formula = cellFormula(shape, current);
+    if (formula === undefined) return false;
+    if (cellIsGuarded(shape, current)) return true;
+    const target = singleSetatrefTarget(formula);
+    if (target === undefined) return SETATREF_CALL.test(formula);
+    if (!findCell(shape, target)) return true;
+    current = target;
+  }
+  return true;
+}
+
 /** True when a delete would be refused by LockDelete or a GUARD on it. */
 export function isDeleteBlocked(shape: ShapeSnapshot | null): boolean {
   if (!shape) return false;
-  return lockCellEnabled(shape, 'LockDelete') || cellIsGuarded(shape, 'LockDelete');
+  return lockCellEnabled(shape, 'LockDelete') || guardChainBlocked(shape, 'LockDelete');
 }
 
 export const HANDLE_RESIZE_LOCKS = ['LockMoveX', 'LockMoveY', 'LockWidth', 'LockHeight', 'LockAspect'] as const;
@@ -151,13 +181,13 @@ export const HANDLE_RESIZE_LOCKS = ['LockMoveX', 'LockMoveY', 'LockWidth', 'Lock
 export function isHandleResizeBlocked(shape: ShapeSnapshot | null): boolean {
   if (!shape) return false;
   if (HANDLE_RESIZE_LOCKS.some((lock) => lockCellEnabled(shape, lock))) return true;
-  return (['PinX', 'PinY', 'Width', 'Height'] as const).some((cell) => cellIsGuarded(shape, cell));
+  return (['PinX', 'PinY', 'Width', 'Height'] as const).some((cell) => guardChainBlocked(shape, cell));
 }
 
 /** True when a single-cell write would be refused by a GUARD on that cell. */
 export function isCellWriteBlocked(shape: ShapeSnapshot | null, cellName: string): boolean {
   if (!shape) return false;
-  return cellIsGuarded(shape, cellName);
+  return guardChainBlocked(shape, cellName);
 }
 
 /** A shape's own geometry primitive; text boxes share its id, so kind is part of the match. */
