@@ -89,9 +89,8 @@ test('a reviewer drag from shape A to shape B creates a connector that follows m
       ready!.refresh();
     });
     await armConnector(view.container);
-    const canvases = document.querySelectorAll('canvas');
-    expect(canvases.length).toBeGreaterThan(0);
-    const canvas = canvases[0] as HTMLCanvasElement;
+    const canvas = document.querySelector('canvas[aria-label]') as HTMLCanvasElement;
+    expect(canvas).not.toBeNull();
     for (const scale of [1, 1.5, 0.5]) {
       const frame = ready!.handle.layoutPage(0);
       stubCanvasRect(canvas, frame.width * scale, frame.height * scale);

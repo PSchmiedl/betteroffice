@@ -70,7 +70,7 @@ async function renderWithTwoShapes(): Promise<{ ready: Ready; canvas: HTMLCanvas
     ready!.refresh();
   });
   const frame = ready!.handle.layoutPage(0);
-  const canvas = document.querySelectorAll('canvas')[0] as HTMLCanvasElement;
+  const canvas = document.querySelector('canvas[aria-label]') as HTMLCanvasElement;
   stubCanvasRect(canvas, frame.width, frame.height);
   return { ready: ready!, canvas, fromId, toId };
 }
