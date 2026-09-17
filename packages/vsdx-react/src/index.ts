@@ -25,6 +25,8 @@ export { ShapeDataPanel } from './components/shapeData/ShapeDataPanel';
 export type { ShapeDataPanelProps } from './components/shapeData/ShapeDataPanel';
 export { LayersPanel } from './components/layers/LayersPanel';
 export type { LayersPanelProps } from './components/layers/LayersPanel';
+export { IssuesPanel, issueMessage } from './components/issues/IssuesPanel';
+export type { IssuesPanelProps } from './components/issues/IssuesPanel';
 export { DrawingExplorer, MAX_EXPLORER_DEPTH, findShapePath, groupSectionRows, groupShapeSections, isOneDimensional } from './components/explorer';
 export type { DrawingExplorerProps, ExplorerRow, ExplorerSection } from './components/explorer';
 export { arrowShapes, shapeLabel, shapeStencils, standardShapeById, standardShapes, stencilShapeById } from './components/shapes/shapeLibrary';

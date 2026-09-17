@@ -64,6 +64,8 @@ export class VsdxRenderer {
     pageLayersJson(document: VsdxDocument, page_index: number): string;
     registerFont(family: string, bold: boolean, italic: boolean, bytes: Uint8Array): number;
     setLayerVisible(page_part: string, index: number, visible: boolean): void;
+    validateJson(document: VsdxDocument): string;
+    validatePageJson(document: VsdxDocument, page_index: number): string;
 }
 
 export function parseVsdxJson(data: Uint8Array): string;
@@ -88,6 +90,8 @@ export interface InitOutput {
     readonly vsdxrenderer_pageLayersJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxrenderer_registerFont: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly vsdxrenderer_setLayerVisible: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly vsdxrenderer_validateJson: (a: number, b: number) => [number, number, number, number];
+    readonly vsdxrenderer_validatePageJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly __wbg_vsdxdocument_free: (a: number, b: number) => void;
     readonly vsdxdocument_addConnectedShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_addConnectorJson: (a: number, b: number, c: number) => [number, number, number, number];

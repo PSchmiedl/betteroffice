@@ -10,6 +10,9 @@ export interface DocumentMaster { id: number; name: string | null; display: Page
 export interface ShapeTreeGlue { connectorSource: string; endpoint: string; targetSource: string; toCell: string; }
 export interface FormulaShapeTreeGlue { connectorSource: string; endpoint: string; targetSource: string; toCell: string; }
 export interface FormulaShapeTreeDraft { name?: string; cells: Array<{ locator: CellLocator & { rowType?: string }; name?: string; formula?: string; value?: string }>; text?: string; copySourceId?: number | null; copySourcePageId?: number | null; sourceShapeId?: string | null; sourceId?: number | null; copyRefusal?: string | null; glue?: FormulaShapeTreeGlue[]; children?: FormulaShapeTreeDraft[]; }
+export type ValidationSeverity = 'error' | 'warning';
+export interface RawValidationIssue { id: string; rule: string; severity: ValidationSeverity; pagePart: string; pageId: number | null; shapeId: number; otherShapeId: number | null; endpoint: string | null; row: string | null; }
+export interface ValidationIssue { id: string; rule: string; severity: ValidationSeverity; pageId: string; shapeId: string; otherShapeId: string | null; endpoint: string | null; row: string | null; }
 export interface PageSnapshot { id: string; sourcePartPath: string; name: string | null; shapes: ShapeSnapshot[]; }
 export interface DiagramSnapshot { pages: PageSnapshot[]; }
 export interface CellFormulaReceipt { pageId: string; shapeId: string; cellName: string; before: string | null; after: string; }

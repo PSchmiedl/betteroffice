@@ -11,15 +11,17 @@ let foundation: Uint8Array;
 let nestedGroups: Uint8Array;
 let groupedGlue: Uint8Array;
 let textAccounting: Uint8Array;
+let validation: Uint8Array;
 let demo: Uint8Array;
 
 beforeAll(async () => {
-  const [wasm, foundationBytes, nestedGroupsBytes, groupedGlueBytes, textAccountingBytes, demoBytes] = await Promise.all([
+  const [wasm, foundationBytes, nestedGroupsBytes, groupedGlueBytes, textAccountingBytes, validationBytes, demoBytes] = await Promise.all([
     readFile(resolve(import.meta.dir, 'generated/vsdx_wasm_bg.wasm')),
     readFile(resolve(root, 'crates/vsdx-parse/tests/fixtures/foundation.vsdx')),
     readFile(resolve(root, 'crates/vsdx-parse/tests/fixtures/nested-groups.vsdx')),
     readFile(resolve(root, 'crates/vsdx-parse/tests/fixtures/grouped-glue.vsdx')),
     readFile(resolve(root, 'crates/vsdx-parse/tests/fixtures/text-accounting.vsdx')),
+    readFile(resolve(root, 'crates/vsdx-parse/tests/fixtures/validation.vsdx')),
     readFile(resolve(root, 'apps/demo/public/betteroffice-demo.vsdx')),
   ]);
   await initWasm(wasm);
@@ -27,6 +29,7 @@ beforeAll(async () => {
   nestedGroups = nestedGroupsBytes;
   groupedGlue = groupedGlueBytes;
   textAccounting = textAccountingBytes;
+  validation = validationBytes;
   demo = demoBytes;
 });
 
@@ -100,6 +103,31 @@ describe('VSDX wasm boundary', () => {
     diagram.layoutPage(0);
     expect(diagram.hitTest(-1, -1)).toBeNull();
     diagram.dispose();
+  });
+
+  test('maps validation issues onto the session shape ids', () => {
+    const diagram = openDiagram(validation, { clientId: 9016 });
+    try {
+      const snapshot = diagram.snapshot();
+      const ids = new Map(snapshot.pages[0].shapes.map((shape) => [shape.sourceId, shape.id]));
+      const issues = diagram.validate();
+      expect(issues.map((issue) => issue.rule)).toEqual([
+        'connector-crossing',
+        'dangling-connector',
+        'dangling-connector',
+        'empty-shape-data',
+        'isolated-shape',
+        'overlapping-shapes',
+      ]);
+      const overlap = issues.find((issue) => issue.rule === 'overlapping-shapes')!;
+      expect(overlap.pageId).toBe(snapshot.pages[0].id);
+      expect(overlap.shapeId).toBe(ids.get(1)!);
+      expect(overlap.otherShapeId).toBe(ids.get(2)!);
+      expect(diagram.validatePage(0)).toEqual(issues);
+      expect(() => diagram.validatePage(9)).toThrow('page index is outside the document');
+    } finally {
+      diagram.dispose();
+    }
   });
 
   test('exports one vector SVG per diagram page', () => {

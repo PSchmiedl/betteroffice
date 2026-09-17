@@ -13,6 +13,10 @@ pub use vsdx_resolve::{
 use vsdx_resolve::{
     PageConnectivity, PageContainers, ResolveError, ResolvedShape, Resolver, shape_data,
 };
+pub use vsdx_validate::{
+    RULE_CONNECTOR_CROSSING, RULE_DANGLING_CONNECTOR, RULE_EMPTY_SHAPE_DATA, RULE_ISOLATED_SHAPE,
+    RULE_OVERLAPPING_SHAPES, RuleDescriptor, Severity, ValidationIssue, ValidationReport,
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -169,6 +173,10 @@ impl Diagram {
             diagram: self,
             part,
         })
+    }
+    /// Runs the read-only default rule set over every page.
+    pub fn validate(&self) -> ValidationReport {
+        vsdx_validate::validate_package(&self.package)
     }
 }
 
@@ -465,6 +473,11 @@ impl<'a> Page<'a> {
     }
     pub fn containers(&self) -> Result<PageContainers> {
         Ok(Resolver::new(&self.diagram.package).resolve_page_containers(self.part)?)
+    }
+
+    /// Runs the read-only default rule set over this page.
+    pub fn validate(&self) -> Vec<ValidationIssue> {
+        vsdx_validate::validate_page(&self.diagram.package, self.part)
     }
 }
 
