@@ -17,6 +17,8 @@ export const vsdxdocument_addConnectedShapeJson: (a: number, b: number, c: numbe
 export const vsdxdocument_addConnectorJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const vsdxdocument_addFreeConnectorJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const vsdxdocument_addShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
+export const vsdxdocument_addShapeTreeJson: (a: number, b: number, c: number) => [number, number, number, number];
+export const vsdxdocument_addShapeWithTextJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const vsdxdocument_applyUpdateJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const vsdxdocument_canRedo: (a: number) => number;
 export const vsdxdocument_canUndo: (a: number) => number;
@@ -45,6 +47,7 @@ export const vsdxdocument_setShapeTextJson: (a: number, b: number, c: number) =>
 export const vsdxdocument_shapeTextJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const vsdxdocument_snapshotJson: (a: number) => [number, number, number, number];
 export const vsdxdocument_startUpdateObservation: (a: number) => [number, number];
+export const vsdxdocument_subtreeGlueJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const vsdxdocument_undoJson: (a: number) => [number, number, number, number];
 export const vsdxdocument_version: () => [number, number];
 export const __wbindgen_exn_store: (a: number) => void;

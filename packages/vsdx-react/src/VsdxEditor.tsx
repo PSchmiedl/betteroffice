@@ -10,10 +10,12 @@ import { Ribbon } from './components/ribbon/Ribbon';
 import type { ViewToggleKey } from './components/ribbon/Ribbon';
 import { CanvasContextMenu } from './components/ribbon/CanvasContextMenu';
 import { ShapeContextMenu } from './components/ribbon/ShapeContextMenu';
-import { RibbonCommandsProvider, findShapePlacement, isCellWriteBlocked, isHandleResizeBlocked, numericCellValue, useRibbonCommands } from './components/ribbon/commands';
+import { RibbonCommandsProvider, copySelection, duplicateEntry, findShapePlacement, isCellWriteBlocked, isHandleResizeBlocked, numericCellValue, pasteEntry, useRibbonCommands } from './components/ribbon/commands';
 import type { RibbonCommands } from './components/ribbon/commands';
 import { dragSegmentRoute, hitSegmentDot, paintConnectorChrome, previewChrome, selectedConnectorChrome } from './connectorChrome';
 import type { ChromePoint } from './connectorChrome';
+import type { VsdxClipboardEntry } from './components/ribbon/clipboard';
+import { DUPLICATE_OFFSET, PASTE_OFFSET } from './components/ribbon/clipboard';
 import { STENCIL_DRAG_MIME, ShapesPanel } from './components/shapes/ShapesPanel';
 import { RulerLeft, RulerTop, RULER_SIZE } from './components/ruler/Rulers';
 import { LayersPanel } from './components/layers/LayersPanel';
@@ -81,6 +83,9 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const [selection, setSelection] = useState<VsdxShapeSelection | null>(null);
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
+  const [clipboard, setClipboard] = useState<VsdxClipboardEntry | null>(null);
+  const clipboardRef = useRef(clipboard);
+  clipboardRef.current = clipboard;
   const [editing, setEditing] = useState<{ pageId: string; shapeId: string; selectAll: boolean } | null>(null);
   const [draft, setDraft] = useState('');
   const editingRef = useRef(editing);
@@ -215,7 +220,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     let handle: DiagramHandle | null = null;
     let stopUpdates = () => {};
     let stopResync = () => {};
-    handleRef.current?.dispose(); handleRef.current = null; imageCache.current.clear(); setSelection(null); setContextMenu(null); setEditing(null); setDraft(''); modelRef.current = { snapshot: null, pageIndex: 0, frame: null, layers: [] }; setModel(modelRef.current); setError(null); setDirty(false);
+    handleRef.current?.dispose(); handleRef.current = null; imageCache.current.clear(); setSelection(null); setContextMenu(null); setClipboard(null); setEditing(null); setDraft(''); modelRef.current = { snapshot: null, pageIndex: 0, frame: null, layers: [] }; setModel(modelRef.current); setError(null); setDirty(false);
     if (!file) { setLoading(false); return; }
     setLoading(true);
     const openingFonts = fontsRef.current;
@@ -1116,9 +1121,53 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     if (intent.kind === 'escape') { cancelActiveDrag(); hideAutoConnect(); closeContextMenu(); setSelection(null); return; }
     nudgeSelection(intent.dx, intent.dy);
   };
+  const copySelected = useCallback(() => {
+    const handle = handleRef.current;
+    if (!handle || !selection) return;
+    try { setClipboard(copySelection(handle, selection)); } catch (value) { reportError(value); }
+  }, [selection, reportError]);
+  const cutSelected = useCallback(() => {
+    const handle = handleRef.current;
+    if (!handle || !selection) return;
+    try {
+      setClipboard(copySelection(handle, selection));
+      handle.deleteShape(selection.pageId, selection.shapeId);
+      refresh(undefined, true);
+    } catch (value) { reportError(value); }
+  }, [selection, refresh, reportError]);
+  const pasteClipboardEntry = useCallback(() => {
+    const handle = handleRef.current;
+    const entry = clipboardRef.current;
+    if (!handle || !entry) return;
+    try {
+      const target = modelRef.current.snapshot?.pages[modelRef.current.pageIndex]?.id ?? selection?.pageId ?? entry.pageId;
+      const step = entry.pasteCount + 1;
+      const { receipt, entry: next } = pasteEntry(handle, target, entry, PASTE_OFFSET.x * step, PASTE_OFFSET.y * step);
+      setClipboard(next);
+      setSelection({ pageId: target, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } });
+      refresh(undefined, true);
+    } catch (value) { reportError(value); }
+  }, [selection, refresh, reportError]);
+  const duplicateSelected = useCallback(() => {
+    const handle = handleRef.current;
+    if (!handle || !selection) return;
+    try {
+      const entry = copySelection(handle, selection);
+      const receipt = duplicateEntry(handle, selection.pageId, entry, DUPLICATE_OFFSET.x, DUPLICATE_OFFSET.y);
+      setSelection({ pageId: selection.pageId, shapeId: receipt.shapeId, hit: { kind: 'shape', shapeId: receipt.shapeId } });
+      refresh(undefined, true);
+    } catch (value) { reportError(value); }
+  }, [selection, refresh, reportError]);
   const onCanvasKeyDown = (event: KeyboardEvent<HTMLCanvasElement>) => {
     if (event.altKey && event.key === '3') { event.preventDefault(); toggleConnector(); return; }
     const selected = selectionRef.current;
+    if (!editingRef.current && (event.ctrlKey || event.metaKey) && !event.altKey) {
+      const key = event.key.toLowerCase();
+      if (key === 'c' && selected) { event.preventDefault(); copySelected(); return; }
+      if (key === 'x' && selected) { event.preventDefault(); cutSelected(); return; }
+      if (key === 'v' && clipboardRef.current) { event.preventDefault(); pasteClipboardEntry(); return; }
+      if (key === 'd' && selected) { event.preventDefault(); duplicateSelected(); return; }
+    }
     if (selected && !editingRef.current) {
       if (event.key === 'Enter') { event.preventDefault(); enterTextEdit(selected.pageId, selected.shapeId); return; }
       if (isPrintableEntryKey(event)) { event.preventDefault(); enterTextEdit(selected.pageId, selected.shapeId, event.key); return; }
@@ -1244,7 +1293,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const fidelity = diagnostics.filter((diagnostic) => diagnostic.category === 'fidelity');
   return <div className={className} style={styles.root} aria-label={t('editor.appLabel')} onKeyDown={onEditorKeyDown}>
     <header style={styles.titleBar}><strong>{t('ribbon.documentName')}</strong><span style={{ color: dirty ? '#a16207' : '#526273' }}>{dirty ? t('ribbon.dirty') : t('ribbon.saved')}</span></header>
-    <RibbonCommandsProvider handle={handleRef.current} snapshot={model.snapshot} pageId={model.snapshot?.pages[model.pageIndex]?.id} selection={selection} frame={model.frame} pageBreaks={pageBreakToggle} onMutation={() => refresh(undefined, true)} onError={reportError} onDownload={download}>
+    <RibbonCommandsProvider handle={handleRef.current} snapshot={model.snapshot} pageId={model.snapshot?.pages[model.pageIndex]?.id} selection={selection} frame={model.frame} clipboard={clipboard} onClipboardChange={setClipboard} onSelectShape={setSelection} pageBreaks={pageBreakToggle} onMutation={() => refresh(undefined, true)} onError={reportError} onDownload={download}>
     <RibbonCommandsBridge target={commandsRef} />
     <Ribbon t={t} hasSelection={selection !== null} connector={{ active: connectorMode, disabled: !model.frame, onToggle: toggleConnector }} view={{ grid: showGrid, snap: snapEnabled, rulers: showRulers }} onToggleView={toggleView} />
     <div style={styles.contentRow}>

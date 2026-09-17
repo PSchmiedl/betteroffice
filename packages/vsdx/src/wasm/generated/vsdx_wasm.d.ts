@@ -9,6 +9,8 @@ export class VsdxDocument {
     addConnectorJson(args: string): string;
     addFreeConnectorJson(args: string): string;
     addShapeJson(args: string): string;
+    addShapeTreeJson(args: string): string;
+    addShapeWithTextJson(args: string): string;
     applyUpdateJson(update: Uint8Array): string;
     canRedo(): boolean;
     canUndo(): boolean;
@@ -39,6 +41,7 @@ export class VsdxDocument {
     shapeTextJson(args: string): string;
     snapshotJson(): string;
     startUpdateObservation(): void;
+    subtreeGlueJson(args: string): string;
     undoJson(): string;
     static version(): string;
     readonly clientId: number;
@@ -81,6 +84,8 @@ export interface InitOutput {
     readonly vsdxdocument_addConnectorJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_addFreeConnectorJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_addShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly vsdxdocument_addShapeTreeJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly vsdxdocument_addShapeWithTextJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_applyUpdateJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_canRedo: (a: number) => number;
     readonly vsdxdocument_canUndo: (a: number) => number;
@@ -109,6 +114,7 @@ export interface InitOutput {
     readonly vsdxdocument_shapeTextJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_snapshotJson: (a: number) => [number, number, number, number];
     readonly vsdxdocument_startUpdateObservation: (a: number) => [number, number];
+    readonly vsdxdocument_subtreeGlueJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly vsdxdocument_undoJson: (a: number) => [number, number, number, number];
     readonly vsdxdocument_version: () => [number, number];
     readonly __wbindgen_exn_store: (a: number) => void;

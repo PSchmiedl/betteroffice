@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use vsdx_parse::{Connect, ConnectsChild, ShapesChild, SheetChild};
+use vsdx_parse::{Connect, ConnectsChild, ParseLimits, ShapesChild, SheetChild};
 use vsdx_resolve::Resolver;
 use yrs::{Doc, Map, MapPrelim, Out, ReadTxn, Transact, WriteTxn};
 
@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     CONNECTS, ConnectedShapeReceipt, ConnectorGlue, DiagramSession, EditCtx, EditError, EditResult,
-    PAGES, PageSnapshot, SHEETS, ShapeDraft, ShapeReceipt, ShapeSnapshot,
+    PAGES, PageSnapshot, SHEETS, ShapeDraft, ShapeReceipt, ShapeSnapshot, ShapeTreeGlue,
 };
 
 #[derive(PartialEq, Eq)]
@@ -23,14 +23,14 @@ pub(super) struct GlueRecord {
     to_cell: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GlueEndpoint {
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum GlueEndpoint {
     Begin,
     End,
 }
 
 impl GlueEndpoint {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Begin => "begin",
             Self::End => "end",
@@ -44,7 +44,7 @@ impl GlueEndpoint {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub(super) fn parse(value: &str) -> Option<Self> {
         match value {
             "begin" => Some(Self::Begin),
             "end" => Some(Self::End),
@@ -82,7 +82,7 @@ impl DiagramSession {
         from: &ConnectorGlue,
         to: &ConnectorGlue,
     ) -> EditResult<ShapeReceipt> {
-        validate_shape_draft(draft)?;
+        validate_shape_draft(draft, false)?;
         let glue = [(GlueEndpoint::Begin, from), (GlueEndpoint::End, to)];
         self.validate_connector(page_id, draft, &glue)?;
         let mut txn = self.transact_for(context);
@@ -113,7 +113,7 @@ impl DiagramSession {
         draft: &ShapeDraft,
         from: &ConnectorGlue,
     ) -> EditResult<ShapeReceipt> {
-        validate_shape_draft(draft)?;
+        validate_shape_draft(draft, false)?;
         self.validate_free_connector(page_id, draft, from)?;
         let mut txn = self.transact_for(context);
         let receipt = insert_shape(&mut txn, self.client_id, page_id, draft)?;
@@ -164,9 +164,12 @@ impl DiagramSession {
             name: draft.name.clone(),
             cells: draft.cells.clone(),
             children: Vec::new(),
+            copy_source_id: None,
+            copy_source_page_id: None,
+            copy_refusal: None,
         };
         let mut shape = shape_from_snapshot(&candidate);
-        materialize_shape(&mut shape, &candidate, &HashSet::new(), 1)?;
+        materialize_shape(&mut shape, &candidate, &HashSet::new(), 1, &BTreeMap::new())?;
         let Some(SheetChild::Shapes(shapes)) = sheet
             .children
             .iter_mut()
@@ -203,8 +206,8 @@ impl DiagramSession {
         from: &ConnectorGlue,
         to_cell: Option<&str>,
     ) -> EditResult<ConnectedShapeReceipt> {
-        validate_shape_draft(shape_draft)?;
-        validate_shape_draft(connector_draft)?;
+        validate_shape_draft(shape_draft, false)?;
+        validate_shape_draft(connector_draft, false)?;
         self.validate_connected_shape(page_id, shape_draft, connector_draft, from, to_cell)?;
         let mut txn = self.transact_for(context);
         let shape = insert_shape(&mut txn, self.client_id, page_id, shape_draft)?;
@@ -274,9 +277,12 @@ impl DiagramSession {
                 name: draft.name.clone(),
                 cells: draft.cells.clone(),
                 children: Vec::new(),
+                copy_source_id: None,
+                copy_source_page_id: None,
+                copy_refusal: None,
             };
             let mut shape = shape_from_snapshot(&candidate);
-            materialize_shape(&mut shape, &candidate, &HashSet::new(), 1)?;
+            materialize_shape(&mut shape, &candidate, &HashSet::new(), 1, &BTreeMap::new())?;
             Ok(shape)
         };
         let new_shape = staged(shape_source, shape_draft)?;
@@ -346,9 +352,12 @@ impl DiagramSession {
             name: draft.name.clone(),
             cells: draft.cells.clone(),
             children: Vec::new(),
+            copy_source_id: None,
+            copy_source_page_id: None,
+            copy_refusal: None,
         };
         let mut shape = shape_from_snapshot(&candidate);
-        materialize_shape(&mut shape, &candidate, &HashSet::new(), 1)?;
+        materialize_shape(&mut shape, &candidate, &HashSet::new(), 1, &BTreeMap::new())?;
         let Some(SheetChild::Shapes(shapes)) = sheet
             .children
             .iter_mut()
@@ -600,6 +609,81 @@ fn validate_added_glue(staged: &Doc, added: &[&GlueRecord]) -> EditResult<()> {
         }
     }
     Ok(())
+}
+
+pub(super) fn glue_key(connector_id: &str, endpoint: GlueEndpoint) -> String {
+    format!("{connector_id}:{}", endpoint.name())
+}
+
+/// `PinX`, `PinY` or a one-based connection point.
+pub(super) fn valid_glue_target(cell: &str) -> bool {
+    matches!(cell, "PinX" | "PinY") || connection_row(cell).is_some()
+}
+
+pub(super) fn glue_text_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= ParseLimits::default().max_attribute_bytes
+        && value
+            .chars()
+            .all(|c| matches!(c, '\t' | '\r' | '\n' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}'))
+}
+
+/// Glue wholly inside a copied subtree: session records plus the source part's own connects.
+pub(super) fn subtree_glue<T: ReadTxn>(
+    txn: &T,
+    page_id: &str,
+    members: &HashSet<String>,
+    sheet: Option<&vsdx_parse::Sheet>,
+    by_source: &BTreeMap<u32, String>,
+) -> EditResult<Vec<ShapeTreeGlue>> {
+    let mut seen = HashSet::new();
+    let mut glue = Vec::new();
+    for record in glue_records(txn)? {
+        if record.page_id != page_id
+            || !members.contains(record.connector_id.as_str())
+            || !members.contains(record.target_id.as_str())
+        {
+            continue;
+        }
+        seen.insert((record.connector_id.clone(), record.endpoint));
+        glue.push(ShapeTreeGlue {
+            connector_source: record.connector_id,
+            endpoint: record.endpoint.name().to_owned(),
+            target_source: record.target_id,
+            to_cell: record.to_cell,
+        });
+    }
+    for connect in sheet.into_iter().flat_map(vsdx_parse::Sheet::connects) {
+        let endpoint = match connect.from_cell.as_deref() {
+            Some("BeginX") => GlueEndpoint::Begin,
+            Some("EndX") => GlueEndpoint::End,
+            _ => continue,
+        };
+        let to_cell = match connect.to_cell.as_deref() {
+            None => "PinX".to_owned(),
+            Some(cell) if valid_glue_target(cell) => cell.to_owned(),
+            Some(_) => continue,
+        };
+        let (Some(connector), Some(target)) = (
+            by_source.get(&connect.from_sheet),
+            by_source.get(&connect.to_sheet),
+        ) else {
+            continue;
+        };
+        if !seen.insert((connector.clone(), endpoint)) {
+            continue;
+        }
+        glue.push(ShapeTreeGlue {
+            connector_source: connector.clone(),
+            endpoint: endpoint.name().to_owned(),
+            target_source: target.clone(),
+            to_cell,
+        });
+    }
+    glue.sort_by(|left, right| {
+        (&left.connector_source, &left.endpoint).cmp(&(&right.connector_source, &right.endpoint))
+    });
+    Ok(glue)
 }
 
 fn connection_row(cell: &str) -> Option<u32> {

@@ -1,6 +1,6 @@
 import initWasmModule, { VsdxDocument, VsdxRenderer, rendererVersion } from './generated/vsdx_wasm.js';
 import type { InitInput } from './generated/vsdx_wasm.js';
-import type { CellLocator, CellFormulaReceipt, CollaborationUpdateOrigin, ConnectedShapeReceipt, ConnectorGlue, ConnectorRoutePoint, ConnectorRouteReceipt, DiagramSnapshot, FormulaShapeDraft, HistoryResult, HitTestResult, PageDisplayList, PageLayer, ShapeReceipt, TextReceipt, VsdxFontFace } from '../types';
+import type { CellLocator, CellFormulaReceipt, CollaborationUpdateOrigin, ConnectedShapeReceipt, ConnectorGlue, ConnectorRoutePoint, ConnectorRouteReceipt, DiagramSnapshot, FormulaShapeDraft, FormulaShapeTreeDraft, HistoryResult, HitTestResult, PageDisplayList, PageLayer, ShapeReceipt, ShapeTreeGlue, TextReceipt, VsdxFontFace } from '../types';
 
 export type WasmInitInput = InitInput | Promise<InitInput>;
 export interface OpenDiagramOptions { clientId?: number; fonts?: ReadonlyArray<VsdxFontFace>; initialUpdate?: Uint8Array; }
@@ -25,6 +25,9 @@ export interface DiagramHandle {
   reorderShape(pageId: string, shapeId: string, toIndex: number): ShapeReceipt;
   reorderPage(pageId: string, toIndex: number): ShapeReceipt;
   addShape(pageId: string, draft: FormulaShapeDraft): ShapeReceipt;
+  addShapeWithText(pageId: string, draft: FormulaShapeDraft, text: string): ShapeReceipt;
+  addShapeTree(pageId: string, draft: FormulaShapeTreeDraft): ShapeReceipt;
+  subtreeGlue(pageId: string, shapeId: string): ShapeTreeGlue[];
   addConnector(pageId: string, draft: FormulaShapeDraft, from: ConnectorGlue, to: ConnectorGlue): ShapeReceipt;
   addFreeConnector(pageId: string, draft: FormulaShapeDraft, from: ConnectorGlue): ShapeReceipt;
   addConnectedShape(pageId: string, shapeDraft: FormulaShapeDraft, connectorDraft: FormulaShapeDraft, from: ConnectorGlue, toCell?: string): ConnectedShapeReceipt;
@@ -147,6 +150,9 @@ export function openDiagram(bytes: Uint8Array, options: OpenDiagramOptions = {})
     reorderShape: (pageId, shapeId, toIndex) => json(() => doc.reorderShapeJson(JSON.stringify({ pageId, shapeId, toIndex })), true),
     reorderPage: (pageId, toIndex) => json(() => doc.reorderPageJson(JSON.stringify({ pageId, toIndex })), true),
     addShape: (pageId, draft) => json(() => doc.addShapeJson(JSON.stringify({ pageId, draft })), true),
+    addShapeWithText: (pageId, draft, text) => json(() => doc.addShapeWithTextJson(JSON.stringify({ pageId, draft, text })), true),
+    addShapeTree: (pageId, draft) => json(() => doc.addShapeTreeJson(JSON.stringify({ pageId, draft })), true),
+    subtreeGlue: (pageId, shapeId) => json(() => doc.subtreeGlueJson(JSON.stringify({ pageId, shapeId }))),
     addConnector: (pageId, draft, from, to) => json(() => doc.addConnectorJson(JSON.stringify({ pageId, draft, from, to })), true),
     addFreeConnector: (pageId, draft, from) => json(() => doc.addFreeConnectorJson(JSON.stringify({ pageId, draft, from })), true),
     addConnectedShape: (pageId, shapeDraft, connectorDraft, from, toCell) => json(() => doc.addConnectedShapeJson(JSON.stringify({ pageId, shapeDraft, connectorDraft, from, toCell })), true),

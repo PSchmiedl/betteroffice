@@ -144,6 +144,8 @@ function HomePanel({ t }: { t: TFunction }) {
   return <div style={styles.surface} data-testid="vsdx-ribbon-home-panel">
     <RibbonRun label={t('ribbon.groups.history')}><CommandButton id="undo" icon="undo" label={label('undo')} /><CommandButton id="redo" icon="redo" label={label('redo')} /></RibbonRun>
     <Divider />
+    <RibbonRun label={t('ribbon.groups.clipboard')}><CommandButton id="cut" icon="cut" label={label('cut')} /><CommandButton id="copy" icon="copy" label={label('copy')} /><CommandButton id="paste" icon="paste" label={label('paste')} /><CommandButton id="duplicate" icon="duplicate" label={label('duplicate')} /></RibbonRun>
+    <Divider />
     <RibbonRun label={t('ribbon.groups.insert')}><CommandButton id="delete" icon="delete" label={label('delete')} /><CommandButton id="addShape" icon="add" label={label('addShape')} /></RibbonRun>
     <Divider />
     <FormatRun t={t} />
