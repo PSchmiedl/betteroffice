@@ -254,6 +254,7 @@ dependencies = [
  "betteroffice-vsdx-edit",
  "betteroffice-vsdx-eval",
  "betteroffice-vsdx-parse",
+ "betteroffice-vsdx-raster",
  "betteroffice-vsdx-render",
  "betteroffice-vsdx-resolve",
 ]
@@ -309,9 +310,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "betteroffice-vsdx-raster"
+version = "0.2.0"
+dependencies = [
+ "betteroffice-drawingml",
+ "betteroffice-ooxml-text",
+ "betteroffice-vsdx-parse",
+ "betteroffice-vsdx-render",
+ "image",
+ "png",
+ "rustybuzz",
+ "tiny-skia",
+]
+
+[[package]]
 name = "betteroffice-vsdx-render"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "betteroffice-drawingml",
  "betteroffice-ooxml-text",
  "betteroffice-vsdx-eval",

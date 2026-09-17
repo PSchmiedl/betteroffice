@@ -128,6 +128,27 @@ impl VsdxRenderer {
         let package = document.session().package().map_err(js_error)?;
         self.renderer.export_pdf(&package).map_err(js_error)
     }
+
+    #[wasm_bindgen(js_name = exportSvgJson)]
+    pub fn export_svg_json(&self, document: &VsdxDocument) -> Result<String, JsValue> {
+        let package = document.session().package().map_err(js_error)?;
+        let pages = self.renderer.export_svg(&package).map_err(js_error)?;
+        serde_json::to_string(&pages).map_err(js_error)
+    }
+
+    #[cfg(feature = "raster")]
+    #[wasm_bindgen(js_name = exportPng)]
+    pub fn export_png(
+        &self,
+        document: &VsdxDocument,
+        page_index: u32,
+        scale: f32,
+    ) -> Result<Vec<u8>, JsValue> {
+        let package = document.session().package().map_err(js_error)?;
+        vsdx_raster::render_page(&self.renderer, &package, page_index as usize, scale)
+            .map(|page| page.bytes)
+            .map_err(js_error)
+    }
 }
 
 impl Default for VsdxRenderer {
@@ -508,5 +529,35 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn export_svg_json_renders_one_vector_page_per_diagram_page() {
+        let document = VsdxDocument::open_collaborative(
+            include_bytes!("../../vsdx-parse/tests/fixtures/text-accounting.vsdx"),
+            1.0,
+        )
+        .unwrap();
+        let renderer = VsdxRenderer::new();
+        let pages: Vec<String> =
+            serde_json::from_str(&renderer.export_svg_json(&document).unwrap()).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
+        assert!(pages[0].contains("<text"));
+    }
+
+    #[cfg(feature = "raster")]
+    #[test]
+    fn export_png_renders_scaled_raster_pages() {
+        let document = VsdxDocument::open_collaborative(
+            include_bytes!("../../vsdx-parse/tests/fixtures/text-accounting.vsdx"),
+            1.0,
+        )
+        .unwrap();
+        let renderer = VsdxRenderer::new();
+        let first = renderer.export_png(&document, 0, 1.0).unwrap();
+        assert_eq!(&first[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+        let second = renderer.export_png(&document, 0, 2.0).unwrap();
+        assert!(second.len() > first.len());
     }
 }
