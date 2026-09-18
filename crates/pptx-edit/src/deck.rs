@@ -30,6 +30,8 @@ const MAX_SHAPE_DEPTH: usize = 128;
 const EMU_PER_POINT: f64 = 12_700.0;
 const MAX_ADJUSTMENTS: usize = 32;
 const MAX_ADJUSTMENT_INDEX: usize = 32;
+/// Stays well under the 16 MiB collaboration frame cap once base64-encoded.
+const MAX_PENDING_PICTURE_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) fn seed_doc(doc: &Doc, package: &PptxPackage, fingerprint: &str) -> EditResult<()> {
     let package_json =
@@ -507,8 +509,7 @@ impl DeckSession {
         })
     }
 
-    /// Inserts a picture whose bytes have no part of their own yet; `save`
-    /// mints the media part, its content-type default and the relationship.
+    /// `save` mints the media part, content-type default and relationship.
     pub fn add_picture(
         &self,
         context: &EditCtx,
@@ -521,6 +522,18 @@ impl DeckSession {
             return Err(EditError::InvalidState(
                 "a picture needs image data".to_owned(),
             ));
+        }
+        if draft.media_bytes.len() > MAX_PENDING_PICTURE_BYTES {
+            return Err(EditError::InvalidState(format!(
+                "image is {} bytes, exceeds the {MAX_PENDING_PICTURE_BYTES}-byte limit",
+                draft.media_bytes.len()
+            )));
+        }
+        if !pptx_parse::is_supported_image_content_type(&draft.content_type) {
+            return Err(EditError::InvalidState(format!(
+                "unsupported image type {:?}",
+                draft.content_type
+            )));
         }
         let shape_id = self.next_id("shape");
         let mut txn = self.transact_for(context);

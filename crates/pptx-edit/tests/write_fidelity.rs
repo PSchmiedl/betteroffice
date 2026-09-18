@@ -529,6 +529,49 @@ fn an_added_picture_mints_its_media_part_content_type_and_relationship() {
 }
 
 #[test]
+fn an_unsupported_or_oversized_picture_is_rejected_before_it_touches_the_deck() {
+    let session = open();
+    let slide_id = session.snapshot().unwrap().slides[0].id.clone();
+    let rect = pptx_edit::ShapeRect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+    };
+
+    let error = session
+        .add_picture(
+            &context(),
+            &slide_id,
+            &pptx_edit::PictureDraft {
+                name: "Bad type".to_owned(),
+                rect,
+                content_type: "image/avif".to_owned(),
+                media_bytes: vec![1, 2, 3, 4],
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, EditError::InvalidState(_)), "{error:?}");
+
+    let error = session
+        .add_picture(
+            &context(),
+            &slide_id,
+            &pptx_edit::PictureDraft {
+                name: "Too big".to_owned(),
+                rect,
+                content_type: "image/png".to_owned(),
+                media_bytes: vec![0; 8 * 1024 * 1024 + 1],
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, EditError::InvalidState(_)), "{error:?}");
+
+    // Neither rejected draft left a shape behind.
+    assert_eq!(parts(&session.save().unwrap()), parts(&fixture(256)));
+}
+
+#[test]
 fn shape_z_order_operations_reorder_within_the_slide() {
     let session = open();
     let snapshot = session.snapshot().unwrap();

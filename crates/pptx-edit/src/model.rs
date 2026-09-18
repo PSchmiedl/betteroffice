@@ -129,8 +129,7 @@ pub struct ShapeSnapshot {
     pub outline: Option<ShapeOutline>,
     pub resolved_outline_color: Option<String>,
     pub media_part_path: Option<String>,
-    /// A picture added locally: its bytes have no part of their own yet, so
-    /// `save` mints one. Absent for pictures loaded from the source package.
+    /// Set only for a picture added locally that `save` has not minted a part for yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_media: Option<PendingMedia>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -140,8 +139,7 @@ pub struct ShapeSnapshot {
     pub children: Vec<ShapeSnapshot>,
 }
 
-/// A locally added picture's bytes, kept base64-encoded so a `snapshotJson`
-/// call stays a JSON string rather than exploding into a number array.
+/// A locally added picture's bytes, base64-encoded for compact JSON.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingMedia {

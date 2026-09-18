@@ -88,8 +88,7 @@ export interface ToolbarProps {
   onFormat?: (action: FormattingAction) => void;
   currentShapeFormatting?: ShapeFormatting;
   shapeSelectionActive?: boolean;
-  /** Enables the arrange (z-order) menu; true for any selected object, not
-   *  only the preset shapes `shapeSelectionActive` covers. */
+  /** Enables the arrange (z-order) menu for any selected object. */
   shapeArrangeActive?: boolean;
   onShapeFormat?: (action: ShapeFormattingAction) => void;
   onInsertSlide?: (layoutPartPath?: string | null) => void;

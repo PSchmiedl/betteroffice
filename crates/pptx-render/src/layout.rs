@@ -3672,8 +3672,7 @@ fn picture_source(shape: Option<&ShapeNode>) -> Option<&Picture> {
     }
 }
 
-/// A picture's part path, or a marker the wasm boundary resolves against the
-/// shape's own pending bytes for one added locally and not yet saved.
+/// A picture's part path, or a marker resolving to its unsaved pending bytes.
 fn picture_asset_id(shape: &ShapeSnapshot) -> Option<String> {
     shape.media_part_path.clone().or_else(|| {
         shape

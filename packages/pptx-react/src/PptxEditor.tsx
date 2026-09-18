@@ -285,6 +285,9 @@ function loadImageSize(dataUrl: string): Promise<{ width: number; height: number
   });
 }
 
+/** Mirrors pptx-edit's MAX_PENDING_PICTURE_BYTES. */
+const MAX_INSERT_IMAGE_BYTES = 8 * 1024 * 1024;
+
 /** Windows/Office caret phase. */
 const CARET_BLINK_MS = 530;
 
@@ -1038,16 +1041,24 @@ function PptxEditorContent({
   };
 
   const insertPicture = async (file: File) => {
-    const handle = handleRef.current;
-    const current = modelRef.current;
-    if (!handle || !current?.frame) return;
-    const slide = current.snapshot.slides[current.slideIndex];
-    if (!slide) return;
+    if (!handleRef.current) return;
     try {
+      if (file.size > MAX_INSERT_IMAGE_BYTES) {
+        throw new Error(
+          `image is ${file.size} bytes, exceeds the ${MAX_INSERT_IMAGE_BYTES}-byte limit`
+        );
+      }
       const dataUrl = await readFileAsDataUrl(file);
       const mediaBase64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
       const contentType = file.type || 'image/png';
       const natural = await loadImageSize(dataUrl).catch(() => ({ width: 1, height: 1 }));
+
+      // Re-read: the user may have switched slides during the awaits above.
+      const handle = handleRef.current;
+      const current = modelRef.current;
+      if (!handle || !current?.frame) return;
+      const slide = current.snapshot.slides[current.slideIndex];
+      if (!slide) return;
       const maxWidth = current.frame.width * 0.5;
       const maxHeight = current.frame.height * 0.5;
       const scale = Math.min(maxWidth / natural.width, maxHeight / natural.height, 1);

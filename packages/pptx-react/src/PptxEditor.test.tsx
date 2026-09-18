@@ -20,7 +20,7 @@ const root = resolve(import.meta.dir, '../../..');
 // installed it may tear it down.
 const ownsDom = !GlobalRegistrator.isRegistered;
 if (ownsDom) GlobalRegistrator.register();
-const { act, cleanup, fireEvent, render, waitFor } = await import('@testing-library/react');
+const { act, cleanup, fireEvent, render, waitFor, within } = await import('@testing-library/react');
 
 let fixture: Uint8Array;
 let fontBytes: Uint8Array;
@@ -198,6 +198,64 @@ describe('PptxEditor insert image', () => {
         expect(Math.round(added.width / added.height)).toBe(2);
         expect(() => opened[0].handle.save()).not.toThrow();
         expect(errors).toEqual([]);
+      } finally {
+        cleanup();
+        globalThis.Image = originalImage;
+      }
+    },
+    30_000
+  );
+
+  it(
+    'lands on the slide showing when the read finishes, not the one showing when it started',
+    async () => {
+      const originalImage = globalThis.Image;
+      let finishDecoding: (() => void) | undefined;
+      class PausedImage {
+        onload: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        naturalWidth = 400;
+        naturalHeight = 200;
+        set src(_value: string) {
+          finishDecoding = () => this.onload?.();
+        }
+      }
+      globalThis.Image = PausedImage as unknown as typeof Image;
+      try {
+        const opened: PptxEditorApi[] = [];
+        const view = render(
+          <PptxEditor
+            file={fixture}
+            fonts={[{ family: 'Liberation Sans', bytes: fontBytes }]}
+            clientId={9104}
+            onReady={(api) => opened.push(api)}
+          />
+        );
+        await waitFor(() => expect(opened.length).toBe(1), { timeout: 15_000 });
+
+        const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+        const file = new File([bytes], 'logo.png', { type: 'image/png' });
+        const input = view.getByTestId('pptx-insert-image-input') as HTMLInputElement;
+        fireEvent.change(input, { target: { files: [file] } });
+
+        // The file read has reached image decoding and is now paused there.
+        await waitFor(() => expect(finishDecoding).toBeDefined());
+
+        // The user switches to slide 2 while decoding is still pending.
+        const slides = within(view.getByLabelText('Slides')).getAllByRole('button');
+        fireEvent.click(slides[1]);
+
+        await act(async () => {
+          finishDecoding!();
+          await Promise.resolve();
+        });
+
+        const hasLogo = (slideIndex: number) =>
+          opened[0].handle
+            .snapshot()
+            .slides[slideIndex].shapes.some((shape) => shape.name === 'logo.png');
+        await waitFor(() => expect(hasLogo(1)).toBe(true));
+        expect(hasLogo(0)).toBe(false);
       } finally {
         cleanup();
         globalThis.Image = originalImage;

@@ -142,8 +142,7 @@ pub struct ShapeAdd {
     pub fill: Option<ShapeFill>,
     pub outline: Option<ShapeOutline>,
     pub paragraphs: Option<Vec<ParagraphWrite>>,
-    /// A picture instead of an autoshape: mints a media part and an image
-    /// relationship rather than the fields above that only apply to shapes.
+    /// A picture instead of an autoshape; mints its own media part and relationship.
     pub picture: Option<PictureAdd>,
 }
 
@@ -266,9 +265,8 @@ pub fn write_pptx_with_edits(
                                 .first()
                                 .map(|layout| layout.part_path.clone())
                         });
-                    // The rels file is seeded with the layout link before the
-                    // shapes are written, so a picture among them can append
-                    // its own image relationship rather than clobbering this.
+                    // Seed the layout relationship first so a picture among
+                    // the shapes can append its own without clobbering it.
                     if let Some(layout) = &layout {
                         sink.store(
                             &slide_relationships_path(&part_path),
@@ -552,9 +550,7 @@ fn patch_structure(
     replacements.insert(relationships_path, serialize_xml(&root));
 
     let content_types_path = "[Content_Types].xml";
-    // A picture minted earlier in this save may already have patched this
-    // part (a new `Default` extension); build on that instead of the
-    // pristine source, or its edit would be lost.
+    // Build on an earlier picture's patch here, if any, or it would be lost.
     let bytes = match replacements.get(content_types_path) {
         Some(bytes) => bytes.clone(),
         None => package
@@ -3039,8 +3035,7 @@ fn shape_element(
     Ok(shape)
 }
 
-/// A shape, patched into `slide_part_path`, or minted fresh into a picture
-/// that also needs a media part, a content-type default and a relationship.
+/// A new shape, or a picture that also needs a media part and relationship.
 fn add_shape_element(
     add: &ShapeAdd,
     next_shape_id: &mut Option<u32>,
@@ -3064,20 +3059,27 @@ fn add_shape_element(
     }
 }
 
-fn image_extension(content_type: &str) -> Result<&'static str, PptxError> {
+fn image_content_type_extension(content_type: &str) -> Option<&'static str> {
     match content_type {
-        "image/png" => Ok("png"),
-        "image/jpeg" | "image/jpg" => Ok("jpeg"),
-        "image/gif" => Ok("gif"),
-        "image/bmp" => Ok("bmp"),
-        "image/tiff" => Ok("tiff"),
-        "image/webp" => Ok("webp"),
-        "image/svg+xml" => Ok("svg"),
-        other => Err(write_error(
-            "media",
-            format!("unsupported image type {other:?}"),
-        )),
+        "image/png" => Some("png"),
+        "image/jpeg" | "image/jpg" => Some("jpeg"),
+        "image/gif" => Some("gif"),
+        "image/bmp" => Some("bmp"),
+        "image/tiff" => Some("tiff"),
+        "image/webp" => Some("webp"),
+        "image/svg+xml" => Some("svg"),
+        _ => None,
     }
+}
+
+fn image_extension(content_type: &str) -> Result<&'static str, PptxError> {
+    image_content_type_extension(content_type)
+        .ok_or_else(|| write_error("media", format!("unsupported image type {content_type:?}")))
+}
+
+/// Whether [`write_pptx_with_edits`] can mint a media part for this MIME type.
+pub fn is_supported_image_content_type(content_type: &str) -> bool {
+    image_content_type_extension(content_type).is_some()
 }
 
 fn next_media_part_path(
@@ -3109,8 +3111,7 @@ fn next_media_part_path(
     format!("ppt/media/image{number}.{extension}")
 }
 
-/// Registers the extension as a package-wide default content type, unless
-/// some other media part already declared it.
+/// Registers the extension as a package-wide default, unless already declared.
 fn ensure_media_content_type(
     sink: &mut PartSink<'_>,
     extension: &str,
@@ -3139,9 +3140,8 @@ fn ensure_media_content_type(
     Ok(())
 }
 
-/// Always mints a fresh relationship; unlike [`set_relationship`] this does
-/// not look for an existing one of the same type to replace, since a slide
-/// can carry many image relationships side by side.
+/// Unlike [`set_relationship`], always mints a fresh one rather than
+/// replacing an existing match, since a slide can carry many images.
 fn add_relationship(
     sink: &mut PartSink<'_>,
     relationships_path: &str,
