@@ -265,8 +265,6 @@ pub fn write_pptx_with_edits(
                                 .first()
                                 .map(|layout| layout.part_path.clone())
                         });
-                    // Seed the layout relationship first so a picture among
-                    // the shapes can append its own without clobbering it.
                     if let Some(layout) = &layout {
                         sink.store(
                             &slide_relationships_path(&part_path),
@@ -550,7 +548,6 @@ fn patch_structure(
     replacements.insert(relationships_path, serialize_xml(&root));
 
     let content_types_path = "[Content_Types].xml";
-    // Build on an earlier picture's patch here, if any, or it would be lost.
     let bytes = match replacements.get(content_types_path) {
         Some(bytes) => bytes.clone(),
         None => package
@@ -1053,6 +1050,8 @@ fn set_content_type_override(
         .current(path)
         .ok_or_else(|| PptxError::MissingPart(path.to_owned()))?;
     let mut root = parse_xml(&bytes, path, budget)?;
+    let prefix = root.name.rsplit_once(':').map_or("", |(prefix, _)| prefix);
+    let override_name = qualified(prefix, "Override");
     let name = format!("/{part_path}");
     let existing = root.children.iter_mut().find_map(|child| match child {
         XmlNode::Element(element)
@@ -1066,7 +1065,7 @@ fn set_content_type_override(
     match existing {
         Some(element) => element.set_attribute("ContentType", content_type),
         None => root.children.push(XmlNode::Element(
-            XmlElement::new("Override")
+            XmlElement::new(override_name)
                 .with_attribute("PartName", name)
                 .with_attribute("ContentType", content_type),
         )),
@@ -1496,7 +1495,6 @@ fn patch_shape_children(
                     add,
                     next_shape_id,
                     prefixes,
-                    part,
                     part,
                     sink,
                     budget,
@@ -3041,20 +3039,13 @@ fn add_shape_element(
     next_shape_id: &mut Option<u32>,
     prefixes: &Prefixes,
     part: &str,
-    slide_part_path: &str,
     sink: &mut PartSink<'_>,
     budget: &mut ParseBudget<'_>,
 ) -> Result<XmlElement, PptxError> {
     match &add.picture {
-        Some(picture) => picture_shape_element(
-            add,
-            picture,
-            next_shape_id,
-            prefixes,
-            slide_part_path,
-            sink,
-            budget,
-        ),
+        Some(picture) => {
+            picture_shape_element(add, picture, next_shape_id, prefixes, part, sink, budget)
+        }
         None => shape_element(add, next_shape_id, prefixes, part),
     }
 }
@@ -3093,18 +3084,7 @@ fn next_media_part_path(
         .map(|part| part.path.as_str())
         .chain(new_parts.iter().map(|(path, _)| path.as_str()))
         .collect();
-    let mut number = existing
-        .iter()
-        .filter_map(|path| {
-            path.strip_prefix("ppt/media/image")?
-                .rsplit_once('.')
-                .map_or(*path, |(digits, _)| digits)
-                .parse::<usize>()
-                .ok()
-        })
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let mut number = 1_u64;
     while existing.contains(format!("ppt/media/image{number}.{extension}").as_str()) {
         number += 1;
     }
@@ -3115,6 +3095,7 @@ fn next_media_part_path(
 fn ensure_media_content_type(
     sink: &mut PartSink<'_>,
     extension: &str,
+    part_path: &str,
     content_type: &str,
     budget: &mut ParseBudget<'_>,
 ) -> Result<(), PptxError> {
@@ -3123,15 +3104,25 @@ fn ensure_media_content_type(
         .current(path)
         .ok_or_else(|| PptxError::MissingPart(path.to_owned()))?;
     let mut root = parse_xml(&bytes, path, budget)?;
-    let has_default = root.children.iter().any(|child| match child {
-        XmlNode::Element(element) if element.local_name() == "Default" => element
-            .attribute("Extension")
-            .is_some_and(|value| value.eq_ignore_ascii_case(extension)),
-        _ => false,
+    let default = root.children.iter().find_map(|child| match child {
+        XmlNode::Element(element)
+            if element.local_name() == "Default"
+                && element
+                    .attribute("Extension")
+                    .is_some_and(|value| value.eq_ignore_ascii_case(extension)) =>
+        {
+            Some(element)
+        }
+        _ => None,
     });
-    if !has_default {
+    if let Some(default) = default {
+        if default.attribute("ContentType") != Some(content_type) {
+            set_content_type_override(sink, part_path, content_type, budget)?;
+        }
+    } else {
+        let prefix = root.name.rsplit_once(':').map_or("", |(prefix, _)| prefix);
         root.children.push(XmlNode::Element(
-            XmlElement::new("Default")
+            XmlElement::new(qualified(prefix, "Default"))
                 .with_attribute("Extension", extension)
                 .with_attribute("ContentType", content_type),
         ));
@@ -3153,9 +3144,18 @@ fn add_relationship(
         Some(bytes) => parse_xml(&bytes, relationships_path, budget)?,
         None => XmlElement::new("Relationships").with_attribute("xmlns", PACKAGE_RELATIONSHIPS_NS),
     };
-    let id = format!("rId{}", max_relationship_id(&root) + 1);
+    let used: HashSet<&str> = root
+        .children_named("Relationship")
+        .filter_map(|element| element.attribute("Id"))
+        .collect();
+    let mut number = 1_u64;
+    while used.contains(format!("rId{number}").as_str()) {
+        number += 1;
+    }
+    let id = format!("rId{number}");
+    let prefix = root.name.rsplit_once(':').map_or("", |(prefix, _)| prefix);
     root.children.push(XmlNode::Element(
-        XmlElement::new("Relationship")
+        XmlElement::new(qualified(prefix, "Relationship"))
             .with_attribute("Id", id.clone())
             .with_attribute("Type", relationship_type)
             .with_attribute("Target", target),
@@ -3176,7 +3176,13 @@ fn picture_shape_element(
     let extension = image_extension(&picture.content_type)?;
     let media_part_path = next_media_part_path(sink.package, sink.new_parts.as_slice(), extension);
     sink.store(&media_part_path, picture.media_bytes.clone());
-    ensure_media_content_type(sink, extension, &picture.content_type, budget)?;
+    ensure_media_content_type(
+        sink,
+        extension,
+        &media_part_path,
+        &picture.content_type,
+        budget,
+    )?;
     let relationships_path = slide_relationships_path(slide_part_path);
     let target = relative_target(slide_part_path, &media_part_path);
     let relationship_id = add_relationship(
@@ -3287,7 +3293,6 @@ fn slide_xml(
             shape,
             &mut next_shape_id,
             &prefixes,
-            part,
             part,
             sink,
             budget,

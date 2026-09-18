@@ -266,7 +266,7 @@ function downloadBytes(bytes: Uint8Array, name: string, mime: string): void {
 }
 
 /** Reads a file as a `data:` URL, e.g. for handing an image to `<img>`/`Image`. */
-function readFileAsDataUrl(file: File): Promise<string> {
+function readFileAsDataUrl(file: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result as string);
@@ -285,8 +285,11 @@ function loadImageSize(dataUrl: string): Promise<{ width: number; height: number
   });
 }
 
-/** Mirrors pptx-edit's MAX_PENDING_PICTURE_BYTES. */
 const MAX_INSERT_IMAGE_BYTES = 8 * 1024 * 1024;
+const INSERT_IMAGE_TYPES: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff', webp: 'image/webp', svg: 'image/svg+xml',
+};
 
 /** Windows/Office caret phase. */
 const CARET_BLINK_MS = 530;
@@ -422,6 +425,8 @@ function PptxEditorContent({
   onChangeRef.current = onChange;
   onErrorRef.current = onError;
   modelRef.current = model;
+  const imageInsertAllowedRef = useRef(false);
+  imageInsertAllowedRef.current = !readOnly && !canvasReview.reviewing;
 
   const reportError = useCallback((value: unknown) => {
     const next = value instanceof Error ? value : new Error(String(value));
@@ -1041,22 +1046,30 @@ function PptxEditorContent({
   };
 
   const insertPicture = async (file: File) => {
-    if (!handleRef.current) return;
+    const handle = handleRef.current;
+    if (!handle || !imageInsertAllowedRef.current) return;
     try {
       if (file.size > MAX_INSERT_IMAGE_BYTES) {
         throw new Error(
           `image is ${file.size} bytes, exceeds the ${MAX_INSERT_IMAGE_BYTES}-byte limit`
         );
       }
+      const extension = file.name.split('.').pop()?.toLowerCase() ?? '';
+      const contentType = file.type === 'image/jpg' ? 'image/jpeg' : file.type || INSERT_IMAGE_TYPES[extension];
+      if (!Object.values(INSERT_IMAGE_TYPES).includes(contentType)) {
+        throw new Error(`unsupported image type ${file.type || extension}`);
+      }
       const dataUrl = await readFileAsDataUrl(file);
       const mediaBase64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
-      const contentType = file.type || 'image/png';
-      const natural = await loadImageSize(dataUrl).catch(() => ({ width: 1, height: 1 }));
-
-      // Re-read: the user may have switched slides during the awaits above.
-      const handle = handleRef.current;
+      let previewUrl = `data:${contentType};base64,${mediaBase64}`;
+      if (contentType === 'image/tiff') {
+        const bytes = Uint8Array.from(atob(mediaBase64), (char) => char.charCodeAt(0));
+        previewUrl = await readFileAsDataUrl(presentationImageBlob(bytes));
+      }
+      const natural = await loadImageSize(previewUrl);
       const current = modelRef.current;
-      if (!handle || !current?.frame) return;
+      if (handleRef.current !== handle || !imageInsertAllowedRef.current || !current?.frame) return;
+      if (natural.width <= 0 || natural.height <= 0) throw new Error('image dimensions must be positive');
       const slide = current.snapshot.slides[current.slideIndex];
       if (!slide) return;
       const maxWidth = current.frame.width * 0.5;
@@ -1087,7 +1100,7 @@ function PptxEditorContent({
       recentClickRef.current = null;
       if (next) stageRef.current?.focus();
     } catch (value) {
-      reportError(value);
+      if (handleRef.current === handle && imageInsertAllowedRef.current) reportError(value);
     }
   };
 
@@ -1986,7 +1999,7 @@ function PptxEditorContent({
           shapeArrangeActive={!canvasReview.reviewing && Boolean(selectedShape)}
           onShapeFormat={formatShape}
           onInsertSlide={addSlide}
-          onInsertImage={() => pictureInputRef.current?.click()}
+          onInsertImage={canvasReview.reviewing ? undefined : () => pictureInputRef.current?.click()}
           slideLayouts={slideLayouts}
           currentLayoutPartPath={model?.snapshot.slides[currentSlide]?.layoutPartPath}
           onSave={save}
@@ -2055,7 +2068,10 @@ function PptxEditorContent({
         <input
           ref={pictureInputRef}
           type="file"
-          accept="image/*"
+          accept={Object.values(INSERT_IMAGE_TYPES).join(',')}
+          disabled={readOnly || canvasReview.reviewing}
+          tabIndex={-1}
+          aria-hidden="true"
           data-testid="pptx-insert-image-input"
           style={styles.hiddenFileInput}
           onChange={(event) => {

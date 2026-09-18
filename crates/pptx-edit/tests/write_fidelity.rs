@@ -2067,3 +2067,213 @@ fn an_older_collaboration_document_recovers_notes_without_resurrecting_cleared_t
             .is_empty()
     );
 }
+
+fn picture_draft() -> pptx_edit::PictureDraft {
+    pptx_edit::PictureDraft {
+        name: "Inserted picture".to_owned(),
+        rect: ShapeRect {
+            x: 10,
+            y: 20,
+            width: 3000,
+            height: 4000,
+        },
+        content_type: "image/png".to_owned(),
+        media_bytes: vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10],
+    }
+}
+
+#[test]
+fn concurrent_shape_arrangement_can_be_rearranged_and_deleted() {
+    let first = open();
+    let second = DeckSession::open(&fixture(256), 12).unwrap();
+    let slide = first.snapshot().unwrap().slides.remove(0);
+    let shape_id = &slide.shapes[2].id;
+    first
+        .bring_to_front(&context(), &slide.id, shape_id)
+        .unwrap();
+    second
+        .send_to_back(&context(), &slide.id, shape_id)
+        .unwrap();
+    first
+        .apply_update_v1(&second.encode_state_as_update_v1())
+        .unwrap();
+    second
+        .apply_update_v1(&first.encode_state_as_update_v1())
+        .unwrap();
+    assert_eq!(first.snapshot().unwrap(), second.snapshot().unwrap());
+    first
+        .bring_to_front(&context(), &slide.id, shape_id)
+        .unwrap();
+    assert_eq!(
+        first.snapshot().unwrap().slides[0]
+            .shapes
+            .last()
+            .unwrap()
+            .id,
+        *shape_id
+    );
+    first.remove_shape(&context(), &slide.id, shape_id).unwrap();
+    second
+        .apply_update_v1(&first.encode_state_as_update_v1())
+        .unwrap();
+    assert_eq!(first.snapshot().unwrap(), second.snapshot().unwrap());
+    first.save().unwrap();
+}
+
+#[test]
+fn concurrent_shape_arrangement_and_deletion_converge() {
+    let first = open();
+    let second = DeckSession::open(&fixture(256), 12).unwrap();
+    let slide = first.snapshot().unwrap().slides.remove(0);
+    let shape_id = &slide.shapes[2].id;
+    first
+        .bring_to_front(&context(), &slide.id, shape_id)
+        .unwrap();
+    second
+        .remove_shape(&context(), &slide.id, shape_id)
+        .unwrap();
+    first
+        .apply_update_v1(&second.encode_state_as_update_v1())
+        .unwrap();
+    second
+        .apply_update_v1(&first.encode_state_as_update_v1())
+        .unwrap();
+    assert_eq!(first.snapshot().unwrap(), second.snapshot().unwrap());
+    assert!(
+        !first.snapshot().unwrap().slides[0]
+            .shapes
+            .iter()
+            .any(|s| s.id == *shape_id)
+    );
+    first.save().unwrap();
+    first.search_text("Title", false, None).unwrap();
+    first.delete_slide(&context(), &slide.id).unwrap();
+    first.save().unwrap();
+}
+
+#[test]
+fn inserted_picture_preserves_conflicting_content_type_defaults() {
+    let mut source = fixture_parts(256);
+    source[0].1 = source[0].1.replace(
+        "</Types>",
+        r#"<Default Extension="png" ContentType="application/octet-stream"/></Types>"#,
+    );
+    let session = DeckSession::open(&zip(source), 11).unwrap();
+    let slide = session.snapshot().unwrap().slides.remove(0);
+    session
+        .add_picture(&context(), &slide.id, &picture_draft())
+        .unwrap();
+    let saved = session.save().unwrap();
+    let package = pptx_parse::parse_pptx(&saved).unwrap();
+    assert_eq!(
+        package
+            .media
+            .iter()
+            .find(|m| m.part_path.ends_with(".png"))
+            .unwrap()
+            .content_type,
+        "image/png"
+    );
+    assert!(
+        part_text(&parts(&saved), "[Content_Types].xml")
+            .contains(r#"ContentType="application/octet-stream""#)
+    );
+}
+
+#[test]
+fn pictures_on_existing_and_new_slides_survive_sync_undo_and_repeated_save() {
+    let first = open();
+    let second = DeckSession::open(&fixture(256), 12).unwrap();
+    let slide = first.snapshot().unwrap().slides[0].id.clone();
+    let added = first.insert_slide(&context(), 1, None).unwrap();
+    first
+        .add_picture(&context(), &slide, &picture_draft())
+        .unwrap();
+    first.add_undo_barrier();
+    first
+        .add_picture(&context(), &added.slide_id, &picture_draft())
+        .unwrap();
+    let expected = first.snapshot().unwrap();
+    assert!(first.undo());
+    assert!(first.snapshot().unwrap().slides[1].shapes.is_empty());
+    assert!(first.redo());
+    assert_eq!(first.snapshot().unwrap(), expected);
+    second
+        .apply_update_v1(&first.encode_state_as_update_v1())
+        .unwrap();
+    assert_eq!(second.snapshot().unwrap(), expected);
+    let saved = first.save().unwrap();
+    assert_eq!(parts(&saved), parts(&first.save().unwrap()));
+    assert_eq!(parts(&saved), parts(&second.save().unwrap()));
+    assert_relationships_resolve(&parts(&saved));
+    let reopened = DeckSession::open(&saved, 13).unwrap();
+    for slide in &reopened.snapshot().unwrap().slides[..2] {
+        let picture = slide
+            .shapes
+            .iter()
+            .find(|s| s.name == picture_draft().name)
+            .unwrap();
+        assert_eq!(picture.kind, pptx_edit::ShapeKind::Picture);
+        assert!(picture.media_part_path.is_some());
+    }
+}
+
+#[test]
+fn picture_insertion_preserves_prefixed_metadata_and_exhausted_numeric_names() {
+    let mut source = fixture_parts(256);
+    for (path, xml) in &mut source {
+        if path == "[Content_Types].xml" {
+            *xml = xml
+                .replace("xmlns=", "xmlns:ct=")
+                .replace("<Types", "<ct:Types")
+                .replace("</Types>", "</ct:Types>")
+                .replace("<Default", "<ct:Default")
+                .replace("<Override", "<ct:Override");
+        }
+        if path == "ppt/slides/_rels/slide1.xml.rels" {
+            *xml = xml
+                .replace("xmlns=", "xmlns:rel=")
+                .replace("<Relationships", "<rel:Relationships")
+                .replace("</Relationships>", "</rel:Relationships>")
+                .replace("<Relationship ", "<rel:Relationship ")
+                .replace("rId2", "rId18446744073709551615");
+        }
+        if path == "ppt/slides/slide1.xml" {
+            *xml = xml
+                .replace("rId2", "rId18446744073709551615")
+                .replace("xmlns:r=", "xmlns:links=")
+                .replace("r:id=", "links:id=")
+                .replace("<p:sld ", r#"<p:sld xmlns:r="urn:preserved" "#);
+        }
+    }
+    source.push((
+        "ppt/media/image18446744073709551615.png".to_owned(),
+        "existing".to_owned(),
+    ));
+    let session = DeckSession::open(&zip(source), 11).unwrap();
+    let slide_id = session.snapshot().unwrap().slides[0].id.clone();
+    session
+        .add_picture(&context(), &slide_id, &picture_draft())
+        .unwrap();
+    let saved = session.save().unwrap();
+    let package = pptx_parse::parse_pptx(&saved).unwrap();
+    let image = package
+        .media
+        .iter()
+        .find(|media| media.bytes == picture_draft().media_bytes)
+        .unwrap();
+    assert_eq!(image.content_type, "image/png");
+    let saved_parts = parts(&saved);
+    assert!(part_text(&saved_parts, "[Content_Types].xml").contains("<ct:Default"));
+    assert!(
+        part_text(&saved_parts, "ppt/slides/_rels/slide1.xml.rels")
+            .contains("<rel:Relationship Id=\"rId2\"")
+    );
+    assert!(
+        part_text(&saved_parts, "ppt/slides/slide1.xml").contains(r#"xmlns:r="urn:preserved""#)
+    );
+    assert_eq!(
+        saved_parts["ppt/media/image18446744073709551615.png"],
+        b"existing"
+    );
+}

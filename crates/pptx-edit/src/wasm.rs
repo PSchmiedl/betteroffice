@@ -359,26 +359,7 @@ impl PptxDocument {
 
     #[wasm_bindgen(js_name = mediaBytes)]
     pub fn media_bytes(&self, part_path: &str) -> Result<Vec<u8>, JsValue> {
-        if let Some(shape_id) = part_path.strip_prefix("pending-media:") {
-            let snapshot = self.session.snapshot().map_err(js_error)?;
-            let pending = snapshot
-                .slides
-                .iter()
-                .flat_map(|slide| &slide.shapes)
-                .find(|shape| shape.id == shape_id)
-                .and_then(|shape| shape.pending_media.as_ref())
-                .ok_or_else(|| JsValue::from_str("pending media was not found"))?;
-            return base64::engine::general_purpose::STANDARD
-                .decode(&pending.base64)
-                .map_err(|error| JsValue::from_str(&error.to_string()));
-        }
-        self.session
-            .package()
-            .media
-            .iter()
-            .find(|media| media.part_path == part_path)
-            .map(|media| media.bytes.clone())
-            .ok_or_else(|| JsValue::from_str("media part was not found"))
+        self.session.media_bytes(part_path).map_err(js_error)
     }
 
     /// Serializes the deck back to `.pptx` bytes, edits included.

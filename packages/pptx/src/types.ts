@@ -114,7 +114,7 @@ export interface ShapeSnapshot {
   outline: ShapeOutline | null;
   resolvedOutlineColor: string | null;
   mediaPartPath: string | null;
-  /** Set only for a picture added locally and not yet saved. */
+  /** Image data added to this session, retained across saves. */
   pendingMedia?: { contentType: string; base64: string } | null;
   blipEffects?: BlipEffect[];
   graphic: unknown | null;

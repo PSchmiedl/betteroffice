@@ -129,7 +129,7 @@ pub struct ShapeSnapshot {
     pub outline: Option<ShapeOutline>,
     pub resolved_outline_color: Option<String>,
     pub media_part_path: Option<String>,
-    /// Set only for a picture added locally that `save` has not minted a part for yet.
+    /// Image data added to this session, retained across saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_media: Option<PendingMedia>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -139,7 +139,7 @@ pub struct ShapeSnapshot {
     pub children: Vec<ShapeSnapshot>,
 }
 
-/// A locally added picture's bytes, base64-encoded for compact JSON.
+/// Image data shared by editing peers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingMedia {

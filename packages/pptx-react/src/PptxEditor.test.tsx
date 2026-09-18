@@ -183,7 +183,6 @@ describe('PptxEditor insert image', () => {
         const input = view.getByTestId('pptx-insert-image-input') as HTMLInputElement;
         await act(async () => {
           fireEvent.change(input, { target: { files: [file] } });
-          // FileReader + the fake Image both resolve on microtasks/macrotasks.
           await new Promise((resolve) => setTimeout(resolve, 0));
         });
 
@@ -194,7 +193,6 @@ describe('PptxEditor insert image', () => {
         const added = shapes[shapes.length - 1];
         expect(added.kind).toBe('picture');
         expect(added.name).toBe('logo.png');
-        // The fake image is 400x200 (2:1): height should track width exactly.
         expect(Math.round(added.width / added.height)).toBe(2);
         expect(() => opened[0].handle.save()).not.toThrow();
         expect(errors).toEqual([]);
@@ -216,8 +214,9 @@ describe('PptxEditor insert image', () => {
         onerror: (() => void) | null = null;
         naturalWidth = 400;
         naturalHeight = 200;
-        set src(_value: string) {
-          finishDecoding = () => this.onload?.();
+        set src(value: string) {
+          if (value.startsWith('data:')) finishDecoding = () => this.onload?.();
+          else queueMicrotask(() => this.onload?.());
         }
       }
       globalThis.Image = PausedImage as unknown as typeof Image;
@@ -238,11 +237,9 @@ describe('PptxEditor insert image', () => {
         const input = view.getByTestId('pptx-insert-image-input') as HTMLInputElement;
         fireEvent.change(input, { target: { files: [file] } });
 
-        // The file read has reached image decoding and is now paused there.
         await waitFor(() => expect(finishDecoding).toBeDefined());
 
-        // The user switches to slide 2 while decoding is still pending.
-        const slides = within(view.getByLabelText('Slides')).getAllByRole('button');
+        const slides = await within(view.getByLabelText('Slides')).findAllByRole('button');
         fireEvent.click(slides[1]);
 
         await act(async () => {
@@ -263,6 +260,58 @@ describe('PptxEditor insert image', () => {
     },
     30_000
   );
+});
+
+describe('PptxEditor pending image insertion', () => {
+  for (const scenario of ['replace', 'unmount', 'readOnly', 'decode-error', 'stale-error'] as const) {
+    it(`handles ${scenario} while an image decodes`, async () => {
+      const originalImage = globalThis.Image;
+      let finish: (() => void) | undefined;
+      class PausedImage {
+        onload: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        naturalWidth = 400;
+        naturalHeight = 200;
+        set src(value: string) {
+          if (value.startsWith('data:')) {
+            finish = () => scenario.endsWith('error') ? this.onerror?.() : this.onload?.();
+          } else queueMicrotask(() => this.onload?.());
+        }
+      }
+      globalThis.Image = PausedImage as unknown as typeof Image;
+      const opened: PptxEditorApi[] = [];
+      const errors: Error[] = [];
+      const props = {
+        file: fixture,
+        fonts: [{ family: 'Liberation Sans', bytes: fontBytes }],
+        clientId: 9110,
+        onReady: (api: PptxEditorApi) => opened.push(api),
+        onError: (error: Error) => errors.push(error),
+      };
+      try {
+        const view = render(<PptxEditor {...props} />);
+        await waitFor(() => expect(opened).toHaveLength(1), { timeout: 15_000 });
+        const before = opened[0].handle.snapshot();
+        const file = new File([Uint8Array.from([0x89, 0x50, 0x4e, 0x47])], 'pending.png', { type: 'image/png' });
+        fireEvent.change(view.getByTestId('pptx-insert-image-input'), { target: { files: [file] } });
+        await waitFor(() => expect(finish).toBeDefined());
+        if (scenario === 'replace' || scenario === 'stale-error') {
+          view.rerender(<PptxEditor {...props} file={new Uint8Array(fixture)} />);
+          await waitFor(() => expect(opened).toHaveLength(2), { timeout: 15_000 });
+        } else if (scenario === 'unmount') {
+          view.unmount();
+        } else if (scenario === 'readOnly') {
+          view.rerender(<PptxEditor {...props} readOnly />);
+        }
+        await act(async () => { finish!(); await Promise.resolve(); });
+        if (scenario !== 'unmount') expect(opened[opened.length - 1].handle.snapshot()).toEqual(before);
+        expect(errors).toHaveLength(scenario === 'decode-error' ? 1 : 0);
+      } finally {
+        cleanup();
+        globalThis.Image = originalImage;
+      }
+    }, 30_000);
+  }
 });
 
 describe('PptxEditor font stability', () => {

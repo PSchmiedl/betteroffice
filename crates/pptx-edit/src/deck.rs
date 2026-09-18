@@ -341,7 +341,7 @@ impl DeckSession {
         let slides = required_map(&txn, SLIDES)?;
         let slide = slide_ref(&txn, slide_id)?;
         let shape_order = slide_shape_order(&slide, &txn)?;
-        let shape_ids = string_array_ref(&shape_order, &txn);
+        let shape_ids = live_shape_order(&shape_order, &txn)?;
         remove_shape_entries(&mut txn, &shape_ids)?;
         let comments = required_map(&txn, crate::COMMENTS)?;
         let comment_ids: Vec<String> = comments
@@ -507,6 +507,27 @@ impl DeckSession {
             shape_id,
             index,
         })
+    }
+
+    /// Resolves a display-list image from the source package or shared edits.
+    pub fn media_bytes(&self, asset_id: &str) -> EditResult<Vec<u8>> {
+        if let Some(shape_id) = asset_id.strip_prefix("pending-media:") {
+            let txn = self.doc.transact();
+            let shape = shape_ref(&txn, shape_id)?;
+            let encoded = map_string(&shape, &txn, "pendingMediaBase64")
+                .ok_or_else(|| EditError::InvalidState("pending media was not found".to_owned()))?;
+            return base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| {
+                    EditError::InvalidState(format!("invalid pending image data: {error}"))
+                });
+        }
+        self.package()
+            .media
+            .iter()
+            .find(|media| media.part_path == asset_id)
+            .map(|media| media.bytes.clone())
+            .ok_or_else(|| EditError::InvalidState("media part was not found".to_owned()))
     }
 
     /// `save` mints the media part, content-type default and relationship.
@@ -697,10 +718,17 @@ impl DeckSession {
         let mut txn = self.transact_for(context);
         let slide = slide_ref(&txn, slide_id)?;
         let order = slide_shape_order(&slide, &txn)?;
-        let index = array_index(&order, &txn, shape_id)
-            .ok_or_else(|| EditError::ShapeNotFound(shape_id.to_owned()))?;
+        let ids = live_shape_order(&order, &txn)?;
+        let index =
+            ids.iter()
+                .position(|id| id == shape_id)
+                .ok_or_else(|| EditError::ShapeNotFound(shape_id.to_owned()))? as u32;
         remove_shape_entries(&mut txn, &[shape_id.to_owned()])?;
-        order.remove(&mut txn, index);
+        for (index, id) in string_array_ref(&order, &txn).iter().enumerate().rev() {
+            if id == shape_id {
+                order.remove(&mut txn, index as u32);
+            }
+        }
         Ok(ShapeReceipt {
             slide_id: slide_id.to_owned(),
             shape_id: shape_id.to_owned(),
@@ -786,10 +814,25 @@ impl DeckSession {
         let mut txn = self.transact_for(context);
         let slide = slide_ref(&txn, slide_id)?;
         let order = slide_shape_order(&slide, &txn)?;
-        let length = order.len(&txn);
-        let from_index = array_index(&order, &txn, shape_id)
-            .ok_or_else(|| EditError::ShapeNotFound(shape_id.to_owned()))?;
+        let ids = live_shape_order(&order, &txn)?;
+        let length = ids.len() as u32;
+        let from_index =
+            ids.iter()
+                .position(|id| id == shape_id)
+                .ok_or_else(|| EditError::ShapeNotFound(shape_id.to_owned()))? as u32;
         let target = to_index(length, from_index).min(length - 1);
+        let mut seen = HashSet::new();
+        let live: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let stale: Vec<u32> = string_array_ref(&order, &txn)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| {
+                (!live.contains(id.as_str()) || !seen.insert(id.clone())).then_some(index as u32)
+            })
+            .collect();
+        for index in stale.into_iter().rev() {
+            order.remove(&mut txn, index);
+        }
         if target != from_index {
             order.remove(&mut txn, from_index);
             order.insert(&mut txn, target, shape_id);
@@ -1477,6 +1520,15 @@ fn package_from_meta<T: ReadTxn>(meta: &MapRef, txn: &T) -> EditResult<PptxPacka
     serde_json::from_slice(&bytes).map_err(|error| EditError::InvalidState(error.to_string()))
 }
 
+pub(crate) fn live_shape_order<T: ReadTxn>(order: &ArrayRef, txn: &T) -> EditResult<Vec<String>> {
+    let shapes = required_map(txn, SHAPES)?;
+    let mut seen = HashSet::new();
+    Ok(string_array_ref(order, txn)
+        .into_iter()
+        .filter(|id| shapes.contains_key(txn, id) && seen.insert(id.clone()))
+        .collect())
+}
+
 pub(crate) fn snapshot_doc(doc: &Doc, package: &PptxPackage) -> EditResult<DeckSnapshot> {
     let txn = doc.transact();
     let meta = required_map(&txn, META)?;
@@ -1498,19 +1550,16 @@ pub(crate) fn snapshot_doc(doc: &Doc, package: &PptxPackage) -> EditResult<DeckS
         let layout_part_path = map_string(&slide, &txn, "layoutPartPath");
         let theme = theme_for_layout(package, layout_part_path.as_deref());
         let shape_order = slide_shape_order(&slide, &txn)?;
-        let mut seen_shapes = HashSet::new();
         let mut shape_snapshots = Vec::new();
-        for shape_id in string_array_ref(&shape_order, &txn) {
-            if seen_shapes.insert(shape_id.clone()) {
-                shape_snapshots.push(snapshot_shape(
-                    &shapes,
-                    &stories,
-                    &txn,
-                    &shape_id,
-                    &mut HashSet::new(),
-                    theme,
-                )?);
-            }
+        for shape_id in live_shape_order(&shape_order, &txn)? {
+            shape_snapshots.push(snapshot_shape(
+                &shapes,
+                &stories,
+                &txn,
+                &shape_id,
+                &mut HashSet::new(),
+                theme,
+            )?);
         }
         let notes = map_string(&slide, &txn, "notes").unwrap_or_else(|| {
             package
