@@ -147,6 +147,22 @@ describe('Toolbar shape controls', () => {
     expect(actions).toContainEqual({ type: 'adjust', name: 'adj', value: 0.4 });
   });
 
+  it('lists the stepwise moves before the absolute ones', () => {
+    const { getByTestId, getByRole } = render(
+      <LocaleProvider>
+        <Toolbar shapeArrangeActive onShapeFormat={() => {}} />
+      </LocaleProvider>
+    );
+
+    fireEvent.click(getByTestId('pptx-shape-arrange'));
+
+    const labels = Array.from(
+      getByRole('menu').querySelectorAll('[role="menuitem"]'),
+      (item) => item.getAttribute('aria-label')
+    );
+    expect(labels).toEqual(['Bring forward', 'Send backward', 'Bring to front', 'Send to back']);
+  });
+
   it('emits a z-order action for each arrange menu item', () => {
     const actions: ShapeFormattingAction[] = [];
     const { getByLabelText, getByTestId } = render(
@@ -156,18 +172,18 @@ describe('Toolbar shape controls', () => {
     );
 
     fireEvent.click(getByTestId('pptx-shape-arrange'));
-    fireEvent.click(getByLabelText('Bring to front'));
-    fireEvent.click(getByTestId('pptx-shape-arrange'));
     fireEvent.click(getByLabelText('Bring forward'));
     fireEvent.click(getByTestId('pptx-shape-arrange'));
     fireEvent.click(getByLabelText('Send backward'));
     fireEvent.click(getByTestId('pptx-shape-arrange'));
+    fireEvent.click(getByLabelText('Bring to front'));
+    fireEvent.click(getByTestId('pptx-shape-arrange'));
     fireEvent.click(getByLabelText('Send to back'));
 
     expect(actions).toEqual([
-      { type: 'zOrder', value: 'front' },
       { type: 'zOrder', value: 'forward' },
       { type: 'zOrder', value: 'backward' },
+      { type: 'zOrder', value: 'front' },
       { type: 'zOrder', value: 'back' },
     ]);
   });

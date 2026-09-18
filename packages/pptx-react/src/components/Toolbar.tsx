@@ -735,12 +735,6 @@ export function Toolbar(explicitProps: ToolbarProps) {
               {(close) => (
                 <>
                   <ToolbarMenuItem
-                    label={t('toolbar.bringToFront')}
-                    icon={<ToolbarIcon name="bringToFront" size={16} />}
-                    onClick={() => applyShape({ type: 'zOrder', value: 'front' })}
-                    close={close}
-                  />
-                  <ToolbarMenuItem
                     label={t('toolbar.bringForward')}
                     icon={<ToolbarIcon name="bringForward" size={16} />}
                     onClick={() => applyShape({ type: 'zOrder', value: 'forward' })}
@@ -750,6 +744,12 @@ export function Toolbar(explicitProps: ToolbarProps) {
                     label={t('toolbar.sendBackward')}
                     icon={<ToolbarIcon name="sendBackward" size={16} />}
                     onClick={() => applyShape({ type: 'zOrder', value: 'backward' })}
+                    close={close}
+                  />
+                  <ToolbarMenuItem
+                    label={t('toolbar.bringToFront')}
+                    icon={<ToolbarIcon name="bringToFront" size={16} />}
+                    onClick={() => applyShape({ type: 'zOrder', value: 'front' })}
                     close={close}
                   />
                   <ToolbarMenuItem
