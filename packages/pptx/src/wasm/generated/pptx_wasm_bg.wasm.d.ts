@@ -19,6 +19,8 @@ export const pptxdocument_addPictureJson: (a: number, b: number, c: number) => [
 export const pptxdocument_addShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_addTextBoxJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_applyUpdateJson: (a: number, b: number, c: number) => [number, number, number, number];
+export const pptxdocument_bringShapeForwardJson: (a: number, b: number, c: number) => [number, number, number, number];
+export const pptxdocument_bringShapeToFrontJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_canRedo: (a: number) => number;
 export const pptxdocument_canUndo: (a: number) => number;
 export const pptxdocument_clearUpdateObservation: (a: number) => void;
@@ -50,6 +52,8 @@ export const pptxdocument_replyToCommentJson: (a: number, b: number, c: number) 
 export const pptxdocument_resizeShapeJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_saveBytes: (a: number) => [number, number, number, number];
 export const pptxdocument_searchTextJson: (a: number, b: number, c: number) => [number, number, number, number];
+export const pptxdocument_sendShapeBackwardJson: (a: number, b: number, c: number) => [number, number, number, number];
+export const pptxdocument_sendShapeToBackJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_setCommentFlavorJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_setCommentStatusJson: (a: number, b: number, c: number) => [number, number, number, number];
 export const pptxdocument_setParagraphAlignmentJson: (a: number, b: number, c: number) => [number, number, number, number];

@@ -540,7 +540,15 @@ fn shape_z_order_operations_reorder_within_the_slide() {
         .collect();
     assert_eq!(
         names,
-        ["Title", "Connector", "Box", "Halfway", "Script", "Tracked"]
+        [
+            "Title",
+            "Connector",
+            "Box",
+            "Halfway",
+            "Script",
+            "Tracked",
+            "Linked"
+        ]
     );
     let box_id = slide.shapes[2].id.clone();
 
@@ -555,19 +563,35 @@ fn shape_z_order_operations_reorder_within_the_slide() {
     let receipt = session
         .bring_to_front(&context(), &slide.id, &box_id)
         .unwrap();
-    assert_eq!((receipt.from_index, receipt.to_index), (2, 5));
+    assert_eq!((receipt.from_index, receipt.to_index), (2, 6));
     assert_eq!(
         names_after(&session),
-        ["Title", "Connector", "Halfway", "Script", "Tracked", "Box"]
+        [
+            "Title",
+            "Connector",
+            "Halfway",
+            "Script",
+            "Tracked",
+            "Linked",
+            "Box"
+        ]
     );
 
     let receipt = session
         .send_to_back(&context(), &slide.id, &box_id)
         .unwrap();
-    assert_eq!((receipt.from_index, receipt.to_index), (5, 0));
+    assert_eq!((receipt.from_index, receipt.to_index), (6, 0));
     assert_eq!(
         names_after(&session),
-        ["Box", "Title", "Connector", "Halfway", "Script", "Tracked"]
+        [
+            "Box",
+            "Title",
+            "Connector",
+            "Halfway",
+            "Script",
+            "Tracked",
+            "Linked"
+        ]
     );
 
     let receipt = session
@@ -576,7 +600,15 @@ fn shape_z_order_operations_reorder_within_the_slide() {
     assert_eq!((receipt.from_index, receipt.to_index), (0, 1));
     assert_eq!(
         names_after(&session),
-        ["Title", "Box", "Connector", "Halfway", "Script", "Tracked"]
+        [
+            "Title",
+            "Box",
+            "Connector",
+            "Halfway",
+            "Script",
+            "Tracked",
+            "Linked"
+        ]
     );
 
     let receipt = session
@@ -585,7 +617,15 @@ fn shape_z_order_operations_reorder_within_the_slide() {
     assert_eq!((receipt.from_index, receipt.to_index), (1, 0));
     assert_eq!(
         names_after(&session),
-        ["Box", "Title", "Connector", "Halfway", "Script", "Tracked"]
+        [
+            "Box",
+            "Title",
+            "Connector",
+            "Halfway",
+            "Script",
+            "Tracked",
+            "Linked"
+        ]
     );
 
     // Already at the edge: stepping further is a clamped no-op.

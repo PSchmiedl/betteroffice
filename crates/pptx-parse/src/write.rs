@@ -3043,7 +3043,7 @@ fn shape_element(
 /// that also needs a media part, a content-type default and a relationship.
 fn add_shape_element(
     add: &ShapeAdd,
-    next_shape_id: &mut u32,
+    next_shape_id: &mut Option<u32>,
     prefixes: &Prefixes,
     part: &str,
     slide_part_path: &str,
@@ -3167,7 +3167,7 @@ fn add_relationship(
 fn picture_shape_element(
     add: &ShapeAdd,
     picture: &PictureAdd,
-    next_shape_id: &mut u32,
+    next_shape_id: &mut Option<u32>,
     prefixes: &Prefixes,
     slide_part_path: &str,
     sink: &mut PartSink<'_>,
@@ -3187,8 +3187,7 @@ fn picture_shape_element(
         budget,
     )?;
 
-    let shape_id = *next_shape_id;
-    *next_shape_id += 1;
+    let shape_id = alloc_shape_id(next_shape_id, slide_part_path)?;
     let non_visual = XmlElement::new(prefixes.presentation("nvPicPr"))
         .with_child(
             XmlElement::new(prefixes.presentation("cNvPr"))
@@ -3737,6 +3736,14 @@ mod tests {
         )
         .unwrap();
 
+        let package = PptxPackage::default();
+        let mut replacements = HashMap::new();
+        let mut new_parts = Vec::new();
+        let mut sink = PartSink {
+            package: &package,
+            replacements: &mut replacements,
+            new_parts: &mut new_parts,
+        };
         let error = patch_slide(
             &mut root,
             &[ShapeWrite::Patch {
@@ -3749,6 +3756,8 @@ mod tests {
             None,
             part,
             ShapeElements::WithConnectors,
+            &mut sink,
+            &mut budget,
         )
         .unwrap_err();
         assert!(
