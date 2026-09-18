@@ -20,7 +20,7 @@ const root = resolve(import.meta.dir, '../../..');
 // installed it may tear it down.
 const ownsDom = !GlobalRegistrator.isRegistered;
 if (ownsDom) GlobalRegistrator.register();
-const { act, cleanup, fireEvent, render, waitFor, within } = await import('@testing-library/react');
+const { act, cleanup, fireEvent, render, waitFor } = await import('@testing-library/react');
 
 let fixture: Uint8Array;
 let fontBytes: Uint8Array;
@@ -239,8 +239,9 @@ describe('PptxEditor insert image', () => {
 
         await waitFor(() => expect(finishDecoding).toBeDefined());
 
-        const slides = await within(view.getByLabelText('Slides')).findAllByRole('button');
-        fireEvent.click(slides[1]);
+        await act(async () => {
+          expect(opened[0].goToSlide(2)).toBe(true);
+        });
 
         await act(async () => {
           finishDecoding!();
