@@ -97,7 +97,9 @@
 
 - **Structured DOCX export.** DOCX exports read-only structured JSON and
   Markdown with source anchors, explicit story and revision options, and
-  omission diagnostics. Page fragments are not yet included.
+  omission diagnostics. JavaScript and React can attach version-checked page
+  fragments from configured layout, with optional page geometry. Native Rust
+  and Python structured exports do not yet generate page maps automatically.
 
 - **Structured XLSX export.** XLSX exports bounded sparse worksheet content and
   Markdown with positional anchors, formulas, stored values, formatted text,
