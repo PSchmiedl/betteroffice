@@ -86,6 +86,10 @@
   commands and edit batches. Plugins read and navigate by default; every write
   is checked against its grant, the editor mode and document policy when it runs.
 
+- **Structured PPTX export.** PPTX JavaScript, Rust and Python hosts export
+  structured slide content and Markdown with session or snapshot anchors,
+  explicit hidden-content and notes/comment options, and omission diagnostics.
+
 [Try it out](https://demo.betteroffice.dev), or
 [explore the docs](https://docs.betteroffice.dev) for setup, APIs, and format support.
 
