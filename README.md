@@ -94,6 +94,11 @@
   Markdown with source anchors, explicit story and revision options, and
   omission diagnostics. Page fragments are not yet included.
 
+- **Structured XLSX export.** XLSX exports bounded sparse worksheet content and
+  Markdown with positional anchors, formulas, stored values, formatted text,
+  explicit hidden-content options, and omission diagnostics. Export does not
+  recalculate formulas.
+
 [Try it out](https://demo.betteroffice.dev), or
 [explore the docs](https://docs.betteroffice.dev) for setup, APIs, and format support.
 
