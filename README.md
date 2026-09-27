@@ -41,6 +41,8 @@
 - **Embed or automate.** Drop React editors into your app, build on the
   framework-free JavaScript cores, or use Rust and Python APIs for headless
   processing and agent workflows.
+  DOCX hosts can query the text position under a pointer for drops and hover
+  tools, including body, header, footer, and note locations.
 
 - **Host-controlled PPTX editing.** PPTX hosts can intercept saving, flush accepted input, query slide content
   under the pointer, group undo with explicit boundaries, reposition comments, and anchor carets that

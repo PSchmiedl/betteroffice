@@ -581,3 +581,43 @@ The undo manager retains comment item boundaries with their undo/redo entries so
 anchors inside replaced text survive repeated history traversal with Yrs 0.27.
 Discarding history releases its bookkeeping; undo/redo traverses a local snapshot
 when those boundaries need restoration.
+
+### External drop positions
+
+`RenderedDomContext.getPositionAtPoint(clientX, clientY)` queries the same canvas
+hit testing used for the caret. Pass viewport coordinates, such as a drop event's
+`clientX` and `clientY`. Page scroll and CSS zoom are resolved from the live page
+geometry. The query never changes selection or focus.
+
+The result contains `position`, `pageIndex`, and `region`. Header/footer hits also
+carry `rId`; footnote/endnote hits carry `noteId`. Positions are local to that
+region's display stream in the layout the context renders, and shift with every
+edit.
+
+In React, `editorRef.getPositionAtPoint(clientX, clientY)` runs the same query and
+adds `version` and `target`: the collapsed accepted-view range at the point, keyed
+by session paragraph keys, in the body, header, footer, note or table cell story
+the point is in. Use it as a text step's target with `expectVersion: version`:
+
+```ts
+const hit = editorRef.current!.getPositionAtPoint(event.clientX, event.clientY);
+if (hit) {
+  await editorRef.current!.applyEdits({
+    expectVersion: hit.version,
+    steps: [{ op: 'insertText', target: hit.target, at: 'start', text: '{{customer.name}}' }],
+  });
+}
+```
+
+It returns `null` while typed or composed input is pending and until the painted
+pages show the current version (retry after `flushPendingInput()` or on the next
+frame), and a batch applied after further typing refuses with `stale-version`, so a
+drop never lands at a shifted position. Plugins get the same query as
+`context.geometry.getPositionAtPoint`, with the layout's `layoutId`. The lower-level
+`editorRef.getEditorRef()?.displayPositionToYrsLoc(hit)` maps a hit to its live
+`YrsLoc` (offsets that count text a pending deletion hides) without the version
+check; passing a number to it retains body mapping.
+
+Text runs and their editable content boxes are accepted. Page margins, images,
+page gaps, points outside pages, and queries without ready canvas geometry return
+`null`. The accessibility mirror backend does not support this query.
