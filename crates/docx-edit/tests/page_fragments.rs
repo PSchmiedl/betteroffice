@@ -11,8 +11,8 @@ use docx_edit::structured::{
     StorySelection, render_docx_markdown, render_docx_markdown_with_pages,
 };
 use docx_edit::{
-    EditHistory, EditOperation, EditRequest, EditSource, EditStep, EditTextView, EngineSession,
-    ParagraphTarget, ReadParagraphsRequest, TextTarget, UndoSession,
+    EditCtx, EditHistory, EditOperation, EditRequest, EditSource, EditStep, EditTextView,
+    EngineSession, ParagraphTarget, Position, ReadParagraphsRequest, TextTarget, UndoSession,
 };
 
 const LAID_OUT: [StorySelection; 5] = [
@@ -2138,4 +2138,97 @@ fn a_limited_map_reports_no_diagnostics_past_its_limits() {
     assert!(map.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == PageDiagnosticCode::Truncated && diagnostic.page_index == Some(0)
     }));
+}
+
+#[test]
+fn fragments_name_paragraphs_by_the_session_keys_batches_target() {
+    let body = format!(
+        r#"{}<w:p>{}</w:p>{}{}<w:tbl><w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid><w:tr><w:tc><w:p>{}</w:p></w:tc></w:tr></w:tbl>{}<w:sectPr/>"#,
+        fixture::p("1A2B3C4D", &fixture::r("Valid")),
+        fixture::r("Missing"),
+        fixture::p("1a2b3c4d", &fixture::r("Duplicate")),
+        fixture::p("xyz", &fixture::r("Malformed")),
+        fixture::r("Cell"),
+        fixture::p("0A0B0C0D", &fixture::r("Tail")),
+    );
+    let (engine, request) = fixture::laid_out(&fixture::with_body(&body), 7);
+    let split = engine
+        .doc()
+        .split_paragraph(
+            &EditCtx::local("Ada", "2026-01-01T00:00:00Z"),
+            Position::new("body", 2),
+            None,
+        )
+        .unwrap();
+    engine
+        .layout_document_with_regions_retained_json(&request)
+        .unwrap();
+    let read = engine
+        .export_structured_with_pages(&PageExportOptions::new(RevisionView::Accepted))
+        .unwrap();
+    let content = read.content;
+    let exported = blocks(&content);
+    let mut located = BTreeSet::new();
+    let mut steps = Vec::new();
+    for block in exported.values() {
+        let Anchor::Paragraph { story, para_id } = &block.anchor else {
+            continue;
+        };
+        located.insert((story.as_str(), para_id.as_str()));
+        let texts: Vec<_> = content
+            .layout
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.block_id == block.id)
+            .filter_map(|fragment| match &fragment.slice {
+                FragmentSlice::Text { range } => Some(range.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "{para_id}: {texts:?}");
+        let range = &texts[0];
+        assert_eq!(
+            (&range.story, &range.start.para_id, &range.end.para_id),
+            (story, para_id, para_id)
+        );
+        steps.push(EditStep::new(EditOperation::ReplaceText {
+            target: TextTarget::Range(range.clone()),
+            text: format!("<{para_id}>"),
+        }));
+    }
+    assert_eq!(
+        located,
+        BTreeSet::from([
+            ("body", "1A2B3C4D"),
+            ("body", split.second_para_id.as_str()),
+            ("body", "body:p1"),
+            ("body", "body:p2"),
+            ("body", "body:p3"),
+            ("body:t0:r0c0", "body:t0:r0c0:p0"),
+            ("body", "0A0B0C0D"),
+        ]),
+        "session keys, not Word paragraph IDs"
+    );
+    let request = EditRequest {
+        expect_version: read.version,
+        source: EditSource::Host,
+        history: EditHistory::Separate,
+        steps,
+    };
+    engine
+        .doc()
+        .apply_edits(&request, &UndoSession::default())
+        .unwrap()
+        .unwrap();
+    for (story, key) in located {
+        let text = engine
+            .doc()
+            .paragraphs(story)
+            .unwrap()
+            .into_iter()
+            .find(|paragraph| paragraph.para_id == key)
+            .unwrap()
+            .text;
+        assert_eq!(text, format!("<{key}>"));
+    }
 }

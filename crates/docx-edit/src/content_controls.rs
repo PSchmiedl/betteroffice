@@ -15,6 +15,7 @@ use yrs::{Any, Map, MapRef, Out, ReadTxn, Transact};
 
 use crate::control_source::{ControlSafety, SourceControl, may_hold_controls, safety_key};
 use crate::control_values::{is_text_type, resolved_type};
+use crate::identity::SOURCE_PARA_ID;
 use crate::ops::ChunkKind;
 use crate::policy::Ownership;
 use crate::read_types::{block_control_id, control_metadata, inline_control_id, nested_control_id};
@@ -196,7 +197,9 @@ pub(crate) struct ControlRecord {
     pub alias: bool,
     /// The control's embed, for a control that is one.
     pub embed: Option<BranchID>,
-    /// The paragraph holding the control, or a block control's first paragraph.
+    /// The source Word paragraph ID seeding recorded for the paragraph holding the control, or
+    /// for a block control's first paragraph: what its source occurrence names, whatever session
+    /// key the paragraph carries.
     pub paragraph: Option<String>,
 }
 
@@ -348,7 +351,8 @@ fn inline_text(items: &[Any]) -> Result<String, ValueUnavailable> {
 #[derive(Default)]
 struct StorySummary {
     paragraphs: Vec<String>,
-    first_paragraph: Option<String>,
+    /// The source Word paragraph ID of the first paragraph, once one is read.
+    first_paragraph: Option<Option<String>>,
     non_text: bool,
     revisions: bool,
     controls: bool,
@@ -633,6 +637,7 @@ impl<'a, T: ReadTxn> Builder<'a, T> {
             match &chunk.kind {
                 ChunkKind::Pilcrow(map) => {
                     let para_id = map_string(map, self.txn, PARA_ID).unwrap_or_default();
+                    let source_id = map_string(map, self.txn, SOURCE_PARA_ID);
                     if stamped
                         || [PPR_INS, PPR_DEL].into_iter().any(|key| {
                             matches!(map.get(self.txn, key), Some(Out::Any(value)) if active(Some(&value)))
@@ -650,13 +655,19 @@ impl<'a, T: ReadTxn> Builder<'a, T> {
                         summary.controls = true;
                         let control_id = inline_control_id(story, &para_id, ordinal);
                         self.inline(
-                            story, &para_id, raw, &map, stamped, control_id, category, listed,
-                            ancestors, depth,
+                            story,
+                            (&para_id, source_id.as_deref()),
+                            raw,
+                            &map,
+                            stamped,
+                            control_id,
+                            category,
+                            listed,
+                            ancestors,
+                            depth,
                         )?;
                     }
-                    summary
-                        .first_paragraph
-                        .get_or_insert_with(|| para_id.clone());
+                    summary.first_paragraph.get_or_insert(source_id);
                     summary.paragraphs.push(std::mem::take(&mut paragraph));
                     node_start = chunk.end();
                 }
@@ -802,7 +813,7 @@ impl<'a, T: ReadTxn> Builder<'a, T> {
             lock,
         });
         let summary = self.story(&child, category, listed, &inner, depth + 1)?;
-        self.records[index].paragraph = summary.first_paragraph;
+        self.records[index].paragraph = summary.first_paragraph.flatten();
         let text = if summary.revisions {
             Err(ValueUnavailable::TrackedRevisions)
         } else if summary.non_text {
@@ -818,7 +829,7 @@ impl<'a, T: ReadTxn> Builder<'a, T> {
     fn inline(
         &mut self,
         story: &str,
-        para_id: &str,
+        (para_id, source_id): (&str, Option<&str>),
         raw: u32,
         map: &MapRef,
         stamped: bool,
@@ -842,7 +853,7 @@ impl<'a, T: ReadTxn> Builder<'a, T> {
             listed,
             ancestors,
             depth,
-            (Some(AsRef::<Branch>::as_ref(map).id()), para_id),
+            (Some(AsRef::<Branch>::as_ref(map).id()), source_id),
         )
     }
 
@@ -858,7 +869,7 @@ impl<'a, T: ReadTxn> Builder<'a, T> {
         listed: bool,
         ancestors: &[Ancestor],
         depth: usize,
-        (embed, paragraph): (Option<BranchID>, &str),
+        (embed, paragraph): (Option<BranchID>, Option<&str>),
     ) -> Result<(), ExportFailure> {
         Self::deep(depth)?;
         let mut metadata = control_metadata(control_id, |key| payload.get(key));
@@ -878,7 +889,7 @@ impl<'a, T: ReadTxn> Builder<'a, T> {
             ancestors,
             embed,
         );
-        self.records[index].paragraph = Some(paragraph.to_owned());
+        self.records[index].paragraph = paragraph.map(str::to_owned);
         let mut inner = ancestors.to_vec();
         inner.push(Ancestor {
             control_id: self.records[index].id().to_owned(),

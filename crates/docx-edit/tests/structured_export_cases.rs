@@ -554,21 +554,11 @@ fn shared_paragraph_ids_never_look_like_edit_targets() {
     assert_eq!(ids[0], "70000001");
     assert_ne!(
         ids[1], "70000001",
-        "parsing gives a repeated id a fresh one"
+        "a repeated Word paragraph id opens with a session key of its own"
     );
     assert_eq!(count(&content, DiagnosticCode::AmbiguousIdentity), 0);
     let doc = open(&bytes);
-    let pilcrow = doc.paragraph_mark_position(&ids[1]).unwrap();
-    doc.apply_raw_ops(
-        "body",
-        vec![RawOp::SetEmbedAttr {
-            index: pilcrow.index,
-            key: "paraId".to_owned(),
-            value: yrs::Any::from("70000001"),
-        }],
-        &EditCtx::local("", ""),
-    )
-    .unwrap();
+    fixture::share_key(&doc, "body", &ids[1], "70000001");
     let content = doc
         .export_structured(&options(RevisionView::Accepted))
         .unwrap()
@@ -1976,18 +1966,8 @@ fn shared_ids_leave_cell_and_comment_anchors_without_a_location() {
         .bytes();
     let doc = open(&bytes);
     let rename = |story: &str, para_id: &str, to: &str| {
-        let position = doc.paragraph_mark_position(para_id).unwrap();
-        assert_eq!(position.story, story);
-        doc.apply_raw_ops(
-            story,
-            vec![RawOp::SetEmbedAttr {
-                index: position.index,
-                key: "paraId".to_owned(),
-                value: yrs::Any::from(to),
-            }],
-            &EditCtx::local("", ""),
-        )
-        .unwrap();
+        assert_eq!(doc.paragraph_mark_position(para_id).unwrap().story, story);
+        fixture::share_key(&doc, story, para_id, to);
     };
     rename("body:t0:r0c0", "0F500002", "0F500001");
     rename("body", "0F500005", "0F500003");

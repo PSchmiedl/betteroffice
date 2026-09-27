@@ -1094,6 +1094,9 @@ fn duplicate_paragraph_ids_are_reported_as_ambiguous() {
         &docx_edit::EditCtx::local("", ""),
     )
     .unwrap();
+    let copy = doc.paragraphs("body").unwrap()[0].para_id.clone();
+    assert_ne!(copy, para, "editing repairs a key two paragraphs share");
+    fixture::share_key(&doc, "body", &copy, &para);
     let content = doc
         .export_structured(&options(RevisionView::Accepted))
         .unwrap()

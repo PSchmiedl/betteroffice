@@ -50,6 +50,11 @@
 - **Host-controlled DOCX saving.** Intercept Save before export and await pending
   editor input before reading, changing, or persisting the document.
 
+- **DOCX paragraph anchors that survive saving.** Paragraphs authored in a session
+  save with valid Word paragraph IDs, and each saved paragraph's anchor, qualified by
+  its package part, resolves again after reopening. Source paragraphs without an ID
+  gain one only when the host opts in.
+
 - **Composable DOCX toolbars.** Arrange built-in controls in your own order next
   to host actions, inside or outside the editor. Controls keep their state,
   shortcuts, disabled reasons, and read-only rules through one command store.

@@ -264,6 +264,10 @@ impl EditingDoc {
                 let mut txn = self.transact_for(&EditCtx::local(String::new(), String::new()));
                 let story = story_ref(&txn, child)?;
                 for paragraph in paragraphs.iter().rev() {
+                    if !paragraph.text.is_empty() {
+                        let pilcrow = embed_map_at(&story, &txn, paragraph.pilcrow)?;
+                        crate::identity::promote(self, &mut txn, &pilcrow);
+                    }
                     let len = paragraph.pilcrow - paragraph.node_start;
                     if len > 0 {
                         story.remove_range(&mut txn, paragraph.node_start, len);

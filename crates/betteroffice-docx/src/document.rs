@@ -295,6 +295,7 @@ impl Document {
                 modified_by: options.modified_by,
             },
             selective: None,
+            paragraph_ids: None,
         };
         write_docx_s13_parts(request, &self.original_parts, None).map_err(Error::from)
     }

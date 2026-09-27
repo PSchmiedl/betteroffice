@@ -103,6 +103,10 @@ function setup(
   const saved: ArrayBuffer[] = [];
   const document = structuredClone(fixture);
   const session = {
+    paragraphIdentities: () => ({ sessionId: '', packageSha256: null, paragraphs: [] }),
+    paragraphSavePlan: () => ({ assignments: [], patchedParts: [] }),
+    writtenParagraphIds: () => ({}),
+    recordSavedParagraphIds: () => [],
     canUndo: () => false,
     canRedo: () => false,
     onUpdate: () => () => {},

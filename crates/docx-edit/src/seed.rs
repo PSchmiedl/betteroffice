@@ -9,6 +9,10 @@ use yrs::types::Attrs;
 use yrs::{Any, Transact};
 
 use crate::control_source::safety_key;
+use crate::identity::{
+    PARA_ORIGIN, SOURCE_PARA_ID, SYNTHETIC, SeededParagraph, SourceIndex, SourcePackage,
+    SourcePartInput, SourceStoryKind,
+};
 use crate::structured::source::{
     CellLayout, CommentWrites, InlineRecord, InlineSource, Pin, Provenance, RawSource, ReadSource,
     Relocated, Represented, RowLayout, SourceMerge, SourceParts, Step, TableLayout, Witness,
@@ -18,6 +22,9 @@ use crate::structured::{BreakType, Revision, RevisionKind, StoryKind};
 use crate::{EditCtx, EditingDoc, RawOp};
 
 type JsonObject = BTreeMap<String, Value>;
+
+/// A parsed node's `w:p` occurrence in its part: read for identity, never seeded.
+const SOURCE_ORDINAL: &str = "sourceOrdinal";
 
 #[derive(Clone)]
 struct Mark {
@@ -87,6 +94,10 @@ struct LoweringContext {
     source_json: Arc<BTreeMap<String, String>>,
     plans: Vec<StoryPlan>,
     compatibility_mode: u8,
+    /// The root story being lowered, for [`Self::paragraphs`].
+    root: String,
+    /// Every lowered paragraph in document order, nested stories in place.
+    paragraphs: Vec<SeededParagraph>,
     source: SourceStructure,
     provenance: Provenance,
     /// Each source story's steps from its part's root element.
@@ -412,8 +423,10 @@ impl<'de> Visitor<'de> for OrderedValueVisitor {
         A: MapAccess<'de>,
     {
         let mut entries = Vec::new();
-        while let Some(entry) = object.next_entry()? {
-            entries.push(entry);
+        while let Some(entry) = object.next_entry::<String, OrderedValue>()? {
+            if entry.0 != SOURCE_ORDINAL {
+                entries.push(entry);
+            }
         }
         Ok(OrderedValue::Object(entries))
     }
@@ -675,10 +688,23 @@ fn needs_source_json(value: &Value) -> bool {
 }
 
 fn source_json(value: &Value, values: &BTreeMap<String, String>) -> String {
-    serde_json::to_string(value)
+    let mut value = value.clone();
+    strip_source_ordinals(&mut value);
+    serde_json::to_string(&value)
         .ok()
         .and_then(|key| values.get(&key).cloned())
-        .unwrap_or_else(|| js_json(value))
+        .unwrap_or_else(|| js_json(&value))
+}
+
+fn strip_source_ordinals(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(strip_source_ordinals),
+        Value::Object(values) => {
+            values.remove(SOURCE_ORDINAL);
+            values.values_mut().for_each(strip_source_ordinals);
+        }
+        _ => {}
+    }
 }
 
 fn drop_nulls(value: Value) -> Value {
@@ -3657,7 +3683,9 @@ impl BlockCursor {
             "rawXml" => None,
             "paragraph" => {
                 let id = string(field(Some(block), "paraId"))
-                    .filter(|value| !value.is_empty())
+                    .filter(|value| {
+                        !value.is_empty() && !truthy(field(Some(block), "repeatedParaId"))
+                    })
                     .map_or_else(|| format!("{story_id}:p{}", self.paragraph), str::to_owned);
                 self.paragraph += 1;
                 Some(id)
@@ -3969,6 +3997,7 @@ fn visit_story(
         measured: (0, 0),
     });
     let empty_story;
+    let source = !source_blocks.is_empty();
     let blocks = if source_blocks.is_empty() {
         empty_story = [json!({ "type": "paragraph", "content": [] })];
         &empty_story[..]
@@ -4072,7 +4101,24 @@ fn visit_story(
                         witness: Witness::Invisible,
                     });
                 }
+                let source_para_id = string(field(Some(block), "paraId"))
+                    .filter(|value| source && !value.is_empty())
+                    .map(str::to_owned);
+                if let Some(id) = &source_para_id {
+                    ppr.insert(SOURCE_PARA_ID.to_owned(), Value::String(id.clone()));
+                }
+                if !source {
+                    ppr.insert(PARA_ORIGIN.to_owned(), Value::String(SYNTHETIC.to_owned()));
+                }
                 ppr.insert("paraId".to_owned(), Value::String(block_id.clone()));
+                context.paragraphs.push(SeededParagraph {
+                    root: context.root.clone(),
+                    key: block_id.clone(),
+                    source_para_id,
+                    ordinal: number(field(Some(block), SOURCE_ORDINAL))
+                        .map(|ordinal| ordinal as u32),
+                    source,
+                });
                 bind_field_result_blocks(
                     &mut units,
                     &story_id,
@@ -4264,16 +4310,25 @@ fn visit_story(
             .entry(story_id.clone())
             .or_default()
             .push(None);
+        let key = format!("{story_id}:p{}", cursor.paragraph);
         context.plans[plan_index].units.push(embed_unit(
             "pilcrow",
             map_from_value(json!({
                 "hangingIndent": false,
-                "paraId": format!("{story_id}:p{}", cursor.paragraph)
+                "paraId": key,
+                (PARA_ORIGIN): SYNTHETIC
             })),
             &[],
             None,
             1,
         ));
+        context.paragraphs.push(SeededParagraph {
+            root: context.root.clone(),
+            key,
+            source_para_id: None,
+            ordinal: None,
+            source: false,
+        });
     }
     if options.seed_comments {
         add_comment_coverage(&mut context.plans[plan_index]);
@@ -4433,10 +4488,25 @@ fn entry_parts(entry: &Value) -> Option<(&str, &Value)> {
     Some((entry.first()?.as_str()?, entry.get(1)?))
 }
 
+/// Parses a DOCX for editing, each paragraph carrying its source occurrence.
 #[cfg(any(feature = "wasm", test))]
 pub(crate) fn parse_docx_for_edit(bytes: &[u8]) -> Result<docx_parse::S9WireEnvelope, String> {
-    docx_parse::parse_docx_s9_wire(bytes, docx_parse::S9ParseOptions::default())
-        .map_err(|error| error.to_string())
+    parse_docx_package(bytes).map(|(envelope, _)| envelope)
+}
+
+/// [`parse_docx_for_edit`], with the inflated parts the identity index reads.
+pub(crate) fn parse_docx_package(
+    bytes: &[u8],
+) -> Result<(docx_parse::S9WireEnvelope, Vec<(String, Vec<u8>)>), String> {
+    docx_parse::parse_docx_s9_wire_parts_with_limits(
+        bytes,
+        docx_parse::S9ParseOptions {
+            source_ordinals: true,
+            ..docx_parse::S9ParseOptions::default()
+        },
+        &docx_parse::xml::ParseLimits::default(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// [`parse_docx_for_edit`] plus the parts provenance resolves against.
@@ -4463,14 +4533,26 @@ pub(crate) fn referenced_fonts(
     Ok(fonts.into_iter().collect())
 }
 
-/// Seeds `envelope` and retains its package context, resolving source provenance against
-/// `parts` when the package's parts are at hand.
-pub(crate) fn seed_parsed_docx_with(
-    document: &EditingDoc,
+type SourceRoot = (String, SourceStoryKind, Option<String>);
+
+/// One package lowered into story plans, with what its identity index and structured reads
+/// need.
+struct LoweredDocx {
+    context: LoweringContext,
+    referenced_fonts: BTreeSet<String>,
+    roots: Vec<SourceRoot>,
+    relationships: Vec<(String, docx_parse::Relationship)>,
+    read: ReadSource,
+}
+
+/// Lowers `envelope`, resolving source provenance against `parts` when the package's parts are
+/// at hand.
+fn lower_docx(
     mut envelope: docx_parse::S9WireEnvelope,
     parts: Option<&SourceParts>,
-) -> Result<Vec<String>, String> {
+) -> Result<LoweredDocx, String> {
     envelope.document.package.media_entries.clear();
+    let relationships = envelope.document.package.relationship_entries.clone();
     let mut referenced_fonts = BTreeSet::new();
     collect_font_table_fonts(&envelope, &mut referenced_fonts);
     let parsed = serde_json::to_value(&envelope.document).map_err(|error| error.to_string())?;
@@ -4490,7 +4572,7 @@ pub(crate) fn seed_parsed_docx_with(
     let package =
         field(Some(&parsed), "package").ok_or_else(|| "parsed DOCX has no package".to_owned())?;
     let mut read = read_source(package, &parsed, parts);
-    let mut context = lower_package(package, source_json);
+    let (mut context, roots) = lower_package(package, source_json);
     drop(parsed);
     read.provenance = std::mem::take(&mut context.provenance);
     read.seeded_comments = seeded_comments(&context.plans);
@@ -4499,6 +4581,38 @@ pub(crate) fn seed_parsed_docx_with(
         let represented = represented_controls(&context.plans, &read);
         read.resolve_sources(parts, comment_raw, &represented);
     }
+    Ok(LoweredDocx {
+        context,
+        referenced_fonts,
+        roots,
+        relationships,
+        read,
+    })
+}
+
+/// Seeds `envelope` and retains its package context, resolving source provenance against
+/// `parts` when the package's parts are at hand.
+pub(crate) fn seed_parsed_docx_with(
+    document: &EditingDoc,
+    envelope: docx_parse::S9WireEnvelope,
+    parts: Option<&SourceParts>,
+) -> Result<Vec<String>, String> {
+    seed_lowered(document, lower_docx(envelope, parts)?, None)
+}
+
+/// Seeds every lowered story into `document` and retains the package context, with the identity
+/// index when there is one.
+fn seed_lowered(
+    document: &EditingDoc,
+    lowered: LoweredDocx,
+    index: Option<SourceIndex>,
+) -> Result<Vec<String>, String> {
+    let LoweredDocx {
+        context,
+        mut referenced_fonts,
+        mut read,
+        ..
+    } = lowered;
     document
         .create_empty_stories(
             &context
@@ -4519,6 +4633,9 @@ pub(crate) fn seed_parsed_docx_with(
         .map_err(|error| error.to_string())?;
     read.pin(document);
     read.comment_writes = CommentWrites::watch(document);
+    if let Some(index) = index {
+        document.retain_source(SourcePackage::Ready(Arc::new(index)));
+    }
     document.install_source(
         SourceMetadata {
             styles: context.styles,
@@ -4562,6 +4679,8 @@ fn scratch_context(styles: StyleResolver) -> LoweringContext {
         source_json: Arc::new(BTreeMap::new()),
         plans: Vec::new(),
         compatibility_mode: 12,
+        root: String::new(),
+        paragraphs: Vec::new(),
         source: SourceStructure::default(),
         provenance: Provenance::default(),
         locators: HashMap::new(),
@@ -4686,7 +4805,7 @@ pub(crate) fn source_metadata(
     let package =
         field(Some(&parsed), "package").ok_or_else(|| "parsed DOCX has no package".to_owned())?;
     let mut read = read_source(package, &parsed, parts);
-    let mut context = lower_package(package, BTreeMap::new());
+    let (mut context, _) = lower_package(package, BTreeMap::new());
     read.provenance = std::mem::take(&mut context.provenance);
     read.seeded_comments = seeded_comments(&context.plans);
     if let Some(parts) = parts {
@@ -4701,7 +4820,10 @@ pub(crate) fn source_metadata(
     })
 }
 
-fn lower_package(package: &Value, source_json: BTreeMap<String, String>) -> LoweringContext {
+fn lower_package(
+    package: &Value,
+    source_json: BTreeMap<String, String>,
+) -> (LoweringContext, Vec<SourceRoot>) {
     let compatibility_mode = compatibility_mode_from_package(Some(package));
     let mut context = LoweringContext {
         styles: StyleResolver::new(field(Some(package), "styles")),
@@ -4709,10 +4831,13 @@ fn lower_package(package: &Value, source_json: BTreeMap<String, String>) -> Lowe
         source_json: Arc::new(source_json),
         plans: Vec::new(),
         compatibility_mode,
+        root: "body".to_owned(),
+        paragraphs: Vec::new(),
         source: SourceStructure::default(),
         provenance: Provenance::default(),
         locators: HashMap::from([("body".to_owned(), vec![Step::Body])]),
     };
+    let mut roots = vec![("body".to_owned(), SourceStoryKind::Body, None)];
     visit_story(
         &mut context,
         "body".to_owned(),
@@ -4723,59 +4848,50 @@ fn lower_package(package: &Value, source_json: BTreeMap<String, String>) -> Lowe
             seed_comments: true,
         },
     );
-    for entry in array(field(Some(package), "headerEntries")) {
-        let Some((relationship_id, part)) = entry_parts(entry) else {
-            continue;
-        };
-        context
-            .locators
-            .insert(format!("hf:{relationship_id}"), Vec::new());
-        visit_story(
-            &mut context,
-            format!("hf:{relationship_id}"),
-            array(field(Some(part), "content")),
-            StoryOptions {
-                include_page_breaks: false,
-                append_body_tail: false,
-                seed_comments: true,
-            },
-        );
-    }
-    for entry in array(field(Some(package), "footerEntries")) {
-        let Some((relationship_id, part)) = entry_parts(entry) else {
-            continue;
-        };
-        let story_id = format!("hf:{relationship_id}");
-        if context.plans.iter().any(|plan| plan.story_id == story_id) {
-            continue;
+    for (key, kind) in [
+        ("headerEntries", SourceStoryKind::Header),
+        ("footerEntries", SourceStoryKind::Footer),
+    ] {
+        for entry in array(field(Some(package), key)) {
+            let Some((relationship_id, part)) = entry_parts(entry) else {
+                continue;
+            };
+            let story_id = format!("hf:{relationship_id}");
+            if context.plans.iter().any(|plan| plan.story_id == story_id) {
+                continue;
+            }
+            context.root = story_id.clone();
+            context.locators.insert(story_id.clone(), Vec::new());
+            roots.push((story_id.clone(), kind, Some(relationship_id.to_owned())));
+            visit_story(
+                &mut context,
+                story_id,
+                array(field(Some(part), "content")),
+                StoryOptions {
+                    include_page_breaks: false,
+                    append_body_tail: false,
+                    seed_comments: true,
+                },
+            );
         }
-        context.locators.insert(story_id.clone(), Vec::new());
-        visit_story(
-            &mut context,
-            story_id,
-            array(field(Some(part), "content")),
-            StoryOptions {
-                include_page_breaks: false,
-                append_body_tail: false,
-                seed_comments: true,
-            },
-        );
     }
-    for (key, prefix, element) in [
-        ("footnotes", "fn", "footnote"),
-        ("endnotes", "en", "endnote"),
+    for (key, prefix, element, kind) in [
+        ("footnotes", "fn", "footnote", SourceStoryKind::Footnote),
+        ("endnotes", "en", "endnote", SourceStoryKind::Endnote),
     ] {
         for note in array(field(Some(package), key)) {
             let Some(id) = field(Some(note), "id") else {
                 continue;
             };
-            context.locators.insert(
-                format!("{prefix}:{}", js_string(id)),
-                vec![Step::Note(element, js_string(id))],
-            );
+            let story_id = format!("{prefix}:{}", js_string(id));
+            context.root = story_id.clone();
+            context
+                .locators
+                .insert(story_id.clone(), vec![Step::Note(element, js_string(id))]);
+            roots.push((story_id.clone(), kind, Some(js_string(id))));
             visit_story(
                 &mut context,
-                format!("{prefix}:{}", js_string(id)),
+                story_id,
                 array(field(Some(note), "content")),
                 StoryOptions {
                     include_page_breaks: false,
@@ -4785,12 +4901,172 @@ fn lower_package(package: &Value, source_json: BTreeMap<String, String>) -> Lowe
             );
         }
     }
-    context
+    (context, roots)
 }
 
+const COMMENT_COMPANIONS: [&str; 2] = ["word/commentsExtended.xml", "word/commentsIds.xml"];
+
+/// What the identity index reads from every part of a package, before its parts narrow to the
+/// stories: every paragraph ID an XML part uses, and the IDs the comment companion parts
+/// reference.
+struct PackageIds {
+    occupied: BTreeSet<u32>,
+    comment_references: BTreeSet<u32>,
+}
+
+impl PackageIds {
+    fn scan(parts: &[(String, Vec<u8>)]) -> Self {
+        Self {
+            occupied: docx_parse::paragraph_identity::package_paragraph_ids(parts),
+            comment_references: COMMENT_COMPANIONS
+                .iter()
+                .filter_map(|path| {
+                    parts
+                        .iter()
+                        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(path))
+                })
+                .flat_map(|(_, xml)| docx_parse::paragraph_identity::paragraph_id_attributes(xml))
+                .collect(),
+        }
+    }
+}
+
+/// Indexes the package's paragraph identities: every story part with the
+/// root stories seeded from it, and the IDs `ids` read from the whole package.
+fn build_source_index(
+    bytes: Arc<[u8]>,
+    parts: &SourceParts,
+    ids: PackageIds,
+    roots: Vec<SourceRoot>,
+    relationships: &[(String, docx_parse::Relationship)],
+    paragraphs: Vec<SeededParagraph>,
+) -> SourceIndex {
+    use crate::structured::source::{COMMENTS_PART, ENDNOTES_PART, FOOTNOTES_PART};
+    use sha2::{Digest, Sha256};
+    let document_path = &parts.document;
+    let find = |path: &str| {
+        parts
+            .parts
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(path))
+    };
+    let mut inputs: Vec<SourcePartInput> = Vec::new();
+    let mut add = |path: &str, kind: SourceStoryKind, root: Option<(String, Option<String>)>| {
+        let Some((path, xml)) = find(path) else {
+            return;
+        };
+        if let Some(input) = inputs.iter_mut().find(|input| input.path == *path) {
+            input.roots.extend(root);
+            return;
+        }
+        let Ok(xml) = std::str::from_utf8(xml) else {
+            return;
+        };
+        inputs.push(SourcePartInput {
+            path: path.clone(),
+            kind,
+            xml: xml.to_owned(),
+            roots: root.into_iter().collect(),
+        });
+    };
+    for (story_id, kind, item) in roots {
+        let path = match kind {
+            SourceStoryKind::Body => Some(document_path.clone()),
+            SourceStoryKind::Footnote => Some(FOOTNOTES_PART.to_owned()),
+            SourceStoryKind::Endnote => Some(ENDNOTES_PART.to_owned()),
+            SourceStoryKind::Comment => Some(COMMENTS_PART.to_owned()),
+            SourceStoryKind::Header | SourceStoryKind::Footer => relationships
+                .iter()
+                .find(|(id, _)| Some(id) == item.as_ref())
+                .and_then(|(_, relationship)| {
+                    match docx_parse::resolve_relationship_target(document_path, relationship) {
+                        Ok(docx_parse::RelationshipTarget::Internal(path)) => Some(path),
+                        _ => None,
+                    }
+                }),
+        };
+        let item =
+            item.filter(|_| matches!(kind, SourceStoryKind::Footnote | SourceStoryKind::Endnote));
+        if let Some(path) = path {
+            add(&path, kind, Some((story_id, item)));
+        }
+    }
+    add(FOOTNOTES_PART, SourceStoryKind::Footnote, None);
+    add(ENDNOTES_PART, SourceStoryKind::Endnote, None);
+    add(COMMENTS_PART, SourceStoryKind::Comment, None);
+    SourceIndex::new(
+        format!("{:x}", Sha256::digest(&bytes)),
+        bytes,
+        ids.occupied,
+        inputs,
+        ids.comment_references,
+        paragraphs,
+    )
+}
+
+/// The identity index of a package, lowered without seeding.
+pub(crate) fn source_index(bytes: Arc<[u8]>) -> Result<SourceIndex, String> {
+    let (envelope, parts) = parse_docx_package(&bytes)?;
+    let ids = PackageIds::scan(&parts);
+    let parts = SourceParts::new(parts);
+    let lowered = lower_docx(envelope, None)?;
+    Ok(build_source_index(
+        bytes,
+        &parts,
+        ids,
+        lowered.roots,
+        &lowered.relationships,
+        lowered.context.paragraphs,
+    ))
+}
+
+/// Seeds every story of the parsed package, resolving source provenance against `parts`, and
+/// retains its identity index.
+pub(crate) fn seed_parsed_docx(
+    document: &EditingDoc,
+    envelope: docx_parse::S9WireEnvelope,
+    parts: Vec<(String, Vec<u8>)>,
+    bytes: Arc<[u8]>,
+) -> Result<Vec<String>, String> {
+    let ids = PackageIds::scan(&parts);
+    let parts = SourceParts::new(parts);
+    let mut lowered = lower_docx(envelope, Some(&parts))?;
+    let index = build_source_index(
+        bytes,
+        &parts,
+        ids,
+        std::mem::take(&mut lowered.roots),
+        &lowered.relationships,
+        std::mem::take(&mut lowered.context.paragraphs),
+    );
+    seed_lowered(document, lowered, Some(index))
+}
+
+/// Opens a DOCX: seeds every story and starts a new opening with a fresh
+/// generation, so its session anchors are its own; see
+/// [`EditingDoc::begin_opening`].
 pub fn seed_from_docx(document: &EditingDoc, bytes: &[u8]) -> Result<(), String> {
-    let (envelope, parts) = parse_docx_with_parts(bytes)?;
-    seed_parsed_docx_with(document, envelope, Some(&parts)).map(|_| ())
+    seed_stories(document, bytes)?;
+    document.begin_opening(None);
+    Ok(())
+}
+
+/// [`seed_from_docx`] with a fixed opening generation, for a deterministic
+/// seed every replica loads as one session.
+pub fn seed_from_docx_with_generation(
+    document: &EditingDoc,
+    bytes: &[u8],
+    generation: &str,
+) -> Result<(), String> {
+    seed_stories(document, bytes)?;
+    document.begin_opening(Some(generation));
+    Ok(())
+}
+
+/// Seeds every story of a DOCX without starting an opening.
+pub(crate) fn seed_stories(document: &EditingDoc, bytes: &[u8]) -> Result<(), String> {
+    let (envelope, parts) = parse_docx_package(bytes)?;
+    seed_parsed_docx(document, envelope, parts, Arc::from(bytes)).map(|_| ())
 }
 
 #[cfg(test)]
@@ -4802,6 +5078,8 @@ mod tests {
             source_json: Arc::new(BTreeMap::new()),
             plans: Vec::new(),
             compatibility_mode: 12,
+            root: "body".to_owned(),
+            paragraphs: Vec::new(),
             source: SourceStructure::default(),
             provenance: Provenance::default(),
             locators: HashMap::new(),
@@ -5047,6 +5325,8 @@ mod tests {
             source_json: Arc::new(BTreeMap::new()),
             plans: Vec::new(),
             compatibility_mode: 12,
+            root: "body".to_owned(),
+            paragraphs: Vec::new(),
             source: SourceStructure::default(),
             provenance: Provenance::default(),
             locators: HashMap::new(),
@@ -5412,6 +5692,24 @@ mod tests {
         assert_eq!(
             source_json(&value, &source),
             r#"{"type":"shape","z":1,"nested":{"b":2,"a":3}}"#
+        );
+    }
+
+    #[test]
+    fn source_json_never_carries_source_ordinals() {
+        let wire = r#"{"type":"shape","textBody":{"content":[{"type":"paragraph","sourceOrdinal":4}]},"z":1.0}"#;
+        let ordered: OrderedValue = serde_json::from_str(wire).unwrap();
+        let parsed: Value = serde_json::from_str(wire).unwrap();
+        let mut source = BTreeMap::new();
+        ordered.collect_source_json(&mut source);
+
+        assert_eq!(
+            source_json(&parsed, &source),
+            r#"{"type":"shape","textBody":{"content":[{"type":"paragraph"}]},"z":1}"#
+        );
+        assert_eq!(
+            source_json(&parsed, &BTreeMap::new()),
+            r#"{"textBody":{"content":[{"type":"paragraph"}]},"type":"shape","z":1}"#
         );
     }
 

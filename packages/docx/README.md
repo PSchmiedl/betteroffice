@@ -100,6 +100,46 @@ surrounding typing. Undo/redo close capture as usual. Manual mode controls histo
 grouping; it does not defer updates, flush pending input, or provide atomic execution.
 The host must close manual groups so later unrelated edits do not join them.
 
+### Paragraph identities
+
+A session addresses paragraphs by session keys (`YrsLoc.paraId`); Word stores its
+own paragraph ID (`w14:paraId`) in the file. A session key is never saved; a session
+anchor resolves on every replica of one collaborative session, and each seeding open
+(`openDocx`, `seedFromDocx`, `documentToYrs`) starts a new one unless given a fixed
+`generation`, as a deterministic shared seed needs. Source IDs are kept as authored, and every
+paragraph authored in the session gets a fresh, valid ID that avoids every ID the
+package already uses.
+
+`saveYrsDocx(session)` saves a session opened from DOCX bytes and returns each saved
+paragraph's persisted anchor, qualified by its package part:
+
+```ts
+import { createYrsSession, saveYrsDocx } from '@betteroffice/docx/yrs';
+
+const { secondParaId } = session.splitParagraph({ story: 'body', paraId, offset: 12 });
+const saved = await saveYrsDocx(session);
+const anchor = saved.paragraphs.find((p) => p.session.paraId === secondParaId)!.persisted;
+
+const reopened = await createYrsSession();
+reopened.openDocx(saved.bytes, true);
+reopened.resolveParagraphAnchor(anchor); // { status: 'found', anchor: { kind: 'session', … } }
+```
+
+`saved.conflicts` lists saved paragraphs whose ID the live session reassigned while the
+save ran, such as by a duplicate repair after a remote update; their anchors find them in
+the saved bytes only. The React editor's Save writes the same IDs and records them as
+saved; only `saveYrsDocx` returns the anchors and keeps unchanged parts as source bytes.
+Source paragraphs without an ID save without one and have no persisted anchor.
+`session.persistParagraphIds()` assigns them IDs across every story part, comments,
+note separators and retained XML included, and repairs duplicates: source IDs and
+saved IDs keep theirs over copies. It refuses, changing nothing, rather than guess at
+an ambiguous comment reference. The change is replicated, stays out of undo history,
+and later saves keep it; a save whose stories are otherwise unchanged patches the IDs
+into the source bytes. `session.paragraphIdentities()` lists each paragraph's session,
+persisted and exact-source anchors. A persisted anchor is scoped to the document the
+host chose, repeated source IDs resolve as `ambiguous`, and table, cell and
+content-control identities are not persisted.
+
 ### Selection state
 
 `session.selectionContext(range)` aggregates the range for toolbars and
@@ -188,7 +228,8 @@ controls, section breaks, opaque XML, fields' cached results, or comments and
 bookmarks crossing the span refuses, as does any step after which saving would
 move an opaque XML block, such as one that precedes a table. A batch holds at most 128 steps,
 1,048,576 inserted UTF-16 units and 1,024 new paragraphs. Paragraph ids are
-session anchors: they are not guaranteed to survive save and reopen.
+session keys; inserted paragraphs get Word paragraph IDs as typed ones do, so
+`saveYrsDocx` returns persisted anchors for them.
 
 ### Structured export
 
@@ -247,14 +288,17 @@ cell or grid changes,
 or row and table revisions the markup view cannot attribute) the block is an
 anchored `unsupported` placeholder with an `unsupported-revision` diagnostic.
 
-Anchors use the batch offsets: a range is paragraph-local UTF-16 in the view it
+Anchors use the batch offsets and session keys: a paragraph anchor's `paraId` is the
+batch target key, and a range is paragraph-local UTF-16 in the view it
 names, one U+FFFC per atom, the same shape the edit batches take; ranges from a
 session export address the version it returned. Content without a session
 location (comment bodies, omitted raw XML) carries a `sourcePart` anchor: the
 part, its SHA-256, and element-child ordinals into its XML. Content with no
 location of its own carries `{ kind: 'unlocated', story, reason }`: the reason is
-`duplicate-paragraph-id` (parsing gives a repeated paragraph id a fresh one, but a
-session can give two paragraphs one id), `story-too-large`, `missing-story` or
+`duplicate-paragraph-id` (a paragraph whose Word paragraph ID repeats an earlier one
+opens with a session key of its own, and edits and merges repair a key two paragraphs
+share, so only shared state written outside the engine has it), `story-too-large`,
+`missing-story` or
 `provenance-unavailable`. Comment metadata reads
 the session's comment store once a field has been written there, and the source
 until then. Ids are deterministic export-tree paths, and a bytes export is
