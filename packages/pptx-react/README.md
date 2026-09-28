@@ -50,9 +50,7 @@ without it, saving downloads the file), `readOnly`, `toolbar`, and `showToolbar`
 ## Compose the toolbar
 
 Every built-in control runs through one command store per editor,
-`api.commands`. This command and toolbar composition API is experimental and
-may change in minor releases. Hosts arrange the same controls with their own
-actions:
+`api.commands`. Hosts arrange the same controls with their own actions:
 
 ```tsx
 import {
@@ -102,8 +100,8 @@ import {
   `usePptxCommand` and `usePptxCommandState` bind custom controls.
 - **Ordering.** `execute(id, args)` waits for input accepted before it, such as
   a picture still decoding, keeps later typing behind it, checks availability
-  again and resolves to `executed`, `noop`, `opened`, `requested` or a coded
-  failure (`input-failed`, `document-replaced`, `target-changed`,
+  again and resolves to `{ ok: true, status }` or `{ ok: false, failure }`
+  (`input-failed`, `document-replaced`, `target-changed`,
   `gesture-active`, `command-failed`). Keystrokes typed meanwhile land in the
   text they were typed into, and a picture on the slide the picker opened on;
   input queued for a replaced document is dropped. Save runs the host's `onSaveRequest` outside that queue, so the request
@@ -173,8 +171,6 @@ batch refuses with `stale-version`. Read-only editors refuse `validateEdits` and
 replaced while input flushes.
 
 ## Host plugins
-
-The plugin API is experimental and may change in minor releases.
 
 Host-owned tools (review aids, checks, templates) install through the `plugins`
 prop. A plugin contributes a docked panel, an overlay and commands, and works
@@ -271,17 +267,17 @@ const review = definePptxPlugin<State>({
   after pending input against `expectVersion`, keep keyboard focus unless
   `focus: true`, and refuse with `stale-version`, `missing-target`,
   `layout-unavailable` or `unsupported` (during proposal review) rather than
-  retarget. Ids are session-scoped: they do not survive saving and reopening.
-- **Geometry.** `context.geometry` exists only while the canvas shows a painted
-  frame of the current version, and not during proposal review.
+  retarget. Ids are session-scoped.
+- **Geometry.** `context.geometry` describes the painted current version, and is
+  `null` during proposal review.
   `layout.width` and `height` are the unzoomed slide in display-list pixels and
   `layout.zoom` the resolved scale, fit included. `geometry.toOverlayRect` takes
   a `slide-emu` (9,525 EMU per pixel) or `slide-px` rectangle and returns pixels
   of the unscaled overlay layer, which sits on the slide canvas below selection
   handles and proposal controls and ignores the pointer unless an element sets
   `pointer-events: auto`. `getShapeRect(shapeId)` returns the rendered bounds of
-  a shape and its group descendants, and `getPositionAtPoint` adds the layout's
-  `version` and `id` to a hit. Every method returns null once its layout is gone.
+  a shape and its group descendants, and `getPositionAtPoint` adds `version` and
+  `layoutId` to a hit. Every method returns null once its layout is gone.
 - **Panels** dock left, right or bottom of the slide, beside the thumbnail rail
   and outside the slide's keyboard handling, with tabs when several share a
   side. `preferredSize` is clamped to 40% of the workspace. In a narrow editor
@@ -352,9 +348,8 @@ step. Rejecting it leaves the deck untouched. If a target changed, preview its
 current state before choosing **Apply updated proposal**. A further target
 change detected at that click refreshes the preview for another review.
 
-Pending proposals are session-local and disappear when the deck closes. Only
-accepted edits are saved and synchronized. Existing host-driven edits may keep
-using `api.refresh()`, which also refreshes the proposal list.
+Accepted proposals are saved and synchronized. `api.refresh()` also refreshes the
+proposal list.
 
 ## Collaboration
 
@@ -384,8 +379,7 @@ import { CollaborationProvider } from '@betteroffice/pptx';
 
 ## Framework notes
 
-The editor is browser-only (canvas, wasm); under Next.js load it with
-`next/dynamic` and `ssr: false`.
+Under Next.js, load the editor with `next/dynamic` and `ssr: false`.
 
 [JavaScript guide](https://docs.betteroffice.dev/docs/javascript) ·
 [Changelog](https://github.com/openooxml/betteroffice/blob/main/packages/pptx-react/CHANGELOG.md) · Apache-2.0.
