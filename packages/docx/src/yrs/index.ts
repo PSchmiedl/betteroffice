@@ -44,6 +44,13 @@ import type {
   DocxValidationResult,
 } from './edits';
 import type { DocxParagraphHeading } from './readTypes';
+import {
+  createProposalRegistry,
+  type DocxProposalRequest,
+  type DocxProposalResult,
+  type DocxProposalSnapshot,
+  type DocxProposalStateRequest,
+} from './proposals';
 import type {
   DocxContentControlQuery,
   DocxContentControlsOptions,
@@ -85,6 +92,18 @@ export {
 export { documentToYrs } from './documentToYrs';
 export { yrsToDocument } from './yrsToDocument';
 export * from './paragraphIdentity';
+export {
+  proposalRevisionPreview,
+  type DocxOccurrence,
+  type DocxProposalFailure,
+  type DocxProposalInput,
+  type DocxProposalRecord,
+  type DocxProposalRequest,
+  type DocxProposalResult,
+  type DocxProposalSnapshot,
+  type DocxProposalState,
+  type DocxProposalStateRequest,
+} from './proposals';
 export {
   captureSessionSave,
   saveYrsDocx,
@@ -480,6 +499,8 @@ export interface YrsRenderEnv {
   numericIds?: Record<string, number>;
   /** Include hidden text in visible layout without changing the document. */
   showHiddenText?: boolean;
+  /** Revision id → decision shown in layout; unlisted revisions render as tracked changes. */
+  revisionPreview?: Readonly<Record<string, 'accepted' | 'rejected'>>;
 }
 
 /** Receipt of {@link YrsSession.addComment}. */
@@ -1225,6 +1246,25 @@ export interface YrsSession extends CollaborationReplica {
   /** Accepted-view texts around a paragraph-keyed selection. @internal */
   selectionText(range: YrsStoryRange): YrsSelectionText;
 
+  // -- host proposals --
+
+  /**
+   * Proposes a round of tracked changes: every new proposal resolves against `expectVersion` and
+   * the round applies as one batch outside undo history, or nothing changes. A retried id with
+   * the same edit is a no-op; the same id with another edit refuses. Opening another document
+   * forgets every proposal.
+   */
+  proposeChanges(request: DocxProposalRequest): DocxProposalResult;
+  /**
+   * Sets how proposals render. Decisions change neither the document, its version nor undo
+   * history; each call that changes one increments `previewVersion`.
+   */
+  setProposalStates(request: DocxProposalStateRequest): DocxProposalResult;
+  /** The proposals in the order they were made. */
+  getProposals(): DocxProposalSnapshot;
+  /** Listens for new proposals, decisions and a forgotten registry. Returns the unsubscribe. */
+  onProposalChange(listener: (snapshot: DocxProposalSnapshot) => void): () => void;
+
   // -- structured export --
 
   /**
@@ -1509,14 +1549,28 @@ function wrapSession(session: EditSession, clientId: number): YrsSession {
   ): YrsDocxHost => {
     const source = bytes.slice();
     markDirty('all');
-    const json = mutate(() =>
-      session.open_docx(source, seedStories, options.generation, preparedDigests.get(bytes))
-    );
+    const json = mutate(() => {
+      const opened = session.open_docx(
+        source,
+        seedStories,
+        options.generation,
+        preparedDigests.get(bytes)
+      );
+      proposals.reset();
+      return opened;
+    });
     const host = decodeDocxHost(json, source);
     docxSource = source;
     partialDocument = false;
     return host;
   };
+
+  const proposals = createProposalRegistry({
+    version: () => facade.version(),
+    resolveParagraphAnchor: (anchor) => facade.resolveParagraphAnchor(anchor),
+    findText: (request) => facade.findText(request),
+    applyEdits: (request) => facade.applyEdits(request),
+  });
 
   const facade: YrsSession = {
     clientId,
@@ -1702,11 +1756,19 @@ function wrapSession(session: EditSession, clientId: number): YrsSession {
 
     loadState: (update) => {
       markDirty('all');
-      mutate(() => session.load(update));
+      mutate(() => {
+        session.load(update);
+        proposals.reset();
+      });
     },
     seedFromDocx: (bytes, options) => openDocx(bytes, true, options),
     openDocx,
-    beginOpening: (generation) => mutate(() => session.begin_opening(generation)),
+    beginOpening: (generation) => {
+      mutate(() => {
+        session.begin_opening(generation);
+        proposals.reset();
+      });
+    },
     materializeDocx: () => {
       const source = docxSource;
       const json = session.materialize_docx();
@@ -2374,6 +2436,13 @@ function wrapSession(session: EditSession, clientId: number): YrsSession {
         if (result.ok && result.applied) markDirty(result.changedStories);
         return result;
       }),
+    proposeChanges: (request) => mutate(() => proposals.propose(request)),
+    setProposalStates: (request) => proposals.setStates(request),
+    getProposals: () => proposals.snapshot(),
+    onProposalChange: (listener) => {
+      if (destroyed) throw new Error('yrs session is destroyed');
+      return proposals.subscribe(listener);
+    },
     formatTextTarget: (target, delta) => {
       ensureUndo(targetStory(target));
       return mutate(
@@ -2410,6 +2479,7 @@ function wrapSession(session: EditSession, clientId: number): YrsSession {
       if (destroyed) return;
       destroyed = true;
       listeners.clear();
+      proposals.destroy();
       pendingUpdates.length = 0;
       if (observing) session.clear_update_observer();
       session.free();
@@ -2419,7 +2489,11 @@ function wrapSession(session: EditSession, clientId: number): YrsSession {
   registerSessionInternals(facade, {
     compareDocx: (original, revised, options) => {
       markDirty('all');
-      const json = mutate(() => session.compare_docx_json(original, revised, options));
+      const json = mutate(() => {
+        const compared = session.compare_docx_json(original, revised, options);
+        proposals.reset();
+        return compared;
+      });
       docxSource = original.slice();
       return json;
     },
