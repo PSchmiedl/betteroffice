@@ -776,6 +776,8 @@ pub struct EngineSession {
     capture: RefCell<Option<LayoutCapture>>,
     /// Content fingerprints of measurement fonts, by font store and font id.
     font_fingerprints: RefCell<HashMap<(u64, u32), String>>,
+    /// The document holds part of a package, such as a preview's first blocks.
+    partial_document: Cell<bool>,
 }
 
 /// The font requirements of `blocks` that `measurement` gives no chain of registered fonts, so
@@ -1234,7 +1236,15 @@ impl EngineSession {
             display: RefCell::new(DisplayState::default()),
             capture: RefCell::new(None),
             font_fingerprints: RefCell::new(HashMap::new()),
+            partial_document: Cell::new(false),
         }
+    }
+
+    /// Marks whether the document is part of a package, such as a preview's
+    /// first blocks: such a document's layouts count only its own pages, so
+    /// they render NUMPAGES empty.
+    pub fn set_partial_document(&self, partial: bool) {
+        self.partial_document.set(partial);
     }
 
     /// Editing document.
@@ -1908,7 +1918,7 @@ impl EngineSession {
             page.footnote_columns = None;
             page.note_areas = None;
         }
-        layout.partial = provisional;
+        layout.partial = provisional || self.partial_document.get();
         apply_document_regions(layout, &regions);
         let page_note_map = map_notes_to_pages(&layout.pages, &refs, &regions);
         stamp_note_pages(layout, &page_note_map, &regions);
@@ -2303,7 +2313,10 @@ impl EngineSession {
         pagination.measured_with = None;
         pagination.lowered_from = None;
         pagination.note_changed_pages.clear();
-        pagination.layout = Some(run.layout);
+        let mut layout = run.layout;
+        // Every pass over part of a package, the resident edit paths' too.
+        layout.partial = self.partial_document.get();
+        pagination.layout = Some(layout);
         pagination.checkpoints = run.checkpoints;
         pagination.block_fingerprints = block_fingerprints;
         pagination.options_fingerprint = input_options_fingerprint;
@@ -6152,6 +6165,244 @@ mod tests {
             ("word/document.xml".to_owned(), document.into_bytes()),
         ])
         .expect("zip the fixture")
+    }
+
+    #[test]
+    fn a_preview_seeded_from_a_body_prefix_paints_the_first_pages_of_the_document() {
+        docx_layout::clear_measure_fonts();
+        let font_id = docx_layout::register_measure_font(LIBERATION).unwrap();
+        let styles = r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:pPr><w:keepNext/><w:spacing w:before="240" w:after="120"/></w:pPr><w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style>"#;
+        let cell = |text: &str| format!("<w:tc><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:tc>");
+        let mut body = String::new();
+        for index in 0..160 {
+            if index % 12 == 0 {
+                body.push_str(&format!(
+                    r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Part {index}</w:t></w:r></w:p>"#
+                ));
+            }
+            if index % 40 == 5 {
+                body.push_str(&format!(
+                    "<w:tbl><w:tblGrid><w:gridCol w:w=\"2400\"/><w:gridCol w:w=\"2400\"/></w:tblGrid><w:tr>{}{}</w:tr><w:tr>{}{}</w:tr></w:tbl>",
+                    cell("North"),
+                    cell("South"),
+                    cell(&format!("Row {index}")),
+                    cell("A cell long enough to wrap onto a second line of its column"),
+                ));
+            }
+            body.push_str(&format!(
+                "<w:p><w:r><w:t>Paragraph {index}: a sentence that wraps across the narrow column of this small page, twice over.</w:t></w:r></w:p>"
+            ));
+            if index == 150 {
+                body.push_str(r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="5760" w:h="4320"/></w:sectPr></w:pPr></w:p>"#);
+            }
+        }
+        let bytes = docx_bytes(styles, &body);
+        let request = serde_json::json!({
+            "bodyStory": "body",
+            "regions": { "sections": [
+                { "sectionId": "first", "properties": {
+                    "pageWidth": 5760, "pageHeight": 4320,
+                    "marginTop": 360, "marginRight": 360, "marginBottom": 360, "marginLeft": 360
+                } },
+                { "sectionId": "last", "properties": {
+                    "pageWidth": 12240, "pageHeight": 2880,
+                    "marginTop": 200, "marginRight": 200, "marginBottom": 200, "marginLeft": 200
+                } }
+            ] },
+            "measurement": {
+                "fontChains": { "liberation sans|0|0": [font_id] },
+                "defaults": { "fontSize": 11, "fontFamily": "Liberation Sans" },
+                "authoritativeShaping": true
+            },
+            "renderEnv": {}
+        })
+        .to_string();
+        let extras =
+            serde_json::json!({ "fontChains": { "liberation sans|0|0": [font_id] } }).to_string();
+        let first_pages = |engine: &EngineSession, layout_json: String| {
+            engine.build_display_list_frame(&extras, 0).unwrap();
+            let pages = engine
+                .with_display_list(|list| list.pages[..3].to_vec())
+                .unwrap();
+            (layout_json, pages)
+        };
+
+        let full = EngineSession::new(310);
+        crate::seed::seed_from_docx(full.doc(), &bytes).unwrap();
+        let (_, full_pages) = first_pages(
+            &full,
+            full.layout_document_with_regions_retained_json(&request)
+                .unwrap(),
+        );
+        let preview = EngineSession::new(311);
+        assert!(crate::seed::seed_docx_preview(preview.doc(), &bytes, 60).unwrap());
+        assert!(
+            preview.doc().paragraphs("body").unwrap().len()
+                < full.doc().paragraphs("body").unwrap().len()
+        );
+        let cell_stories = |engine: &EngineSession| {
+            use yrs::{Map, ReadTxn, Transact};
+            let txn = engine.doc().yrs_doc().transact();
+            let stories = txn.get_map(crate::STORIES).unwrap();
+            stories
+                .iter(&txn)
+                .filter(|(id, _)| id.starts_with("body:"))
+                .count()
+        };
+        // Only the tables the preview reaches keep their cell stories.
+        assert!(cell_stories(&preview) > 0 && cell_stories(&preview) < cell_stories(&full));
+        // The preview ends mid-section, so only a prefix pass that stops
+        // short of its end lays out pages the rest cannot move.
+        let (layout, preview_pages) = first_pages(
+            &preview,
+            preview
+                .layout_document_with_regions_prefix_retained_json(&request, 3)
+                .unwrap(),
+        );
+        assert!(layout.contains("\"provisional\":true"));
+        assert_eq!(preview_pages, full_pages);
+        docx_layout::clear_measure_fonts();
+    }
+
+    #[test]
+    fn a_preview_draws_the_images_its_first_pages_use() {
+        docx_layout::clear_measure_fonts();
+        let font_id = docx_layout::register_measure_font(LIBERATION).unwrap();
+        // A 1x1 PNG, and a second medium nothing on the first pages uses.
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52,
+            0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 0x0d, 0x49,
+            0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0, 0x05, 0, 0x01,
+            0xff, 0x7d, 0x31, 0x96, 0xd5, 0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
+            0x82,
+        ];
+        let image = |id: &str| {
+            format!(
+                r#"<w:p><w:r><w:drawing><wp:inline><wp:extent cx="914400" cy="457200"/><wp:docPr id="1" name="picture"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="{id}"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#
+            )
+        };
+        let mut body = image("rIdFirst");
+        for index in 0..150 {
+            body.push_str(&format!(
+                "<w:p><w:r><w:t>Paragraph {index} of a document whose first page shows a picture.</w:t></w:r></w:p>"
+            ));
+        }
+        body.push_str(&image("rIdLater"));
+        let document = format!(
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>{body}</w:body></w:document>"#
+        );
+        let bytes = ooxml_opc::rezip_parts(&[
+            ("[Content_Types].xml".to_owned(), br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_vec()),
+            ("_rels/.rels".to_owned(), PACKAGE_RELS.as_bytes().to_vec()),
+            ("word/_rels/document.xml.rels".to_owned(), br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdFirst" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/first.png"/><Relationship Id="rIdLater" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/later.png"/></Relationships>"#.to_vec()),
+            ("word/document.xml".to_owned(), document.into_bytes()),
+            ("word/media/first.png".to_owned(), PNG.to_vec()),
+            ("word/media/later.png".to_owned(), PNG.to_vec()),
+        ])
+        .unwrap();
+        let request = serde_json::json!({
+            "bodyStory": "body",
+            "regions": { "sections": [{ "sectionId": "main", "properties": {
+                "pageWidth": 5760, "pageHeight": 4320,
+                "marginTop": 360, "marginRight": 360, "marginBottom": 360, "marginLeft": 360
+            } }] },
+            "measurement": {
+                "fontChains": { "liberation sans|0|0": [font_id] },
+                "defaults": { "fontSize": 11, "fontFamily": "Liberation Sans" },
+                "authoritativeShaping": true
+            },
+            "renderEnv": {}
+        })
+        .to_string();
+        let extras =
+            serde_json::json!({ "fontChains": { "liberation sans|0|0": [font_id] } }).to_string();
+        let first_page = |engine: &EngineSession| {
+            engine.build_display_list_frame(&extras, 0).unwrap();
+            engine
+                .with_display_list(|list| list.pages[0].clone())
+                .unwrap()
+        };
+        let full = EngineSession::new(312);
+        crate::seed::seed_from_docx(full.doc(), &bytes).unwrap();
+        full.layout_document_with_regions_retained_json(&request)
+            .unwrap();
+        let preview = EngineSession::new(312);
+        assert!(crate::seed::seed_docx_preview(preview.doc(), &bytes, 40).unwrap());
+        preview
+            .layout_document_with_regions_prefix_retained_json(&request, 3)
+            .unwrap();
+        let page = first_page(&preview);
+        assert!(
+            serde_json::to_string(&page)
+                .unwrap()
+                .contains("data:image/png;base64,")
+        );
+        assert_eq!(page, first_page(&full));
+        docx_layout::clear_measure_fonts();
+    }
+
+    /// Times opening a document for display in full and from a body prefix.
+    /// Run: `DOCX_PREVIEW_PROBE=<file.docx> cargo test -p betteroffice-docx-edit --release --lib -- --ignored preview_probe --nocapture`
+    #[test]
+    #[ignore = "perf probe; run explicitly with DOCX_PREVIEW_PROBE set"]
+    fn preview_probe() {
+        let Ok(path) = std::env::var("DOCX_PREVIEW_PROBE") else {
+            return;
+        };
+        let blocks = std::env::var("DOCX_PREVIEW_BLOCKS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(200);
+        let bytes = std::fs::read(path).unwrap();
+        docx_layout::clear_measure_fonts();
+        let font_id = docx_layout::register_measure_font(LIBERATION).unwrap();
+        let request = serde_json::json!({
+            "bodyStory": "body",
+            "regions": { "sections": [{ "sectionId": "main", "properties": {} }] },
+            "measurement": {
+                "fontChains": { "liberation sans|0|0": [font_id] },
+                "defaults": { "fontSize": 11, "fontFamily": "Liberation Sans" },
+                "authoritativeShaping": true
+            },
+            "renderEnv": {}
+        })
+        .to_string();
+        let extras =
+            serde_json::json!({ "fontChains": { "liberation sans|0|0": [font_id] } }).to_string();
+        let open = |engine: &EngineSession, seed: &dyn Fn(&EngineSession)| {
+            let started = std::time::Instant::now();
+            seed(engine);
+            let seeded = started.elapsed();
+            engine
+                .layout_document_with_regions_prefix_retained_json(&request, 3)
+                .unwrap();
+            let laid_out = started.elapsed();
+            engine.build_display_list_frame(&extras, 0).unwrap();
+            let painted = started.elapsed();
+            let pages = engine
+                .pagination
+                .borrow()
+                .layout
+                .as_ref()
+                .unwrap()
+                .pages
+                .len();
+            println!("  seed {seeded:?}, +layout {laid_out:?}, +frame {painted:?}, {pages} pages");
+            engine
+                .with_display_list(|list| list.pages[..3].to_vec())
+                .unwrap()
+        };
+        println!("full open:");
+        let full = open(&EngineSession::new(320), &|engine| {
+            crate::seed::seed_from_docx(engine.doc(), &bytes).unwrap();
+        });
+        println!("preview of the first {blocks} body blocks:");
+        let preview = open(&EngineSession::new(320), &|engine| {
+            assert!(crate::seed::seed_docx_preview(engine.doc(), &bytes, blocks).unwrap());
+        });
+        for (index, (full, preview)) in full.iter().zip(&preview).enumerate() {
+            println!("  page {index} identical: {}", full == preview);
+        }
     }
 
     /// Three sections of ten paragraphs under a header taller than the top
