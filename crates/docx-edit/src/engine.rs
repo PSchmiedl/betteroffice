@@ -714,6 +714,72 @@ fn measured_fingerprint(measured: &MeasuredBlock) -> Result<u64, String> {
         .map_err(|error| format!("fingerprint measured block: {error}"))
 }
 
+/// JSON equality with numbers compared by value, as a host's `1` and Rust's `1.0`.
+fn json_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            left == right
+                || left
+                    .as_f64()
+                    .is_some_and(|value| Some(value) == right.as_f64())
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len() && left.iter().zip(right).all(|(l, r)| json_equal(l, r))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .all(|(key, l)| right.get(key).is_some_and(|r| json_equal(l, r)))
+        }
+        _ => left == right,
+    }
+}
+
+fn json_option_equal(left: Option<&serde_json::Value>, right: Option<&serde_json::Value>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => json_equal(left, right),
+        (left, right) => left.is_none() && right.is_none(),
+    }
+}
+
+/// A section break's extent never depends on its margins, which header and
+/// footer extents widen after measurement.
+fn section_breaks_match_but_margins(next: &LayoutBlock, retained: &LayoutBlock) -> bool {
+    let (LayoutBlock::SectionBreak(next), LayoutBlock::SectionBreak(retained)) = (next, retained)
+    else {
+        return false;
+    };
+    let mut retained = retained.clone();
+    retained.margins.clone_from(&next.margins);
+    *next == retained
+}
+
+/// `dirty`, or the start of the section whose closing break changed first, if
+/// that is earlier: a section break carries geometry (margins a header
+/// widens, page size, columns) that the whole section was laid out under, so
+/// pagination has to resume where the section begins.
+fn section_start_of_first_changed_break(
+    measured: &[MeasuredBlock],
+    previous: &[u64],
+    next: &[u64],
+    dirty: usize,
+) -> usize {
+    let Some(changed) = (dirty..measured.len()).find(|&index| {
+        matches!(measured[index].block, LayoutBlock::SectionBreak(_))
+            && previous.get(index) != next.get(index)
+    }) else {
+        return dirty;
+    };
+    // From the break that opens the section: the section's first page starts there.
+    let section_start = measured[..changed]
+        .iter()
+        .rposition(|block| matches!(block.block, LayoutBlock::SectionBreak(_)))
+        .unwrap_or(0);
+    dirty.min(section_start)
+}
+
 fn measured_fingerprints(input: &LayoutInput) -> Result<Vec<u64>, String> {
     input.measured.iter().map(measured_fingerprint).collect()
 }
@@ -1504,7 +1570,16 @@ impl EngineSession {
             block_fingerprints = None;
         }
         let block_fingerprints = match block_fingerprints {
-            Some(fingerprints) => fingerprints,
+            // Header and footer extents widen the section breaks' margins after the
+            // reuse walk: fingerprint them as a full pass does, as paginated.
+            Some(mut fingerprints) => {
+                for (fingerprint, measured) in fingerprints.iter_mut().zip(&input.measured) {
+                    if matches!(measured.block, LayoutBlock::SectionBreak(_)) {
+                        *fingerprint = measured_fingerprint(measured)?;
+                    }
+                }
+                fingerprints
+            }
             None => measured_fingerprints(&input)?,
         };
         let refs = input
@@ -1912,7 +1987,15 @@ impl EngineSession {
                 .block_fingerprints
                 .iter()
                 .zip(&block_fingerprints)
-                .position(|(previous, next)| previous != next);
+                .position(|(previous, next)| previous != next)
+                .map(|dirty| {
+                    section_start_of_first_changed_break(
+                        &input.measured,
+                        &previous.block_fingerprints,
+                        &block_fingerprints,
+                        dirty,
+                    )
+                });
             if let Some(dirty_index) = first_dirty
                 && incremental_eligible(&previous, &input, input_options_fingerprint)
             {
@@ -2305,7 +2388,10 @@ impl EngineSession {
                 docx_layout::paragraph_spacing::apply_contextual_spacing_blocks(
                     std::slice::from_mut(&mut owned),
                 );
-                if width_clean && owned == previous_entry.block {
+                if width_clean
+                    && (owned == previous_entry.block
+                        || section_breaks_match_but_margins(&owned, &previous_entry.block))
+                {
                     measured.push(MeasuredBlock {
                         block: owned,
                         measure: std::mem::replace(
@@ -2622,12 +2708,25 @@ impl EngineSession {
             .borrow()
             .as_ref()
             .and_then(|state| state.headers_footers.clone());
-        if let Some(headers_footers) = headers_footers {
-            fields.insert("headersFooters".to_owned(), headers_footers);
+        let shown = if let Some(headers_footers) = headers_footers {
+            fields.insert("headersFooters".to_owned(), headers_footers)
         } else {
-            fields.remove("headersFooters");
+            fields.remove("headersFooters")
+        };
+        let rebuilt = serde_json::to_string(&value)
+            .map_err(|error| format!("serialize display extras: {error}"))?;
+        if rebuilt == extras {
+            return Ok(extras);
         }
-        serde_json::to_string(&value).map_err(|error| format!("serialize display extras: {error}"))
+        // The host writes the shown frame's extras in its own JSON. When they
+        // carry these headers and footers, keep them verbatim, so the next
+        // frame builds on the shown one.
+        let reparsed: serde_json::Value = serde_json::from_str(&rebuilt)
+            .map_err(|error| format!("parse display extras: {error}"))?;
+        if json_option_equal(reparsed.get("headersFooters"), shown.as_ref()) {
+            return Ok(extras);
+        }
+        Ok(rebuilt)
     }
 
     /// Profiled twin of [`Self::apply_and_layout`]. The caller supplies a
@@ -5187,6 +5286,245 @@ mod tests {
             ("word/document.xml".to_owned(), document.into_bytes()),
         ])
         .expect("zip the fixture")
+    }
+
+    /// Three sections of ten paragraphs under a header taller than the top
+    /// margin, and the region request that lays them out.
+    fn sectioned_header_fixture() -> (Vec<u8>, String) {
+        let section = r#"<w:sectPr><w:type w:val="nextPage"/><w:pgSz w:w="6000" w:h="4000"/><w:pgMar w:top="400" w:right="400" w:bottom="400" w:left="400" w:header="100" w:footer="100"/></w:sectPr>"#;
+        let mut body = String::new();
+        for index in 0..30 {
+            let properties = if index % 10 == 9 { section } else { "" };
+            body.push_str(&format!(
+                r#"<w:p><w:pPr><w:spacing w:before="0" w:after="0"/>{properties}</w:pPr><w:r><w:t>Paragraph {index} of the body</w:t></w:r></w:p>"#
+            ));
+        }
+        body.push_str(section);
+        docx_layout::clear_measure_fonts();
+        let font_id = docx_layout::register_measure_font(LIBERATION).unwrap();
+        let sections: Vec<_> = (0..3)
+            .map(|index| {
+                serde_json::json!({
+                    "sectionId": format!("s{index}"),
+                    "pageSize": {"w": 300, "h": 200},
+                    "margins": {"top": 20, "right": 20, "bottom": 20, "left": 20, "header": 5, "footer": 5},
+                    "headerFooterRefs": {"headerDefault": "rId1"}
+                })
+            })
+            .collect();
+        let request = serde_json::json!({
+            "bodyStory": "body",
+            "regions": {"sections": sections},
+            "measurement": {
+                "fontChains": {"liberation sans|0|0": [font_id]},
+                "defaults": {"fontSize": 11, "fontFamily": "Liberation Sans"},
+                "authoritativeShaping": true
+            },
+            "renderEnv": {}
+        });
+        (docx_bytes("", &body), request.to_string())
+    }
+
+    fn open_sectioned(bytes: &[u8], client_id: u64) -> EngineSession {
+        let engine = EngineSession::new(client_id);
+        crate::seed::seed_from_docx(engine.doc(), bytes).unwrap();
+        engine
+            .doc()
+            .create_story(
+                "hf:rId1",
+                "A header taller than the top margin",
+                "Normal",
+                "left",
+            )
+            .unwrap();
+        engine
+    }
+
+    fn insert_x(engine: &EngineSession, story: &str, at: u32) {
+        engine
+            .doc()
+            .insert_text(
+                &crate::EditCtx::local("", ""),
+                crate::Position::new(story, at),
+                "x",
+                crate::FormatPolicy::Inherit,
+            )
+            .unwrap();
+    }
+
+    fn retained_pages(engine: &EngineSession) -> serde_json::Value {
+        serde_json::to_value(&engine.pagination.borrow().layout.as_ref().unwrap().pages).unwrap()
+    }
+
+    fn assert_fingerprints_as_paginated(engine: &EngineSession) {
+        let pagination = engine.pagination.borrow();
+        assert_eq!(
+            pagination.block_fingerprints,
+            measured_fingerprints(pagination.input.as_ref().unwrap()).unwrap(),
+            "retained fingerprints are those of the arena as paginated"
+        );
+    }
+
+    #[test]
+    fn the_first_edit_after_a_region_open_reuses_section_breaks_and_converges() {
+        let (bytes, request) = sectioned_header_fixture();
+        let engine = open_sectioned(&bytes, 142);
+        let output: serde_json::Value =
+            serde_json::from_str(&engine.layout_document_with_regions_json(&request).unwrap())
+                .unwrap();
+        assert!(
+            output["options"]["margins"]["top"].as_f64().unwrap() > 20.0,
+            "the header widens the margins"
+        );
+        assert!(output["layout"]["pages"].as_array().unwrap().len() > 3);
+        engine.build_display_list_frame("{}", 0).unwrap();
+
+        insert_x(&engine, "body", 2);
+        let before = engine.stats();
+        let epoch = engine.display.borrow().binary_frame_epoch;
+        engine.apply_and_layout("body", epoch).unwrap();
+        let after = engine.stats();
+        assert_eq!(
+            after.resident_measure_calls - before.resident_measure_calls,
+            1,
+            "only the edited paragraph re-measures; the section breaks keep their extents"
+        );
+        assert_eq!(
+            after.incremental_pagination_calls - before.incremental_pagination_calls,
+            1
+        );
+        assert_eq!(
+            after.rebuilt_pages, 1,
+            "pagination converges after the edited page"
+        );
+        assert_fingerprints_as_paginated(&engine);
+
+        let reference = open_sectioned(&bytes, 143);
+        insert_x(&reference, "body", 2);
+        reference
+            .layout_document_with_regions_json(&request)
+            .unwrap();
+        assert_eq!(retained_pages(&engine), retained_pages(&reference));
+    }
+
+    #[test]
+    fn the_first_edit_after_an_open_builds_on_the_hosts_frame() {
+        fn integral(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Number(number) => {
+                    if let Some(whole) = number.as_f64().filter(|value| value.fract() == 0.0) {
+                        *value = serde_json::json!(whole as i64);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(integral),
+                serde_json::Value::Object(fields) => fields.values_mut().for_each(integral),
+                _ => {}
+            }
+        }
+        let (bytes, request) = sectioned_header_fixture();
+        let open = |client_id| {
+            let engine = open_sectioned(&bytes, client_id);
+            let output: serde_json::Value =
+                serde_json::from_str(&engine.layout_document_with_regions_json(&request).unwrap())
+                    .unwrap();
+            // A host writes whole numbers without a fraction.
+            let mut headers_footers = output["headersFooters"].clone();
+            assert!(headers_footers.is_object());
+            integral(&mut headers_footers);
+            let extras = serde_json::json!({ "headersFooters": headers_footers }).to_string();
+            engine.build_display_list_frame(&extras, 0).unwrap();
+            (engine, extras)
+        };
+        let (engine, _) = open(146);
+        insert_x(&engine, "body", 2);
+        let before = engine.stats();
+        let epoch = engine.display.borrow().binary_frame_epoch;
+        engine.apply_and_layout("body", epoch).unwrap();
+        let after = engine.stats();
+        assert_eq!(
+            after.incremental_display_builds - before.incremental_display_builds,
+            1
+        );
+
+        let (reference, extras) = open(146);
+        insert_x(&reference, "body", 2);
+        reference
+            .layout_document_with_regions_json(&request)
+            .unwrap();
+        reference.build_display_list_frame(&extras, 0).unwrap();
+        let pages = |engine: &EngineSession| engine.with_display_list(|list| list.pages.clone());
+        assert_eq!(pages(&engine), pages(&reference));
+    }
+
+    #[test]
+    fn a_taller_header_refingerprints_the_reused_section_breaks() {
+        let (bytes, request) = sectioned_header_fixture();
+        let engine = open_sectioned(&bytes, 144);
+        engine.layout_document_with_regions_json(&request).unwrap();
+        let grow = |engine: &EngineSession| {
+            let ctx = crate::EditCtx::local("", "");
+            for _ in 0..3 {
+                engine
+                    .doc()
+                    .split_paragraph(&ctx, crate::Position::new("hf:rId1", 1), None)
+                    .unwrap();
+            }
+        };
+        grow(&engine);
+        engine.layout_document_with_regions_json(&request).unwrap();
+        assert_fingerprints_as_paginated(&engine);
+
+        let reference = open_sectioned(&bytes, 145);
+        grow(&reference);
+        reference
+            .layout_document_with_regions_json(&request)
+            .unwrap();
+        assert_eq!(retained_pages(&engine), retained_pages(&reference));
+    }
+
+    #[test]
+    fn a_middle_section_whose_header_grows_repaginates_from_its_start() {
+        let (bytes, request) = sectioned_header_fixture();
+        let mut request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        for (index, section) in request["regions"]["sections"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            section["headerFooterRefs"]["headerDefault"] = format!("rId{}", index + 1).into();
+        }
+        let request = request.to_string();
+        let open = |client_id| {
+            let engine = open_sectioned(&bytes, client_id);
+            for story in ["hf:rId2", "hf:rId3"] {
+                engine
+                    .doc()
+                    .create_story(story, "A header", "Normal", "left")
+                    .unwrap();
+            }
+            engine
+        };
+        let grow = |engine: &EngineSession| {
+            let ctx = crate::EditCtx::local("", "");
+            for _ in 0..3 {
+                engine
+                    .doc()
+                    .split_paragraph(&ctx, crate::Position::new("hf:rId2", 1), None)
+                    .unwrap();
+            }
+        };
+        let engine = open(146);
+        engine.layout_document_with_regions_json(&request).unwrap();
+        grow(&engine);
+        engine.layout_document_with_regions_json(&request).unwrap();
+
+        let reference = open(147);
+        grow(&reference);
+        reference
+            .layout_document_with_regions_json(&request)
+            .unwrap();
+        assert_eq!(retained_pages(&engine), retained_pages(&reference));
     }
 
     fn layout_pages(bytes: &[u8], client_id: u64, content_height: f64) -> serde_json::Value {
