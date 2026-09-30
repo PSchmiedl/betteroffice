@@ -900,6 +900,7 @@ struct DisplayState {
     incremental_display_builds: u64,
     rebuilt_display_pages: u64,
     window: Option<std::ops::Range<usize>>,
+    retain_built_pages: bool,
     windowed_incremental_builds: bool,
 }
 
@@ -1171,7 +1172,10 @@ fn window_build_pages(
     rebuilt_pages: &HashSet<usize>,
     caret: Option<CaretExtent>,
 ) -> Vec<bool> {
-    if !display.windowed_incremental_builds || display.window.is_none() {
+    if !display.windowed_incremental_builds
+        || display.window.is_none()
+        || display.retain_built_pages
+    {
         return full_build_pages(display, layout.pages.len());
     }
     layout
@@ -1204,6 +1208,21 @@ fn window_build_pages(
                 || (rebuilt_pages.contains(&index) && caret_page())
         })
         .collect()
+}
+
+/// With windowed builds on, compile the window and a mapped caret's page,
+/// or every built page while retained; otherwise use [`full_build_pages`].
+fn windowed_full_build_pages(
+    display: &DisplayState,
+    layout: &Layout,
+    caret: Option<CaretExtent>,
+) -> Vec<bool> {
+    window_build_pages(
+        display,
+        layout,
+        &(0..layout.pages.len()).collect(),
+        caret.filter(|caret| matches!(caret, CaretExtent::Position(_))),
+    )
 }
 
 fn resident_paragraph_position(input: &LayoutInput, para_id: &str, offset: u32) -> Option<i64> {
@@ -3931,6 +3950,29 @@ impl EngineSession {
                 .as_ref()
                 .ok_or_else(|| "resident layout is not built".to_owned())?;
             let mut display = self.display.borrow_mut();
+            let caret = if display.windowed_incremental_builds && display.window.is_some() {
+                self.resident_caret_head
+                    .borrow()
+                    .as_ref()
+                    .map(|(story, head)| {
+                        let extent = || {
+                            let txn = self.doc.yrs_doc().transact();
+                            let index = head.get_offset(&txn)?.index;
+                            drop(txn);
+                            let segments = self.doc.segment_index(story).ok()?;
+                            let paragraph = segments.para_at(index)?;
+                            let (epoch, map) = pagination.input_lowering.as_ref()?;
+                            if *epoch != self.doc_epoch() {
+                                return None;
+                            }
+                            lowered_caret_position(map, input, story, paragraph, index)
+                                .map(CaretExtent::Position)
+                        };
+                        extent().unwrap_or(CaretExtent::Unmapped)
+                    })
+            } else {
+                None
+            };
             if pagination.last_incremental && display.extras_fingerprint == extras_fingerprint {
                 // The first range is rebuilt as a range; the pages after it shift,
                 // but later ranges, the pages elsewhere whose notes anchor to
@@ -3968,29 +4010,6 @@ impl EngineSession {
                     .collect();
                 let rebuilt_pages: HashSet<usize> =
                     first.clone().chain(note_pages.iter().copied()).collect();
-                let caret = if display.windowed_incremental_builds && display.window.is_some() {
-                    self.resident_caret_head
-                        .borrow()
-                        .as_ref()
-                        .map(|(story, head)| {
-                            let extent = || {
-                                let txn = self.doc.yrs_doc().transact();
-                                let index = head.get_offset(&txn)?.index;
-                                drop(txn);
-                                let segments = self.doc.segment_index(story).ok()?;
-                                let paragraph = segments.para_at(index)?;
-                                let (epoch, map) = pagination.input_lowering.as_ref()?;
-                                if *epoch != self.doc_epoch() {
-                                    return None;
-                                }
-                                lowered_caret_position(map, input, story, paragraph, index)
-                                    .map(CaretExtent::Position)
-                            };
-                            extent().unwrap_or(CaretExtent::Unmapped)
-                        })
-                } else {
-                    None
-                };
                 let build = window_build_pages(&display, layout, &rebuilt_pages, caret);
                 let incremental = if let DisplayState {
                     list: Some(previous),
@@ -4014,7 +4033,7 @@ impl EngineSession {
                     false
                 };
                 if !incremental {
-                    let build = full_build_pages(&display, layout.pages.len());
+                    let build = windowed_full_build_pages(&display, layout, caret);
                     let (resident_input, list) =
                         docx_layout::build_resident_display_list_partial_observed(
                             input,
@@ -4036,7 +4055,7 @@ impl EngineSession {
                 };
                 (incremental, rebuilt_display_pages, rebuilt_pages)
             } else {
-                let build = full_build_pages(&display, layout.pages.len());
+                let build = windowed_full_build_pages(&display, layout, caret);
                 let (resident_input, list) =
                     docx_layout::build_resident_display_list_partial_observed(
                         input,
@@ -4108,6 +4127,12 @@ impl EngineSession {
     /// Limit full builds to `window` and previously built pages; `None` builds all.
     pub fn set_display_window(&self, window: Option<std::ops::Range<usize>>) {
         self.display.borrow_mut().window = window;
+    }
+
+    /// While set, windowed builds keep every page the previous list had built,
+    /// as with windowed builds off.
+    pub fn set_display_retain_built_pages(&self, retain: bool) {
+        self.display.borrow_mut().retain_built_pages = retain;
     }
 
     /// Limit incremental rebuilds to the display window and caret pages. Off by default.
@@ -8681,12 +8706,19 @@ mod tests {
         assert_eq!(built.pages[last], expected.pages[last]);
         assert!(built.pages[2].unbuilt);
 
-        // A later full build keeps what is built and leaves the rest unbuilt.
+        // A later full build evicts pages outside the window.
         engine
             .build_display_list_frame(&format!("{extras} "), epoch + 1)
             .unwrap();
         let rebuilt = engine.with_display_list(Clone::clone).unwrap();
-        assert!(!rebuilt.pages[last].unbuilt && rebuilt.pages[2].unbuilt);
+        assert!(!rebuilt.pages[0].unbuilt);
+        assert!(rebuilt.pages[last].unbuilt && rebuilt.pages[2].unbuilt);
+        let epoch = engine.display.borrow().binary_frame_epoch;
+        engine.build_display_pages_frame(&[last], epoch).unwrap();
+        assert_eq!(
+            engine.with_display_list(Clone::clone).unwrap().pages[last],
+            full_build(&engine).pages[last]
+        );
         docx_layout::clear_measure_fonts();
     }
 
@@ -8882,6 +8914,115 @@ mod tests {
             edited.pages[0],
             full_display_build(&engine, &extras).pages[0]
         );
+        docx_layout::clear_measure_fonts();
+    }
+
+    #[test]
+    fn a_full_windowed_build_keeps_only_the_window_and_the_caret_page() {
+        use yrs::{Assoc, IndexedSequence};
+
+        let (engine, extras) = paged_filler_engine(213, 160);
+        engine.build_display_list_frame(&extras, 0).unwrap();
+        assert!(!engine.pagination.borrow().last_incremental);
+        let full = full_display_build(&engine, &extras);
+        assert!(full.pages.len() >= 11);
+
+        let paragraph = engine.doc().paragraphs("body").unwrap().remove(0);
+        let txn = engine.doc().yrs_doc().transact();
+        let text = crate::story_ref(&txn, "body").unwrap();
+        let head = text.sticky_index(&txn, 0, Assoc::After).unwrap();
+        drop(txn);
+        engine.set_resident_caret_head(Some(("body".to_owned(), head)));
+        engine.set_display_window(Some(8..11));
+        let epoch = engine.display.borrow().binary_frame_epoch;
+        engine.build_display_list_frame(&extras, epoch).unwrap();
+        assert!(
+            engine
+                .with_display_list(|list| list.pages.iter().all(|page| !page.unbuilt))
+                .unwrap(),
+            "without windowed builds a full build keeps every built page"
+        );
+
+        engine.set_windowed_incremental_builds(true);
+        let before = engine.stats();
+        let epoch = engine.display.borrow().binary_frame_epoch;
+        engine.build_display_list_frame(&extras, epoch).unwrap();
+        assert_eq!(
+            engine.stats().incremental_display_builds,
+            before.incremental_display_builds
+        );
+        let windowed = engine.with_display_list(Clone::clone).unwrap();
+        for (index, page) in windowed.pages.iter().enumerate() {
+            assert_eq!(page.unbuilt, !(8..11).contains(&index), "page {index}");
+        }
+
+        engine
+            .doc()
+            .insert_text(
+                &crate::EditCtx::local("", ""),
+                crate::Position::new("body", 0),
+                "x",
+                crate::FormatPolicy::Inherit,
+            )
+            .unwrap();
+        let epoch = engine.display.borrow().binary_frame_epoch;
+        engine.apply_and_layout("body", epoch).unwrap();
+        let before = engine.stats();
+        let epoch = engine.display.borrow().binary_frame_epoch;
+        engine
+            .build_display_list_frame(&format!("{extras} "), epoch)
+            .unwrap();
+        assert_eq!(
+            engine.stats().incremental_display_builds,
+            before.incremental_display_builds
+        );
+        let full = full_display_build(&engine, &extras);
+        let windowed = engine.with_display_list(Clone::clone).unwrap();
+        for (index, (page, full_page)) in windowed.pages.iter().zip(&full.pages).enumerate() {
+            if index == 0 || (8..11).contains(&index) {
+                assert_eq!(page, full_page, "page {index} is built");
+            } else {
+                assert!(
+                    page.unbuilt && page.primitives.is_empty(),
+                    "page {index} waits"
+                );
+                assert_eq!(page.width, full_page.width);
+                assert_eq!(page.height, full_page.height);
+                assert_eq!(page.content_bounds, full_page.content_bounds);
+            }
+        }
+        assert_eq!(
+            engine
+                .resident_caret_snapshot(Some((&paragraph.para_id, 1)))
+                .unwrap()
+                .caret_rect
+                .unwrap()
+                .page_index,
+            0
+        );
+
+        let rest: Vec<usize> = (0..full.pages.len())
+            .filter(|index| *index != 0 && !(8..11).contains(index))
+            .collect();
+        let epoch = engine.display.borrow().binary_frame_epoch;
+        engine.build_display_pages_frame(&rest, epoch).unwrap();
+        assert_eq!(
+            engine.with_display_list(Clone::clone).unwrap().pages,
+            full.pages
+        );
+        engine.set_display_retain_built_pages(true);
+        let before = engine.stats();
+        let epoch = engine.display.borrow().binary_frame_epoch;
+        engine
+            .build_display_list_frame(&format!("{extras}  "), epoch)
+            .unwrap();
+        assert_eq!(
+            engine.stats().incremental_display_builds,
+            before.incremental_display_builds
+        );
+        let retained = engine.with_display_list(Clone::clone).unwrap();
+        assert!(retained.pages.iter().all(|page| !page.unbuilt));
+        assert_eq!(retained.pages, full_display_build(&engine, &extras).pages);
         docx_layout::clear_measure_fonts();
     }
 

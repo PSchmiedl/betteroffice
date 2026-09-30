@@ -1803,6 +1803,12 @@ impl EditSession {
             .set_display_window(Some(start as usize..(end.max(start)) as usize));
     }
 
+    /// Keep every previously built page while windowed builds are on.
+    pub fn set_display_retain_built_pages(&self, retain: bool) {
+        let _fonts = self.fonts.enter();
+        self.engine.set_display_retain_built_pages(retain);
+    }
+
     /// Limit incremental rebuilds to the display window and caret pages. Off by default.
     pub fn set_windowed_incremental_builds(&self, enabled: bool) {
         let _fonts = self.fonts.enter();
