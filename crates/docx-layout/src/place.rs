@@ -34,7 +34,9 @@
 
 use crate::LayoutError;
 use crate::hooks;
-use crate::keep_together::{paragraph_is_unbreakable, paragraph_widow_control};
+use crate::keep_together::{
+    measure_keep_with_next_group_witnessing, paragraph_is_unbreakable, paragraph_widow_control,
+};
 use crate::page_flow::{PageFlowGeometry, Paginator};
 use crate::paragraph_spacing::{
     apply_contextual_spacing_measured, get_spacing_after, get_spacing_before,
@@ -859,20 +861,25 @@ fn place(
             let page_content_height =
                 paginator.state(state_idx).content_limit - paginator.state(state_idx).content_top;
             let page_has_content = paginator.page_fragment_count(state_idx) > 0;
-            let group_height = hooks::measure_keep_with_next_group_at(
+            // between float bands a table row's first slice may not share a gap
+            // with the run, so a table follower keeps its whole first row there
+            let split_first_row = !paginator.has_float_bands();
+            let group_height = measure_keep_with_next_group_witnessing(
                 group,
                 measured,
                 |before| paginator.leading_spacing(before),
                 paginator.state(state_idx).deferred_spacing,
                 page_content_height,
-            )?;
-            let fresh_page_height = hooks::measure_keep_with_next_group_at(
+                split_first_row,
+            );
+            let fresh_page_height = measure_keep_with_next_group_witnessing(
                 group,
                 measured,
                 |_| 0.0,
                 0.0,
                 page_content_height,
-            )?;
+                split_first_row,
+            );
             let must_advance = hooks::keep_with_next_group_must_advance_from(
                 group_height,
                 fresh_page_height,
@@ -2882,6 +2889,43 @@ mod pagination_rule_tests {
             serde_json::to_string(&incremental.layout).unwrap(),
             serde_json::to_string(&previous.layout).unwrap()
         );
+    }
+
+    #[test]
+    fn a_heading_above_a_table_on_a_page_with_float_bands_keeps_the_whole_row_witness() {
+        let cell_paragraph = json!({
+            "kind": "paragraph", "id": 10,
+            "runs": [{ "kind": "text", "text": "x", "fmt": {} }],
+        });
+        let lines: Vec<_> = [25.0, 25.0, 20.0, 20.0].into_iter().map(line).collect();
+        let table = json!({
+            "block": {
+                "kind": "table", "id": 3,
+                "rows": [{ "id": 20, "cells": [{ "id": 30, "blocks": [cell_paragraph] }] }],
+                "columnWidths": [100],
+            },
+            "measure": {
+                "kind": "table", "columnWidths": [100], "totalWidth": 100, "totalHeight": 90,
+                "rows": [{ "height": 90, "cells": [{ "width": 100, "height": 90, "blocks": [
+                    { "kind": "paragraph", "lines": lines, "totalHeight": 90 }
+                ] }] }],
+            },
+        });
+        let mut value = input(vec![
+            paragraph(1, 1, 5.0, json!({})),
+            paragraph(2, 1, 15.0, json!({ "keepNext": true })),
+            table,
+        ]);
+        value.options.section_page_float_bands = Some(
+            serde_json::from_value(json!([{"default": [{"top": 60, "bottom": 65}]}])).unwrap(),
+        );
+        let result = layout_document(&mut value).unwrap();
+        assert_eq!(result.pages.len(), 2);
+        assert!(result.pages[0].fragments.iter().any(|fragment| matches!(
+            fragment,
+            Fragment::Paragraph(p)
+                if matches!(p.block_id, crate::types::BlockId::Num(value) if value == 2.0)
+        )));
     }
 
     fn oversized_cant_split_table() -> serde_json::Value {
