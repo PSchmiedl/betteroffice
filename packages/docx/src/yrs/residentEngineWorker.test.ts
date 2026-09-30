@@ -114,6 +114,10 @@ function worker() {
       setPartialDocument() {},
       clearFonts() {},
       layoutDocumentJson() {},
+      layoutDocumentWithRegionsRetained() {},
+      retainedHeadersFootersJson(): string | undefined {
+        return undefined;
+      },
       onUpdate() {
         return () => {};
       },
@@ -476,8 +480,14 @@ describe('resident worker layout ownership', () => {
       notesConverged: true,
     });
     let epoch = 0;
+    const layouts: string[] = [];
     Object.assign(w.harness.session, {
-      layoutDocumentWithRegionsRetainedJson: () => layoutJson,
+      layoutDocumentWithRegionsRetainedJson: () => {
+        layouts.push('reply');
+        return layoutJson;
+      },
+      layoutDocumentWithRegionsRetained: () => layouts.push('retained'),
+      retainedHeadersFootersJson: () => JSON.stringify({ parts: [] }),
       residentCaretSnapshot: () => ({ frameEpoch: epoch, caretRect: null }),
       buildDisplayListFrame: (input: string) => {
         extras.push(input);
@@ -531,6 +541,7 @@ describe('resident worker layout ownership', () => {
     });
     expect(plain.ok && plain.layoutJson).toBeUndefined();
     expect(extras.at(-1)).toBe('given');
+    expect(layouts).toEqual(['reply', 'retained']);
   });
 
   test('marks a replica as a preview or not before it lays it out', async () => {
@@ -539,10 +550,7 @@ describe('resident worker layout ownership', () => {
     Object.assign(w.harness.session, {
       loadState: () => calls.push('load'),
       setPartialDocument: (partial: boolean) => calls.push(`partial:${partial}`),
-      layoutDocumentWithRegionsRetainedJson: () => {
-        calls.push('layout');
-        return JSON.stringify({ layout: { pages: [] }, notesConverged: true });
-      },
+      layoutDocumentWithRegionsRetained: () => calls.push('layout'),
     });
     const snapshot = {
       clientId: 1,
@@ -579,6 +587,7 @@ describe('resident worker layout ownership', () => {
     let epoch = 0;
     const provisional = '{"layout":{"pages":[1]},"notesConverged":true,"provisional":true}';
     const full = '{"layout":{"pages":[1,2]},"notesConverged":true}';
+    let headersFooters = '{"parts":["full"]}';
     Object.assign(w.harness.session, {
       layoutDocumentWithRegionsPrefixRetainedJson: (_input: string, pages: number) => {
         calls.push(`prefix:${pages}`);
@@ -588,6 +597,7 @@ describe('resident worker layout ownership', () => {
         calls.push('full');
         return full;
       },
+      retainedHeadersFootersJson: () => headersFooters,
       residentCaretSnapshot: () => ({ frameEpoch: epoch, caretRect: null }),
       buildDisplayListFrame: (input: string) => {
         extras.push(input);
@@ -649,9 +659,49 @@ describe('resident worker layout ownership', () => {
     });
     await w.send({ type: 'buildFrame', extras: 'given', expectedFrameEpoch: 3, paintCaret: false });
     expect(calls.slice(2)).toEqual(['prefix:3', 'full']);
+    // A later edit changes what the session retains; the completed layout's reply keeps its own.
+    headersFooters = '{"parts":["edited"]}';
     const late = await w.send({ type: 'completeLayout', expectedFrameEpoch: 4, paintCaret: false });
     expect(late.ok && late.layoutJson).toBe(full);
+    expect(extras.at(-1)).toBe('{"headersFooters":{"parts":["full"]}}');
     expect(calls).toHaveLength(4);
+
+    await w.send({
+      type: 'bootstrap',
+      expectedFrameEpoch: 0,
+      extras: '',
+      snapshot,
+      layoutExtras: '{}',
+      provisionalPages: 3,
+    });
+    Object.assign(w.harness.session, {
+      setSelection: () => {},
+      applyInput: (_text: string, expected: number) => {
+        calls.push('input');
+        const session = w.harness.session as unknown as {
+          buildDisplayListFrame: (input: string, expected: number) => Uint8Array;
+        };
+        return session.buildDisplayListFrame('input', expected);
+      },
+    });
+    // A header caret needs no body caret geometry from the stub.
+    const loc = { story: 'header1', paraId: '1', offset: 0 };
+    const selection = { anchor: loc, head: loc };
+    await w.send({
+      type: 'applyInput',
+      text: 'x',
+      selection,
+      expectedFrameEpoch: epoch,
+      profile: false,
+      paintCaret: false,
+    });
+    expect(calls.slice(4)).toEqual(['prefix:3', 'full', 'input']);
+    // The edit re-paginated: a completion built now would pair its cached headers with the new pages.
+    const framesBefore = extras.length;
+    const afterEdit = await w.send({ type: 'completeLayout', expectedFrameEpoch: epoch, paintCaret: false });
+    expect(afterEdit.ok && afterEdit.frame).toBeUndefined();
+    expect(afterEdit.ok && afterEdit.layoutJson).toBeUndefined();
+    expect(extras).toHaveLength(framesBefore);
   });
 });
 
