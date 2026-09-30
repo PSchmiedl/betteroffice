@@ -1471,6 +1471,10 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
     // header/footer double-clicks, word/paragraph multi-click, and
     // right-click → host context-menu.
     const {
+      applyPendingSelection,
+      bumpInputEpoch,
+      handleEditorKeyDown,
+      inputEpoch,
       handlePagesContextMenu,
       handleTableInsertClick,
       tableInsertButton,
@@ -1486,6 +1490,10 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
       applyYrsCommand,
       syncYrsInputState,
       readOnly,
+      replicaPending: () =>
+        yrsCore.hydrateOnDemand && !(yrsCore.replicaReadyRef?.current ?? yrsCore.replicaReady),
+      replicaReady: yrsCore.replicaReady,
+      requestReplica: yrsCore.requestReplica,
       partEdit,
       displayListQueries,
       canvasHostRef,
@@ -1568,6 +1576,7 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
      */
     const handleKeyDown = useCallback(
       (e: React.KeyboardEvent) => {
+        handleEditorKeyDown(e);
         if (readOnly) return;
         // The hidden textarea owns every keyboard/IME event for both body and
         // header/footer roots. Do not re-interpret its bubbled events.
@@ -1603,7 +1612,13 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
           if (sc) sc.scrollTop = sc.scrollHeight;
         }
       },
-      [cancelPendingScrollRestore, readOnly, getScrollContainer, focusBodyInput]
+      [
+        handleEditorKeyDown,
+        cancelPendingScrollRestore,
+        readOnly,
+        getScrollContainer,
+        focusBodyInput,
+      ]
     );
 
     /**
@@ -1827,6 +1842,9 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
 
     // Imperative-handle setup — exposes PagedEditorRef + mirrors via onReady.
     usePagedEditorRefApi({
+      bumpInputEpoch,
+      inputEpoch,
+      readerSurface: getScrollContainer,
       ref,
       yrsInputRef,
       layout,
@@ -1865,6 +1883,7 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
     });
 
     usePagedEditorCommandBridge({
+      bumpInputEpoch,
       bridgeRef: commandBridgeRef,
       experimentalWorkerOpen: yrsCore.experimentalWorkerOpen,
       yrsInputRef,
@@ -1930,6 +1949,10 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
           enabled
           readOnly={readOnly || (!!partEdit && activeYrsRootStory === 'body')}
           replicaReadyRef={yrsCore.experimentalWorkerOpen ? yrsCore.replicaReadyRef : undefined}
+          requestReplica={yrsCore.hydrateOnDemand ? yrsCore.requestReplica : undefined}
+          inputEpoch={inputEpoch}
+          applyPendingSelection={applyPendingSelection}
+          seedSelection={!yrsCore.hydrateOnDemand}
           session={yrsCore.session}
           story={activeYrsRootStory}
           isSuggesting={isSuggesting}
