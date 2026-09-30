@@ -5,6 +5,7 @@ import {
   createResidentEngineSession,
   type ResidentEngineSession,
 } from './residentEngineSession';
+import { preloadEditWasm } from './wasm/index';
 import {
   presentOffscreenPageBackBuffer,
   presentOffscreenPageBackBufferWithCaret,
@@ -142,6 +143,20 @@ function trapped(id: number, error: WebAssembly.RuntimeError): void {
 }
 
 async function handle(request: ResidentEngineWorkerRequest): Promise<void> {
+  if (request.type === 'warm') {
+    try {
+      await preloadEditWasm();
+      reply({ id: request.id, ok: true });
+    } catch (error) {
+      // No session exists yet, so a failed load is retried by the next request.
+      reply({
+        id: request.id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return;
+  }
   if (request.type === 'destroy') {
     destroySession();
     return;
