@@ -1334,6 +1334,7 @@ fn layout_paragraph(
         }
 
         let remaining_after = lines.len() - (current_line_index + fitting_lines);
+        let mut pushed_widow = false;
         if widow_control && remaining_after > 0 {
             if current_line_index == 0 && fitting_lines == 1 {
                 let capacity = paginator.get_column_capacity();
@@ -1363,6 +1364,15 @@ fn layout_paragraph(
             }
             if remaining_after == 1 && fitting_lines > 2 {
                 fitting_lines -= 1;
+                // at a float band the space below it still takes the line, and
+                // balancing chose its column depth with the line kept here
+                let tail: f64 = lines[current_line_index + fitting_lines..]
+                    .iter()
+                    .map(|line| line.line_height + line.float_skip_before.unwrap_or(0.0))
+                    .sum();
+                pushed_widow = !has_float_bands
+                    && !paginator.balances_region()
+                    && tail <= paginator.get_column_capacity();
                 let removed = &lines[current_line_index + fitting_lines];
                 lines_height -= removed.line_height + removed.float_skip_before.unwrap_or(0.0);
             }
@@ -1408,8 +1418,11 @@ fn layout_paragraph(
 
         current_line_index += fitting_lines;
 
-        // leftover lines: move the pen to a column/page with room for the next
-        if current_line_index < lines.len() {
+        // leftover lines: move the pen to a column/page with room for the next;
+        // a line widow control pushed down still fits here, so break anyway
+        if pushed_widow {
+            paginator.advance_for_overflow();
+        } else if current_line_index < lines.len() {
             paginator.ensure_fits(lines[current_line_index].line_height);
         }
     }
@@ -2936,6 +2949,54 @@ mod pagination_rule_tests {
             })
             .collect();
         assert_eq!(second_page_lines, vec![(0, 4)]);
+    }
+
+    #[test]
+    fn widow_control_carries_the_pushed_line_to_the_next_page() {
+        for (preceding_height, lines, expected) in [
+            (40.0, 4, vec![(0, 0, 2), (1, 2, 4)]),
+            (20.0, 5, vec![(0, 0, 3), (1, 3, 5)]),
+        ] {
+            let result = layout(vec![
+                paragraph(1, 1, preceding_height, json!({})),
+                paragraph(2, lines, 20.0, json!({})),
+            ]);
+            assert_eq!(paragraph_slices(&result, 2.0), expected);
+        }
+    }
+
+    #[test]
+    fn widow_control_keeps_the_pushed_line_when_the_last_two_cannot_share_a_page() {
+        let mut block = paragraph(1, 4, 20.0, json!({}));
+        block["measure"]["lines"][3]["lineHeight"] = json!(90.0);
+        let result = layout(vec![block]);
+        assert_eq!(result.pages.len(), 2);
+    }
+
+    #[test]
+    fn widow_control_keeps_the_pushed_line_above_a_float_band_on_its_page() {
+        let mut value = input(vec![paragraph(1, 4, 20.0, json!({}))]);
+        value.options.page_size = Some(crate::types::Size { w: 200.0, h: 220.0 });
+        value.options.section_page_float_bands = Some(
+            serde_json::from_value(json!([{"default": [{"top": 70, "bottom": 90}]}])).unwrap(),
+        );
+        let result = layout_document(&mut value).unwrap();
+        assert_eq!(result.pages.len(), 1);
+    }
+
+    #[test]
+    fn widow_control_in_balanced_columns_keeps_the_section_on_one_page() {
+        let mut value = input(vec![
+            paragraph(1, 4, 20.0, json!({})),
+            paragraph(2, 5, 20.0, json!({})),
+            paragraph(3, 4, 20.0, json!({})),
+            paragraph(4, 5, 20.0, json!({})),
+        ]);
+        value.options.page_size = Some(crate::types::Size { w: 500.0, h: 320.0 });
+        value.options.columns =
+            Some(serde_json::from_value(json!({"count": 3, "gap": 20})).unwrap());
+        let result = layout_document(&mut value).unwrap();
+        assert_eq!(result.pages.len(), 1);
     }
 
     fn paragraph_slices(layout: &Layout, id: f64) -> Vec<(usize, usize, usize)> {
