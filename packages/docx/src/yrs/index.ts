@@ -88,6 +88,7 @@ export {
   takePreloadedResidentEngineWorker,
   type ResidentEngineWorkerApplyResult,
   type ResidentEngineWorkerFrame,
+  type ResidentEngineWorkerOpened,
   type ResidentEngineOffscreenPage,
 } from './residentEngineWorkerClient';
 export { preloadDocxEngine } from './preloadDocxEngine';
