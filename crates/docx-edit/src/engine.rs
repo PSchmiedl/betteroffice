@@ -47,6 +47,8 @@ use crate::structured::{
 struct LoweredStory {
     doc_epoch: u64,
     env: RenderEnv,
+    /// The document's media sources the lowering read.
+    media: crate::media::MediaSources,
     /// Shared so a reader can hold the lowering it asked for without the cache
     /// borrow, and without copying the story.
     blocks: Rc<Vec<LayoutBlock>>,
@@ -1505,7 +1507,11 @@ impl EngineSession {
             .borrow()
             .stories
             .get(story)
-            .is_some_and(|cached| cached.doc_epoch == epoch && cached.env == *env)
+            .is_some_and(|cached| {
+                cached.doc_epoch == epoch
+                    && cached.env == *env
+                    && cached.media == self.doc.media_sources()
+            })
     }
 
     fn lower_story_into_cache(
@@ -1522,6 +1528,7 @@ impl EngineSession {
             LoweredStory {
                 doc_epoch: epoch,
                 env: env.clone(),
+                media: self.doc.media_sources(),
                 blocks: Rc::new(blocks),
                 map: Rc::new(map),
                 serialized_blocks: None,
@@ -7010,7 +7017,7 @@ mod tests {
                 "defaults": { "fontSize": 11, "fontFamily": "Liberation Sans" },
                 "authoritativeShaping": true
             },
-            "renderEnv": {}
+            "renderEnv": { "mediaTokens": true }
         })
         .to_string();
         let extras =
@@ -7022,7 +7029,7 @@ mod tests {
                 .unwrap()
         };
         let full = EngineSession::new(312);
-        crate::seed::seed_from_docx(full.doc(), &bytes).unwrap();
+        crate::seed::seed_with_layout_tokens(full.doc(), &bytes).unwrap();
         full.layout_document_with_regions_retained_json(&request)
             .unwrap();
         let preview = EngineSession::new(312);
@@ -7031,12 +7038,13 @@ mod tests {
             .layout_document_with_regions_prefix_retained_json(&request, 3)
             .unwrap();
         let page = first_page(&preview);
-        assert!(
-            serde_json::to_string(&page)
-                .unwrap()
-                .contains("data:image/png;base64,")
-        );
+        let painted = serde_json::to_string(&page).unwrap();
+        assert!(painted.contains(r#""media:0""#) && !painted.contains("data:"));
         assert_eq!(page, first_page(&full));
+        assert_eq!(
+            preview.doc().media_table().unwrap().bytes(0).unwrap(),
+            full.doc().media_table().unwrap().bytes(0).unwrap()
+        );
         docx_layout::clear_measure_fonts();
     }
 
