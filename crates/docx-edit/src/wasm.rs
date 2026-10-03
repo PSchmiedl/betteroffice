@@ -105,6 +105,22 @@ fn validate_frame_epoch(epoch: f64) -> Result<u64, JsValue> {
     Ok(epoch as u64)
 }
 
+/// `{"revisionId", "range"}` for a text edit's receipt.
+fn text_receipt_json(receipt: crate::Receipt) -> String {
+    let range = receipt.range.map(|range| {
+        json!({
+            "story": range.start.story,
+            "start": { "paraId": range.start.para, "offset": range.start.offset },
+            "end": { "paraId": range.end.para, "offset": range.end.offset },
+        })
+    });
+    json!({
+        "revisionId": receipt.revision_ids.into_iter().next(),
+        "range": range,
+    })
+    .to_string()
+}
+
 fn js_err(error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&error.to_string())
 }
@@ -296,6 +312,7 @@ fn embed_at(doc: &EditingDoc, story: &str, index: u32) -> Result<bool, JsValue> 
 /// Per-peer selection state. These sticky positions are deliberately held
 /// outside the yrs document: an awareness transport may publish them, but they
 /// are never serialized as document content or included in save updates.
+#[derive(Clone)]
 struct LocalSelection {
     story: String,
     anchor: StickyIndex,
@@ -1941,7 +1958,7 @@ impl EditSession {
             ));
         }
 
-        let selection = self.selection.borrow();
+        let selection = self.selection.borrow().clone();
         let selection = selection
             .as_ref()
             .ok_or_else(|| js_err("apply_input requires a resident selection"))?;
@@ -1970,9 +1987,11 @@ impl EditSession {
             ));
         }
 
-        self.engine
+        let receipt = self
+            .engine
             .edit_resident_text(StoryRange::new(&story, head, head), Some(text), true)
             .map_err(js_err)?;
+        self.settle_snapped_input(&story, &loc, &receipt)?;
         self.engine
             .apply_and_layout(&story, expected_frame_epoch as u64)
             .map_err(js_err)
@@ -2005,7 +2024,7 @@ impl EditSession {
         }
 
         let started = performance_now();
-        let selection = self.selection.borrow();
+        let selection = self.selection.borrow().clone();
         let selection = selection
             .as_ref()
             .ok_or_else(|| js_err("apply_input requires a resident selection"))?;
@@ -2036,9 +2055,11 @@ impl EditSession {
         let selection_ms = performance_now() - started;
 
         let started = performance_now();
-        self.engine
+        let receipt = self
+            .engine
             .edit_resident_text(StoryRange::new(&story, head, head), Some(text), true)
             .map_err(js_err)?;
+        self.settle_snapped_input(&story, &loc, &receipt)?;
         let edit_ms = performance_now() - started;
         let (frame, engine_profile) = self
             .engine
@@ -2686,6 +2707,34 @@ impl EditSession {
     ) -> Result<(), JsValue> {
         let anchor_index = loc_index(self.engine.doc(), story, anchor_para, anchor_offset)?;
         let head_index = loc_index(self.engine.doc(), story, head_para, head_offset)?;
+        self.select_indexes(story, anchor_index, head_index)
+    }
+
+    /// Typing with the caret inside a surrogate pair lands before the pair,
+    /// while the sticky head stays inside it: collapse the selection after the
+    /// inserted text instead.
+    fn settle_snapped_input(
+        &self,
+        story: &str,
+        requested: &IndexedLoc,
+        receipt: &crate::Receipt,
+    ) -> Result<(), JsValue> {
+        let Some(range) = receipt.range.as_ref() else {
+            return Ok(());
+        };
+        if range.start.para == requested.para_id && range.start.offset == requested.offset {
+            return Ok(());
+        }
+        let end = self.engine.doc().locate_range(range).map_err(js_err)?.end;
+        self.select_indexes(story, end, end)
+    }
+
+    fn select_indexes(
+        &self,
+        story: &str,
+        anchor_index: u32,
+        head_index: u32,
+    ) -> Result<(), JsValue> {
         let txn = self.engine.doc().yrs_doc().transact();
         let text = story_ref(&txn, story).map_err(js_err)?;
         let anchor = text
@@ -3174,10 +3223,10 @@ impl EditSession {
 
     /// Inserts `text` at `(story, para_id, offset)`. It must contain no
     /// paragraph or line breaks, and it inherits the formatting at the
-    /// insertion point. Receipt: `{"revisionId": string|null}` — non-null in
-    /// suggesting mode, where the text is stamped `ins` and coalesces into an
-    /// adjacent insertion by the same author rather than opening a second
-    /// revision.
+    /// insertion point. Receipt: `{"revisionId": string|null, "range"}` —
+    /// the id is non-null in suggesting mode, where the text is stamped `ins`
+    /// and coalesces into an adjacent insertion by the same author rather than
+    /// opening a second revision; the range is where the text landed.
     pub fn insert_text(
         &self,
         story: &str,
@@ -3194,13 +3243,14 @@ impl EditSession {
             .doc()
             .insert_text(&ctx, Position::new(story, at), text, FormatPolicy::Inherit)
             .map_err(js_err)?;
-        Ok(json!({ "revisionId": receipt.revision_ids.into_iter().next() }).to_string())
+        Ok(text_receipt_json(receipt))
     }
 
     /// Deletes `[start, end)`. Because a range crossing a paragraph boundary
     /// includes the boundary pilcrow, a plain delete also merges those
     /// paragraphs. Suggesting mode removes nothing and stamps the content
-    /// `del` instead. Receipt: `{"revisionId": string|null}`.
+    /// `del` instead. Receipt: `{"revisionId": string|null, "range"}`, the
+    /// range being what the delete left.
     #[allow(clippy::too_many_arguments)]
     pub fn delete_range(
         &self,
@@ -3220,7 +3270,7 @@ impl EditSession {
             .doc()
             .delete_range(&ctx, StoryRange::new(story, start, end))
             .map_err(js_err)?;
-        Ok(json!({ "revisionId": receipt.revision_ids.into_iter().next() }).to_string())
+        Ok(text_receipt_json(receipt))
     }
 
     /// Replaces `[start, end)` with `text` in one transaction. The inserted
@@ -3247,18 +3297,7 @@ impl EditSession {
             .doc()
             .replace_range(&ctx, StoryRange::new(story, start, end), text)
             .map_err(js_err)?;
-        let range = receipt.range.map(|range| {
-            json!({
-                "story": range.start.story,
-                "start": { "paraId": range.start.para, "offset": range.start.offset },
-                "end": { "paraId": range.end.para, "offset": range.end.offset },
-            })
-        });
-        Ok(json!({
-            "revisionId": receipt.revision_ids.into_iter().next(),
-            "range": range,
-        })
-        .to_string())
+        Ok(text_receipt_json(receipt))
     }
 
     /// Splits a paragraph at `(story, para_id, offset)` by inserting one
@@ -3512,8 +3551,8 @@ impl EditSession {
     /// Inserts one inline image embed at `(story, para_id, offset)`.
     /// `payload_json` is the image's authored payload object, stored as given.
     /// The embed occupies one story unit. Receipt:
-    /// `{"revisionId": string|null}`. Errors when the payload is not an
-    /// object.
+    /// `{"revisionId": string|null, "range"}`, the range being where the image
+    /// landed. Errors when the payload is not an object.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_image(
         &self,
@@ -3542,7 +3581,7 @@ impl EditSession {
                     .collect(),
             )
             .map_err(js_err)?;
-        Ok(json!({ "revisionId": receipt.revision_ids.into_iter().next() }).to_string())
+        Ok(text_receipt_json(receipt))
     }
 
     /// Sets the authored `value` (any JSON) on the content-control embed
@@ -6057,6 +6096,99 @@ mod tests {
 
         let paragraphs = session.engine.doc().paragraphs("body").unwrap();
         assert_eq!(paragraphs[1].text, "ABCD");
+    }
+
+    fn resident_surrogate_session(client_id: f64) -> EditSession {
+        let session = EditSession::new(client_id).unwrap();
+        let doc = session.engine.doc();
+        doc.create_story_with_paragraph_id("body", "p0", "a😀b", "Normal", "left")
+            .unwrap();
+        doc.split_paragraph(&EditCtx::local("", ""), Position::new("body", 3), None)
+            .unwrap();
+        let font_id = session
+            .register_measure_font(include_bytes!(
+                "../../ooxml-text/tests/fonts/LiberationSans-Regular.ttf"
+            ))
+            .unwrap();
+        let request = json!({
+            "bodyStory": "body",
+            "regions": {"sections": [{
+                "sectionId": "main",
+                "properties": {
+                    "pageWidth": 4320,
+                    "pageHeight": 2880,
+                    "marginTop": 300,
+                    "marginRight": 300,
+                    "marginBottom": 300,
+                    "marginLeft": 300
+                }
+            }]},
+            "measurement": {
+                "fontChains": {"calibri|0|0": [font_id]},
+                "defaults": {"fontSize": 11, "fontFamily": "Calibri"},
+                "authoritativeShaping": true
+            },
+            "renderEnv": {}
+        });
+        session
+            .layout_document_with_regions_json(&request.to_string())
+            .unwrap();
+        session
+            .build_display_list_frame(
+                &json!({"fontChains": {"calibri|0|0": [font_id]}}).to_string(),
+                0.0,
+            )
+            .unwrap();
+        session.set_selection("body", "p0", 2, "p0", 2).unwrap();
+        assert_eq!(
+            session.collapsed_resident_input_selection().unwrap(),
+            ("body".into(), "p0".into(), 2)
+        );
+        session
+    }
+
+    #[track_caller]
+    fn assert_resident_surrogate_texts(session: &EditSession, expected: &[&str]) {
+        let texts = |doc: &EditingDoc| {
+            doc.paragraphs("body")
+                .unwrap()
+                .into_iter()
+                .map(|paragraph| paragraph.text)
+                .collect::<Vec<_>>()
+        };
+        let doc = session.engine.doc();
+        assert_eq!(texts(doc), expected);
+        let peer = EditingDoc::new(99);
+        peer.apply_update_v1(&doc.encode_state_as_update_v1())
+            .unwrap();
+        assert_eq!(texts(&peer), texts(doc));
+    }
+
+    #[test]
+    fn resident_backspace_inside_a_surrogate_pair_deletes_the_whole_emoji() {
+        let session = resident_surrogate_session(23.0);
+        session.delete_resident_units("backward", 1).unwrap();
+        assert_resident_surrogate_texts(&session, &["a", "b"]);
+    }
+
+    #[test]
+    fn resident_forward_delete_inside_a_surrogate_pair_deletes_the_whole_emoji() {
+        let session = resident_surrogate_session(24.0);
+        session.delete_resident_units("forward", 1).unwrap();
+        assert_resident_surrogate_texts(&session, &["a", "b"]);
+    }
+
+    #[test]
+    fn resident_typing_inside_a_surrogate_pair_lands_before_the_emoji() {
+        let session = resident_surrogate_session(25.0);
+        session.apply_input("x", 1.0).unwrap();
+        assert_resident_surrogate_texts(&session, &["ax😀", "b"]);
+        assert_eq!(
+            session.collapsed_resident_input_selection().unwrap(),
+            ("body".into(), "p0".into(), 2)
+        );
+        session.delete_resident_units("backward", 1).unwrap();
+        assert_resident_surrogate_texts(&session, &["a😀", "b"]);
     }
 
     #[test]

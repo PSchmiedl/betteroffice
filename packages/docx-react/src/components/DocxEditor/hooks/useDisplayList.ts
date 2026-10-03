@@ -1212,6 +1212,13 @@ export function useRustDisplayList(
         }
         const nextFrame = applyFrameDeltaOwned(previous.frame, delta);
         mainFrameRef.current = null;
+        // Typing moved off the middle of a surrogate pair leaves this peer's sticky caret inside it.
+        const settled = result.selectionCursor
+          ? worker.engine.resolveSelection(result.selectionCursor)
+          : null;
+        if (settled && !sameYrsSelection(settled, worker.engine.selection())) {
+          worker.engine.setSelection(settled.anchor, settled.head);
+        }
         const caret = residentCaretForSelection(
           result.caret,
           result.selection,
