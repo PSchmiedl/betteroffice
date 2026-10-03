@@ -49,6 +49,8 @@ import {
   type DisplayListQueries,
   type DisplayListRect,
 } from '@betteroffice/docx/layout/render';
+import type { DocxFindDisplayMatch } from '@betteroffice/docx/yrs';
+import type { FindOptions } from '@betteroffice/docx/utils/findReplace';
 import type { ParagraphHighlightOptions, ScrollToParaIdOptions } from '@betteroffice/docx/utils';
 
 // Layout bridge
@@ -154,7 +156,7 @@ import {
   ViewerPointPositions,
 } from './internals/pointPosition';
 import { isPresented, onPresented, presentedWorkerVersion } from './internals/layoutProvenance';
-import { navigateViewer, readViewerSelectionInfo, type ViewerNavigationTarget } from './internals/viewerRefReads';
+import { navigateViewer, readViewerFindMatches, readViewerSelectionInfo, type ViewerNavigationTarget } from './internals/viewerRefReads';
 import type { DocxSelectionInfo } from '../DocxEditor';
 import { readAt } from './internals/viewerReads';
 
@@ -427,6 +429,10 @@ export interface PagedEditorRef {
   isWorkerViewer(): boolean;
   /** Reads the display selection from the worker. */
   readViewerSelectionInfo(): Promise<DocxSelectionInfo | null>;
+  readViewerFindMatches(
+    searchText: string,
+    options: FindOptions
+  ): Promise<{ version: string; matches: DocxFindDisplayMatch[] } | null>;
   /** Resolves, selects and reveals a worker-owned range. */
   navigateViewer(target: ViewerNavigationTarget, options?: ScrollToParaIdOptions): Promise<boolean>;
 
@@ -1998,6 +2004,10 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
     };
 
     usePagedEditorRefApi({
+      readViewerFindMatches: async (searchText, options) => {
+        const access = viewerReadAccess();
+        return access ? readViewerFindMatches(access, searchText, options) : null;
+      },
       readViewerSelectionInfo: async () => {
         const access = viewerReadAccess();
         return access ? readViewerSelectionInfo(access) : null;
