@@ -33,6 +33,7 @@ import type {
 } from './paragraphIdentity';
 import type { DocxFindTextRequest, DocxFindTextResult, DocxReadParagraphsRequest, DocxReadParagraphsResult } from './edits';
 import type { ProposalGeometryMirror, resolveNavigationTarget } from './proposalGeometry';
+import type { DocxPageExportOptions } from './pagedExport';
 
 /** @internal */
 export interface ResidentEngineWorkerFontSync {
@@ -59,6 +60,7 @@ export interface ResidentProposalResponse {
 
 /** @internal */
 export type ResidentDocumentRead =
+  | { kind: 'exportStructuredWithPages'; options: DocxPageExportOptions; currentRequest: string }
   | { kind: 'paragraphIdentities' }
   | { kind: 'resolveParagraphAnchors'; anchors: DocxParagraphAnchor[] }
   | { kind: 'readParagraphs'; request: DocxReadParagraphsRequest }
@@ -84,6 +86,7 @@ export type ResidentDocumentRead =
 
 /** @internal */
 export interface ResidentDocumentReadValues {
+  exportStructuredWithPages: string;
   paragraphIdentities: DocxParagraphIdentitySnapshot;
   resolveParagraphAnchors: { results: DocxParagraphAnchorResult[] };
   readParagraphs: DocxReadParagraphsResult;

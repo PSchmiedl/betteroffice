@@ -575,6 +575,9 @@ async function handle(request: ResidentEngineWorkerRequest): Promise<void> {
     }
     let value: unknown;
     switch (request.read.kind) {
+      case 'exportStructuredWithPages':
+        value = session.exportStructuredWithPagesJson(request.read.options, request.read.currentRequest);
+        break;
       case 'paragraphIdentities':
         value = session.paragraphIdentities();
         break;
