@@ -15,6 +15,7 @@
  */
 
 import type { EditSession } from './wasm/index';
+import type { ResidentEngineWorkerFontSync } from './residentEngineWorkerProtocol';
 import type { Document } from '../types/document';
 import type { CompatibilityFlags } from '../docx/settingsParser';
 import { resolveCommentMedia } from './hostMedia';
@@ -677,7 +678,7 @@ export type YrsResidentFontRegistration =
   | Uint8Array
   | { substituteOf: number; family: string };
 
-export interface YrsResidentWorkerSnapshot {
+export interface YrsResidentWorkerSnapshot extends ResidentEngineWorkerFontSync {
   /** @internal */
   workerAuthoritative?: true;
   clientId: number;
@@ -685,8 +686,7 @@ export interface YrsResidentWorkerSnapshot {
    * the worker's known vector — both apply through the same merge path. */
   state: Uint8Array;
   selection: YrsSelection | null;
-  /** Empty when the caller declared the worker's fonts current
-   * (`knownFontsRevision` matches); the worker then keeps its registrations. */
+  /** Full registrations, or a possibly empty suffix after `fontsBaseRevision`. */
   fonts: YrsResidentFontRegistration[];
   /** Monotonic revision of the resident font set (bumped by register/clear). */
   fontsRevision: number;
@@ -1633,6 +1633,7 @@ function wrapSession(session: EditSession, clientId: number): YrsSession {
     return progress;
   };
   let residentFontsRevision = 0;
+  let residentFontsClearRevision = 0;
   let docxSource: Uint8Array | null = null;
   let docxSourceKeys: ReturnType<typeof editorSaveKeys> | null = null;
 
@@ -1853,7 +1854,6 @@ function wrapSession(session: EditSession, clientId: number): YrsSession {
     },
     registerSubstituteFont: (base, family) => {
       const id = session.register_substitute_measure_font(base, family);
-      if (id === base) return id;
       residentFonts.push({ substituteOf: base, family });
       residentFontsRevision += 1;
       return id;
@@ -1863,6 +1863,7 @@ function wrapSession(session: EditSession, clientId: number): YrsSession {
       residentFonts.length = 0;
       residentMeasureInputs.clear();
       residentFontsRevision += 1;
+      residentFontsClearRevision = residentFontsRevision;
     },
     measureParagraphJson: (input) => {
       const output = session.measure_paragraph_json(input);
@@ -1974,7 +1975,18 @@ function wrapSession(session: EditSession, clientId: number): YrsSession {
       const selectionJson = mirrored ? 'null' : session.selection();
       const mediaSources = mirrored ? undefined : session.media_sources_json();
       const noteSeparators = mirrored ? undefined : session.note_separators_state();
-      const fontsCurrent = options?.knownFontsRevision === residentFontsRevision;
+      const knownFontsRevision = options?.knownFontsRevision;
+      const fontsBaseRevision =
+        knownFontsRevision != null &&
+        Number.isInteger(knownFontsRevision) &&
+        knownFontsRevision >= residentFontsClearRevision &&
+        knownFontsRevision <= residentFontsRevision
+          ? knownFontsRevision
+          : undefined;
+      const fonts =
+        fontsBaseRevision === undefined
+          ? residentFonts
+          : residentFonts.slice(residentFonts.length - (residentFontsRevision - fontsBaseRevision));
       let state: Uint8Array | null = null;
       if (!mirrored && options?.knownStateVector) {
         try {
@@ -1988,12 +2000,9 @@ function wrapSession(session: EditSession, clientId: number): YrsSession {
         ...(mirrored ? { workerAuthoritative: true as const } : {}),
         state: mirrored ? new Uint8Array(0) : (state ?? session.encode_state()),
         selection: JSON.parse(selectionJson) as YrsSelection | null,
-        fonts: fontsCurrent
-          ? []
-          : residentFonts.map((font) =>
-              font instanceof Uint8Array ? font.slice() : { ...font }
-            ),
+        fonts: fonts.map((font) => (font instanceof Uint8Array ? font.slice() : { ...font })),
         fontsRevision: residentFontsRevision,
+        ...(fontsBaseRevision === undefined ? {} : { fontsBaseRevision }),
         renderInputs: [...residentRenderInputs].map(([story, env]) => ({
           story,
           env: structuredClone(env),
