@@ -3146,10 +3146,10 @@ impl BlockRef {
 }
 
 /// Returns the canonical string key for a block identifier.
-fn block_key(id: &Value) -> String {
+fn block_key(id: &Value) -> Cow<'_, str> {
     match id {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
+        Value::String(s) => Cow::Borrowed(s),
+        other => Cow::Owned(other.to_string()),
     }
 }
 
@@ -4986,7 +4986,7 @@ fn build_display_list_selected(
         serde_json::from_value::<RenderOptionsIn>(input.options.clone()).unwrap_or_default();
 
     // Index measured blocks by canonical block key.
-    let mut by_id: HashMap<String, &MeasuredBlockIn> = HashMap::new();
+    let mut by_id: HashMap<Cow<'_, str>, &MeasuredBlockIn> = HashMap::new();
     for mb in &input.measured {
         let key = match &mb.block {
             BlockIn::Paragraph(p) => block_key(&p.id),
@@ -5061,7 +5061,7 @@ fn build_display_list_selected(
                     {
                         continue;
                     }
-                    let Some(measured) = by_id.get(&block_key(&fragment.block_id)) else {
+                    let Some(measured) = by_id.get(block_key(&fragment.block_id).as_ref()) else {
                         continue;
                     };
                     let BlockIn::Paragraph(block) = &measured.block else {
@@ -5081,7 +5081,7 @@ fn build_display_list_selected(
                     }
                 }
                 FragmentIn::Shape(fragment) => {
-                    let Some(measured) = by_id.get(&block_key(&fragment.block_id)) else {
+                    let Some(measured) = by_id.get(block_key(&fragment.block_id).as_ref()) else {
                         continue;
                     };
                     if let BlockIn::Shape(block) = &measured.block
@@ -5113,7 +5113,7 @@ fn build_display_list_selected(
         // Paragraph border grouping uses neighboring fragment borders.
         let para_borders_of = |frag: &FragmentIn| -> Option<ParaBordersIn> {
             if let FragmentIn::Paragraph(p) = frag
-                && let Some(mb) = by_id.get(&block_key(&p.block_id))
+                && let Some(mb) = by_id.get(block_key(&p.block_id).as_ref())
                 && let BlockIn::Paragraph(b) = &mb.block
             {
                 return b.attrs.as_ref().and_then(|a| a.borders.clone());
@@ -5125,7 +5125,7 @@ fn build_display_list_selected(
         for (i, frag) in page.fragments.iter().enumerate() {
             match frag {
                 FragmentIn::Paragraph(pf) => {
-                    let Some(mb) = by_id.get(&block_key(&pf.block_id)) else {
+                    let Some(mb) = by_id.get(block_key(&pf.block_id).as_ref()) else {
                         prev_para_borders = None;
                         continue;
                     };
@@ -5154,7 +5154,7 @@ fn build_display_list_selected(
                 }
                 FragmentIn::Table(tf) => {
                     prev_para_borders = None;
-                    let Some(mb) = by_id.get(&block_key(&tf.block_id)) else {
+                    let Some(mb) = by_id.get(block_key(&tf.block_id).as_ref()) else {
                         continue;
                     };
                     let (BlockIn::Table(block), MeasureIn::Table(measure)) =
@@ -5166,7 +5166,7 @@ fn build_display_list_selected(
                 }
                 FragmentIn::Image(imf) => {
                     prev_para_borders = None;
-                    let block = by_id.get(&block_key(&imf.block_id)).and_then(|mb| {
+                    let block = by_id.get(block_key(&imf.block_id).as_ref()).and_then(|mb| {
                         if let BlockIn::Image(b) = &mb.block {
                             Some(b)
                         } else {
@@ -5203,7 +5203,7 @@ fn build_display_list_selected(
                 }
                 FragmentIn::TextBox(tf) => {
                     prev_para_borders = None;
-                    let Some(mb) = by_id.get(&block_key(&tf.block_id)) else {
+                    let Some(mb) = by_id.get(block_key(&tf.block_id).as_ref()) else {
                         continue;
                     };
                     let (BlockIn::TextBox(block), MeasureIn::TextBox(measure)) =
@@ -5215,7 +5215,7 @@ fn build_display_list_selected(
                 }
                 FragmentIn::Shape(sf) => {
                     prev_para_borders = None;
-                    let Some(mb) = by_id.get(&block_key(&sf.block_id)) else {
+                    let Some(mb) = by_id.get(block_key(&sf.block_id).as_ref()) else {
                         continue;
                     };
                     let BlockIn::Shape(block) = &mb.block else {
@@ -5227,7 +5227,7 @@ fn build_display_list_selected(
                 }
                 FragmentIn::Chart(cf) => {
                     prev_para_borders = None;
-                    let Some(mb) = by_id.get(&block_key(&cf.block_id)) else {
+                    let Some(mb) = by_id.get(block_key(&cf.block_id).as_ref()) else {
                         continue;
                     };
                     let BlockIn::Chart(block) = &mb.block else {
@@ -5246,7 +5246,7 @@ fn build_display_list_selected(
         for frag in &page.fragments {
             if let FragmentIn::Paragraph(pf) = frag
                 && float_paragraphs.insert((block_key(&pf.block_id), pf.x.to_bits()))
-                && let Some(mb) = by_id.get(&block_key(&pf.block_id))
+                && let Some(mb) = by_id.get(block_key(&pf.block_id).as_ref())
                 && let BlockIn::Paragraph(block) = &mb.block
             {
                 emit_paragraph_floating_images(&mut prims, block, pf.y, &float_geom, false);
@@ -9604,8 +9604,8 @@ pub(crate) fn emit_table_fragment(
         };
         if let Some(attrs) = attrs {
             if let Some(inner) = &mut attrs.table {
-                if inner.table_id != table_id && inner.parent_table_id.is_none() {
-                    inner.parent_table_id = Some(table_id.clone());
+                if inner.table_id.as_str() != table_id.as_ref() && inner.parent_table_id.is_none() {
+                    inner.parent_table_id = Some(table_id.clone().into_owned());
                 }
             } else {
                 attrs.table = Some(Box::new(metadata.clone()));
@@ -10738,7 +10738,15 @@ pub fn build_resident_display_list_partial_with_fonts_observed(
         .into_iter()
         .map(|page| (page.page_index as usize, page))
         .collect();
-    let blocks = source_blocks_by_key(pagination);
+    let blocks = source_blocks_by_key(
+        pagination,
+        layout
+            .pages
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !selected.contains(index))
+            .map(|(_, page)| page),
+    );
     let pages = input
         .layout
         .pages
@@ -10825,7 +10833,7 @@ pub fn release_resident_display_pages(
         .collect();
     wanted.sort_unstable();
     wanted.dedup();
-    let blocks = source_blocks_by_key(pagination);
+    let blocks = source_blocks_by_key(pagination, wanted.iter().map(|&index| &layout.pages[index]));
     let replacements = wanted
         .iter()
         .map(|&index| {
@@ -10848,28 +10856,37 @@ pub fn release_resident_display_pages(
 }
 
 fn prune_resident_display_measured(resident: &mut ResidentDisplayInput, list: &DisplayList) {
-    let keys: HashSet<String> = list
+    let keys: HashSet<Cow<'_, str>> = list
         .pages
         .iter()
         .zip(&resident.input.layout.pages)
         .filter(|(page, _)| !page.unbuilt)
-        .flat_map(|(_, page)| page.fragments.iter().filter_map(fragment_block_key))
+        .flat_map(|(_, page)| page.fragments.iter().filter_map(fragment_block_key_ref))
         .collect();
-    resident
-        .input
-        .measured
-        .retain(|measured| measured_block_key(measured).is_some_and(|key| keys.contains(&key)));
+    resident.input.measured.retain(|measured| {
+        measured_block_key(measured).is_some_and(|key| keys.contains(key.as_ref()))
+    });
 }
 
-/// The pagination's rendered measured blocks by key, first occurrence winning
-/// as in [`build_display_list_selected`].
-fn source_blocks_by_key(
-    pagination: &crate::types::Input,
-) -> HashMap<String, &crate::types::MeasuredBlock> {
+/// The affected pages' source blocks by canonical key, first occurrence winning.
+fn source_blocks_by_key<'a, 'b>(
+    pagination: &'a crate::types::Input,
+    pages: impl IntoIterator<Item = &'b crate::types::Page>,
+) -> HashMap<Cow<'a, str>, &'a crate::types::MeasuredBlock> {
+    let mut pending: HashSet<_> = pages
+        .into_iter()
+        .flat_map(|page| &page.fragments)
+        .map(resident_fragment_block_key)
+        .collect();
     let mut blocks = HashMap::new();
     for measured in &pagination.measured {
-        if let Some(key) = resident_block_key(&measured.block) {
-            blocks.entry(key.into_owned()).or_insert(measured);
+        if pending.is_empty() {
+            break;
+        }
+        if let Some(key) = resident_block_key(&measured.block)
+            && pending.remove(key.as_ref())
+        {
+            blocks.insert(key, measured);
         }
     }
     blocks
@@ -10910,7 +10927,7 @@ fn unbuilt_page_with_span(
 /// out-of-range one is an error.
 fn layout_page_position_span(
     page: &crate::types::Page,
-    blocks: &HashMap<String, &crate::types::MeasuredBlock>,
+    blocks: &HashMap<Cow<'_, str>, &crate::types::MeasuredBlock>,
 ) -> Result<Option<[i64; 2]>, String> {
     use crate::types::{Fragment, LayoutBlock, TableRow};
     fn block(block: &LayoutBlock, positions: &mut Vec<Option<f64>>) {
@@ -11000,11 +11017,11 @@ fn resident_build_input_for(
     let layout: LayoutIn = transcoder
         .convert(layout)
         .map_err(|e| format!("parse resident display input: {e}"))?;
-    let placed: Option<HashSet<String>> = pages.map(|pages| {
+    let placed: Option<HashSet<Cow<'_, str>>> = pages.map(|pages| {
         pages
             .iter()
             .filter_map(|&index| layout.pages.get(index))
-            .flat_map(|page| page.fragments.iter().filter_map(fragment_block_key))
+            .flat_map(|page| page.fragments.iter().filter_map(fragment_block_key_ref))
             .collect()
     });
     let measured = pagination
@@ -11018,6 +11035,7 @@ fn resident_build_input_for(
         .map(|measured| transcoder.convert(measured))
         .collect::<Result<Vec<MeasuredBlockIn>, _>>()
         .map_err(|e| format!("parse resident display input: {e}"))?;
+    drop(placed);
     let options = transcoder
         .convert(&pagination.options)
         .map_err(|e| format!("parse resident display input: {e}"))?;
@@ -11216,10 +11234,87 @@ pub fn update_resident_display_list_incremental_partial_with_fonts_observed(
     build: &dyn Fn(usize) -> bool,
     observe_phase: &mut impl FnMut(),
 ) -> Result<bool, String> {
+    update_resident_display_list_incremental_partial_with_fonts_shifts(
+        pagination,
+        layout,
+        fonts,
+        resident,
+        previous,
+        rebuilt_page_start,
+        rebuilt_page_end,
+        extra_pages,
+        position_deltas,
+        build,
+        observe_phase,
+    )
+    .map(|result| result.is_some())
+}
+
+/// A contiguous range of retained pages shifted by one position delta.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DisplayShiftRun {
+    pub start: usize,
+    pub end: usize,
+    pub delta: i64,
+}
+
+/// Position changes on retained pages after an incremental display update.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct IncrementalDisplayShifts {
+    pub runs: Vec<DisplayShiftRun>,
+    pub mixed: Vec<usize>,
+}
+
+impl IncrementalDisplayShifts {
+    /// Appends a page's shift, coalescing adjacent uniform and inert pages.
+    fn push(&mut self, index: usize, shift: DisplayShift) {
+        match shift {
+            DisplayShift::Uniform(delta) => {
+                if let Some(last) = self.runs.last_mut()
+                    && last.end == index
+                    && last.delta == delta
+                {
+                    last.end = index + 1;
+                } else {
+                    self.runs.push(DisplayShiftRun {
+                        start: index,
+                        end: index + 1,
+                        delta,
+                    });
+                }
+            }
+            DisplayShift::Inert => {
+                if let Some(last) = self.runs.last_mut()
+                    && last.end == index
+                {
+                    last.end = index + 1;
+                }
+            }
+            DisplayShift::Mixed => self.mixed.push(index),
+            DisplayShift::Unchanged => {}
+        }
+    }
+}
+
+/// Updates selected pages and reports position shifts on retained suffix pages.
+#[allow(clippy::too_many_arguments)]
+pub fn update_resident_display_list_incremental_partial_with_fonts_shifts(
+    pagination: &crate::types::Input,
+    layout: &crate::types::Layout,
+    fonts: &ooxml_text::FontStore,
+    resident: &mut ResidentDisplayInput,
+    previous: &mut DisplayList,
+    rebuilt_page_start: usize,
+    rebuilt_page_end: usize,
+    extra_pages: &[usize],
+    position_deltas: &HashMap<String, i64>,
+    build: &dyn Fn(usize) -> bool,
+    observe_phase: &mut impl FnMut(),
+) -> Result<Option<IncrementalDisplayShifts>, String> {
     if previous.pages.len() != layout.pages.len()
         || resident.input.layout.pages.len() != layout.pages.len()
     {
-        return Ok(false);
+        return Ok(None);
     }
     if rebuilt_page_start > rebuilt_page_end
         || rebuilt_page_end > layout.pages.len()
@@ -11255,7 +11350,12 @@ pub fn update_resident_display_list_incremental_partial_with_fonts_observed(
         previous.pages[page_index] = page;
     }
     if built.len() < selected.len() {
-        let blocks = source_blocks_by_key(pagination);
+        let blocks = source_blocks_by_key(
+            pagination,
+            selected
+                .difference(&built)
+                .map(|&index| &layout.pages[index]),
+        );
         for &page_index in selected.difference(&built) {
             previous.pages[page_index] = unbuilt_page_with_span(
                 &resident.input.layout.pages[page_index],
@@ -11264,24 +11364,26 @@ pub fn update_resident_display_list_incremental_partial_with_fonts_observed(
             );
         }
     }
+    let mut shifts = IncrementalDisplayShifts::default();
     for (page_index, page) in previous.pages.iter_mut().enumerate().skip(rebuilt_page_end) {
         if selected.contains(&page_index) {
             continue;
         }
         page.page_index = page_index as u64;
-        shift_page_body_positions(page, position_deltas);
+        let body = shift_page_body_positions(page, position_deltas);
         // The retained layout page may predate this edit, but a converged
         // page holds the same blocks, which is all the shift reads.
-        shift_unbuilt_span(
+        let span = shift_unbuilt_span(
             page,
             resident.input.layout.pages.get(page_index),
             position_deltas,
         );
+        shifts.push(page_index, body.combine(span));
     }
     if built.len() < selected.len() {
         prune_resident_display_measured(resident, previous);
     }
-    Ok(true)
+    Ok(Some(shifts))
 }
 
 fn refresh_resident_display_pages(
@@ -11309,10 +11411,8 @@ fn refresh_resident_display_pages_reading(
         let page: PageIn =
             convert_resident_value(&layout.pages[page_index], "resident display layout page")?;
         if reading.contains(&page_index) {
-            for fragment in &page.fragments {
-                if let Some(key) = fragment_block_key(fragment) {
-                    selected_blocks.insert(key);
-                }
+            for fragment in &layout.pages[page_index].fragments {
+                selected_blocks.insert(resident_fragment_block_key(fragment));
             }
         }
         input.layout.pages[page_index] = page;
@@ -11325,7 +11425,9 @@ fn refresh_resident_display_pages_reading(
         .measured
         .iter()
         .enumerate()
-        .filter_map(|(index, measured)| measured_block_key(measured).map(|key| (key, index)))
+        .filter_map(|(index, measured)| {
+            measured_block_key(measured).map(|key| (key.into_owned(), index))
+        })
         .collect();
     let mut pending_blocks = selected_blocks;
     for measured in &pagination.measured {
@@ -11377,6 +11479,20 @@ fn resident_block_key(block: &crate::types::LayoutBlock) -> Option<Cow<'_, str>>
     }
 }
 
+/// Borrows pagination fragment ids with the resident display key text.
+fn resident_fragment_block_key(fragment: &crate::types::Fragment) -> Cow<'_, str> {
+    use crate::types::Fragment;
+    let id = match fragment {
+        Fragment::Paragraph(value) => &value.block_id,
+        Fragment::Table(value) => &value.block_id,
+        Fragment::Image(value) => &value.block_id,
+        Fragment::TextBox(value) => &value.block_id,
+        Fragment::Shape(value) => &value.block_id,
+        Fragment::Chart(value) => &value.block_id,
+    };
+    resident_block_id_key(id)
+}
+
 /// [`block_key`] of `id` once transcoded, which reads an integral number back
 /// as an integer.
 fn resident_block_id_key(id: &crate::types::BlockId) -> Cow<'_, str> {
@@ -11394,7 +11510,8 @@ fn resident_block_id_key(id: &crate::types::BlockId) -> Cow<'_, str> {
     }
 }
 
-fn measured_block_key(measured: &MeasuredBlockIn) -> Option<String> {
+/// Borrows rendered measured block ids with their canonical key text.
+fn measured_block_key(measured: &MeasuredBlockIn) -> Option<Cow<'_, str>> {
     match &measured.block {
         BlockIn::Paragraph(value) => Some(block_key(&value.id)),
         BlockIn::Table(value) => Some(block_key(&value.id)),
@@ -11406,15 +11523,38 @@ fn measured_block_key(measured: &MeasuredBlockIn) -> Option<String> {
     }
 }
 
-fn fragment_block_key(fragment: &FragmentIn) -> Option<String> {
-    match fragment {
-        FragmentIn::Paragraph(value) => Some(block_key(&value.block_id)),
-        FragmentIn::Table(value) => Some(block_key(&value.block_id)),
-        FragmentIn::Image(value) => Some(block_key(&value.block_id)),
-        FragmentIn::TextBox(value) => Some(block_key(&value.block_id)),
-        FragmentIn::Shape(value) => Some(block_key(&value.block_id)),
-        FragmentIn::Chart(value) => Some(block_key(&value.block_id)),
-        FragmentIn::Unsupported => None,
+/// Borrows string block ids while preserving their canonical key text.
+fn fragment_block_key_ref(fragment: &FragmentIn) -> Option<Cow<'_, str>> {
+    let id = match fragment {
+        FragmentIn::Paragraph(value) => &value.block_id,
+        FragmentIn::Table(value) => &value.block_id,
+        FragmentIn::Image(value) => &value.block_id,
+        FragmentIn::TextBox(value) => &value.block_id,
+        FragmentIn::Shape(value) => &value.block_id,
+        FragmentIn::Chart(value) => &value.block_id,
+        FragmentIn::Unsupported => return None,
+    };
+    Some(block_key(id))
+}
+
+/// Classifies effective position changes without revisiting primitives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayShift {
+    Inert,
+    Uniform(i64),
+    Unchanged,
+    Mixed,
+}
+
+impl DisplayShift {
+    /// Combines the movements of two positioned parts of a page.
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Inert, shift) | (shift, Self::Inert) => shift,
+            (Self::Uniform(left), Self::Uniform(right)) if left == right => Self::Uniform(left),
+            (Self::Unchanged, Self::Unchanged) => Self::Unchanged,
+            _ => Self::Mixed,
+        }
     }
 }
 
@@ -11423,26 +11563,37 @@ fn shift_unbuilt_span(
     page: &mut DisplayPage,
     layout_page: Option<&PageIn>,
     deltas: &HashMap<String, i64>,
-) {
+) -> DisplayShift {
     let Some(span) = &mut page.position_span else {
-        return;
+        return DisplayShift::Inert;
     };
     let delta = layout_page
-        .and_then(|layout_page| layout_page.fragments.iter().find_map(fragment_block_key))
-        .and_then(|key| deltas.get(&key));
-    if let Some(delta) = delta {
+        .and_then(|layout_page| {
+            layout_page
+                .fragments
+                .iter()
+                .find_map(fragment_block_key_ref)
+        })
+        .and_then(|key| deltas.get(key.as_ref()))
+        .filter(|&&delta| delta != 0);
+    if let Some(&delta) = delta {
         span[0] += delta;
         span[1] += delta;
+        DisplayShift::Uniform(delta)
+    } else {
+        DisplayShift::Unchanged
     }
 }
 
-fn shift_page_body_positions(page: &mut DisplayPage, deltas: &HashMap<String, i64>) {
-    if deltas.is_empty() {
-        return;
-    }
+/// Shifts body positions and classifies the deltas applied to positioned primitives.
+fn shift_page_body_positions(
+    page: &mut DisplayPage,
+    deltas: &HashMap<String, i64>,
+) -> DisplayShift {
     // Looked up by reference: a clone per primitive is an allocation per
     // primitive on every page after the edit.
     let mut id_key = String::new();
+    let mut shift = DisplayShift::Inert;
     for primitive in &mut page.primitives {
         let attrs = match primitive {
             Primitive::Text(value) => &mut value.attrs,
@@ -11453,19 +11604,35 @@ fn shift_page_body_positions(page: &mut DisplayPage, deltas: &HashMap<String, i6
             Primitive::Shape(value) => &mut value.attrs,
             Primitive::Decoration(value) => &mut value.attrs,
         };
+        if attrs.doc_start.is_none()
+            && attrs.doc_end.is_none()
+            && attrs.fragment_doc_start.is_none()
+            && attrs.fragment_doc_end.is_none()
+            && attrs.inline_sdt_widget.is_none()
+        {
+            continue;
+        }
+        if deltas.is_empty() {
+            return DisplayShift::Unchanged;
+        }
         let key = match (&attrs.block_key, &attrs.block_id) {
-            (Some(key), _) => key.as_str(),
+            (Some(key), _) => Some(key.as_str()),
             (None, Some(id)) => {
                 id_key.clear();
                 std::fmt::Write::write_fmt(&mut id_key, format_args!("{id}"))
                     .expect("writing to a String cannot fail");
-                id_key.as_str()
+                Some(id_key.as_str())
             }
-            (None, None) => continue,
+            (None, None) => None,
         };
-        let Some(&delta) = deltas.get(key) else {
+        let Some(&delta) = key
+            .and_then(|key| deltas.get(key))
+            .filter(|&&delta| delta != 0)
+        else {
+            shift = shift.combine(DisplayShift::Unchanged);
             continue;
         };
+        shift = shift.combine(DisplayShift::Uniform(delta));
         attrs.doc_start = attrs.doc_start.map(|value| value + delta);
         attrs.doc_end = attrs.doc_end.map(|value| value + delta);
         attrs.fragment_doc_start = attrs.fragment_doc_start.map(|value| value + delta);
@@ -11474,6 +11641,7 @@ fn shift_page_body_positions(page: &mut DisplayPage, deltas: &HashMap<String, i6
             widget.pos += delta;
         }
     }
+    shift
 }
 
 /// Rewrites losslessly-integral JSON floats as integers.
@@ -11739,6 +11907,33 @@ mod tests {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
+    /// Source lookup keeps the first required block and excludes unplaced keys.
+    #[test]
+    fn source_block_lookup_is_scoped_and_keeps_the_first_occurrence() {
+        let mut pagination = table_split_fixture();
+        let crate::types::LayoutBlock::Table(table) = &mut pagination.measured[0].block else {
+            panic!("expected a table");
+        };
+        table.id = crate::types::BlockId::Str("selected".to_owned());
+        let layout = crate::compute_layout_input(&mut pagination).unwrap();
+        let duplicate = pagination.measured[0].clone();
+        let mut unplaced = duplicate.clone();
+        let crate::types::LayoutBlock::Table(table) = &mut unplaced.block else {
+            panic!("expected a table");
+        };
+        table.id = crate::types::BlockId::Str("unplaced".to_owned());
+        pagination.measured.insert(0, unplaced);
+        pagination.measured.push(duplicate);
+        let blocks = source_blocks_by_key(&pagination, &layout.pages[..1]);
+        assert!(std::ptr::eq(blocks["selected"], &pagination.measured[1]));
+        assert!(!blocks.contains_key("unplaced"));
+        assert!(matches!(
+            blocks.keys().find(|key| key.as_ref() == "selected"),
+            Some(Cow::Borrowed("selected")),
+        ));
+        assert!(source_blocks_by_key(&pagination, std::iter::empty()).is_empty());
+    }
+
     #[test]
     fn releasing_resident_pages_prunes_exclusive_blocks_and_keeps_a_split_table() {
         let mut pagination = table_split_fixture();
@@ -11911,6 +12106,7 @@ mod tests {
             .measured
             .iter()
             .filter_map(measured_block_key)
+            .map(Cow::into_owned)
             .collect::<Vec<_>>();
         let last = layout.pages.len() - 1;
         assert!(last > 0);
@@ -11943,6 +12139,7 @@ mod tests {
                 .measured
                 .iter()
                 .filter_map(measured_block_key)
+                .map(Cow::into_owned)
                 .collect::<Vec<_>>(),
             measured
         );
@@ -12173,6 +12370,198 @@ mod tests {
                 (Some(50), None, None),
             ]
         );
+    }
+
+    /// Positioned primitives classify uniformly only when all effective deltas agree.
+    #[test]
+    fn body_position_shifts_classify_uniform_mixed_unchanged_and_inert_pages() {
+        let template: Primitive = serde_json::from_value(serde_json::json!({
+            "kind": "text", "text": "a", "x": 0, "baselineY": 10, "width": 5,
+            "font": "10px serif", "color": "#000"
+        }))
+        .unwrap();
+        let positioned = |key: Option<&str>, start| DocAttrs {
+            block_key: key.map(str::to_owned),
+            doc_start: Some(start),
+            ..Default::default()
+        };
+        let widget: DocAttrs = serde_json::from_value(serde_json::json!({
+            "blockKey": "a",
+            "inlineSdtWidget": {"kind": "checkbox", "groupId": "widget", "pos": 7}
+        }))
+        .unwrap();
+        let deltas = HashMap::from([("a".to_owned(), 3), ("b".to_owned(), -2)]);
+        for (attrs, expected) in [
+            (
+                vec![positioned(Some("a"), 10), widget],
+                DisplayShift::Uniform(3),
+            ),
+            (
+                vec![positioned(Some("a"), 10), positioned(None, 20)],
+                DisplayShift::Mixed,
+            ),
+            (
+                vec![positioned(Some("a"), 10), positioned(Some("b"), 20)],
+                DisplayShift::Mixed,
+            ),
+            (
+                vec![positioned(Some("a"), 10), positioned(Some("absent"), 20)],
+                DisplayShift::Mixed,
+            ),
+            (
+                vec![positioned(Some("absent"), 10), positioned(None, 20)],
+                DisplayShift::Unchanged,
+            ),
+            (vec![DocAttrs::default()], DisplayShift::Inert),
+            (vec![], DisplayShift::Inert),
+        ] {
+            let mut page: DisplayPage = serde_json::from_value(serde_json::json!({
+                "pageIndex": 0, "width": 816, "height": 1056, "primitives": []
+            }))
+            .unwrap();
+            for attrs in attrs {
+                let mut primitive = template.clone();
+                let Primitive::Text(value) = &mut primitive else {
+                    unreachable!()
+                };
+                value.attrs = attrs;
+                page.primitives.push(primitive);
+            }
+            assert_eq!(shift_page_body_positions(&mut page, &deltas), expected);
+            assert_eq!(
+                shift_page_body_positions(&mut page, &HashMap::new()),
+                if expected == DisplayShift::Inert {
+                    DisplayShift::Inert
+                } else {
+                    DisplayShift::Unchanged
+                }
+            );
+        }
+    }
+
+    /// Span shifts borrow string ids and combine with body movements exactly.
+    #[test]
+    fn unbuilt_span_shifts_classify_and_preserve_block_key_text() {
+        let mut page: DisplayPage = serde_json::from_value(serde_json::json!({
+            "pageIndex": 0, "width": 816, "height": 1056, "primitives": [], "unbuilt": true
+        }))
+        .unwrap();
+        let deltas = HashMap::from([("a".to_owned(), 3)]);
+        assert_eq!(
+            shift_unbuilt_span(&mut page, None, &deltas),
+            DisplayShift::Inert
+        );
+        page.position_span = Some([10, 20]);
+        assert_eq!(
+            shift_unbuilt_span(&mut page, None, &deltas),
+            DisplayShift::Unchanged
+        );
+        let layout: PageIn = serde_json::from_value(serde_json::json!({
+            "size": {"width": 816, "height": 1056},
+            "fragments": [{"kind": "paragraph", "blockId": "a"}]
+        }))
+        .unwrap();
+        assert!(matches!(
+            fragment_block_key_ref(&layout.fragments[0]),
+            Some(Cow::Borrowed("a"))
+        ));
+        assert_eq!(
+            shift_unbuilt_span(&mut page, Some(&layout), &deltas),
+            DisplayShift::Uniform(3)
+        );
+        assert_eq!(page.position_span, Some([13, 23]));
+        for id in [
+            serde_json::json!(7),
+            serde_json::json!(7.5),
+            serde_json::json!(-0.0),
+        ] {
+            let fragment: FragmentIn = serde_json::from_value(serde_json::json!({
+                "kind": "paragraph", "blockId": id
+            }))
+            .unwrap();
+            assert_eq!(
+                fragment_block_key_ref(&fragment).unwrap().as_ref(),
+                block_key(&id).as_ref()
+            );
+        }
+        assert_eq!(
+            DisplayShift::Inert.combine(DisplayShift::Uniform(3)),
+            DisplayShift::Uniform(3)
+        );
+        assert_eq!(
+            DisplayShift::Uniform(3).combine(DisplayShift::Inert),
+            DisplayShift::Uniform(3)
+        );
+        assert_eq!(
+            DisplayShift::Uniform(3).combine(DisplayShift::Uniform(3)),
+            DisplayShift::Uniform(3)
+        );
+        assert_eq!(
+            DisplayShift::Uniform(3).combine(DisplayShift::Uniform(4)),
+            DisplayShift::Mixed
+        );
+        assert_eq!(
+            DisplayShift::Uniform(3).combine(DisplayShift::Unchanged),
+            DisplayShift::Mixed
+        );
+        assert_eq!(
+            DisplayShift::Unchanged.combine(DisplayShift::Unchanged),
+            DisplayShift::Unchanged
+        );
+    }
+
+    /// Runs join equal adjacent shifts and inert extensions while leaving gaps separate.
+    #[test]
+    fn display_shift_runs_coalesce_and_split() {
+        let mut shifts = IncrementalDisplayShifts::default();
+        for (index, shift) in [
+            (0, DisplayShift::Inert),
+            (1, DisplayShift::Uniform(3)),
+            (2, DisplayShift::Uniform(3)),
+            (3, DisplayShift::Inert),
+            (4, DisplayShift::Uniform(3)),
+            (5, DisplayShift::Uniform(-2)),
+            (6, DisplayShift::Unchanged),
+            (7, DisplayShift::Inert),
+            (8, DisplayShift::Uniform(-2)),
+            (9, DisplayShift::Mixed),
+            (10, DisplayShift::Inert),
+            (11, DisplayShift::Uniform(-2)),
+            (13, DisplayShift::Uniform(-2)),
+        ] {
+            shifts.push(index, shift);
+        }
+        assert_eq!(
+            shifts.runs,
+            [
+                DisplayShiftRun {
+                    start: 1,
+                    end: 5,
+                    delta: 3
+                },
+                DisplayShiftRun {
+                    start: 5,
+                    end: 6,
+                    delta: -2
+                },
+                DisplayShiftRun {
+                    start: 8,
+                    end: 9,
+                    delta: -2
+                },
+                DisplayShiftRun {
+                    start: 11,
+                    end: 12,
+                    delta: -2
+                },
+                DisplayShiftRun {
+                    start: 13,
+                    end: 14,
+                    delta: -2
+                },
+            ]
+        );
+        assert_eq!(shifts.mixed, [9]);
     }
 
     #[test]
