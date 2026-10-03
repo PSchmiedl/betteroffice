@@ -380,3 +380,129 @@ test('aborting a reveal stops following an unbuilt page after three seconds', as
     clock.mockRestore();
   }
 });
+
+function paginatingApi(session?: YrsSession) {
+  const { scroller, host, scrolls } = pagedDom();
+  const navigation = { epoch: 0 };
+  const focused: number[] = [];
+  const heading = { pageIndex: 8, x: 20, y: 500, width: 0, height: 16 };
+  const laidOut = {
+    ...unbuiltQueries(true, heading),
+    pageCount: () => 10,
+    pageBounds: (pageIndex: number) => ({ pageIndex, x: 0, y: 0, width: 800, height: 1000 }),
+  } as DisplayListQueries;
+  const paginating = {
+    ...laidOut,
+    pageCount: () => 7,
+    anchorRect: () => null,
+  } as DisplayListQueries;
+  const hook = renderHook(
+    (props: Props) =>
+      usePagedScrollApi({
+        pagesContainerRef: { current: host },
+        yrsInputRef: { current: { focus: () => focused.push(1) } as never },
+        yrsSession: props.session ?? null,
+        yrsLocToDisplayPosition: () => 5000,
+        getScrollContainer: () => scroller,
+        displayListQueries: props.queries,
+        layout: props.layout,
+        onNavigationIntent: () => {
+          navigation.epoch += 1;
+        },
+        navigationEpoch: () => navigation.epoch,
+      }),
+    { initialProps: { layout: layout(7, true), queries: paginating, session } as Props }
+  );
+  return { ...hook, scroller, scrolls, navigation, focused, laidOut, paginating };
+}
+
+test('a position past a partial layout is scrolled to once the layout reaches it', async () => {
+  const api = paginatingApi();
+  const { result, rerender, scroller, scrolls, laidOut, paginating, navigation } = api;
+  await act(async () => result.current.scrollToPositionImpl(5000));
+  expect(scrolls).toHaveLength(0);
+  navigation.epoch += 1;
+  await act(async () => rerender({ layout: layout(9, true), queries: paginating }));
+  expect(scrolls).toHaveLength(0);
+  await act(async () => rerender({ layout: layout(10), queries: laidOut }));
+  expect(scrolls).toHaveLength(1);
+  const headingTop = 8000 - scroller.scrollTop + 500;
+  expect(headingTop).toBeGreaterThanOrEqual(0);
+  expect(headingTop).toBeLessThanOrEqual(400);
+  await act(async () => rerender({ layout: layout(10), queries: { ...laidOut } }));
+  expect(scrolls).toHaveLength(1);
+  scroller.remove();
+});
+
+test('a waiting position drops on a user scroll, a new session, an edit or a later page', async () => {
+  let version = '1';
+  const session = { version: () => version } as unknown as YrsSession;
+  const drops: Array<(api: ReturnType<typeof paginatingApi>) => void> = [
+    ({ scroller }) => {
+      scroller.dispatchEvent(new Event('wheel'));
+    },
+    () => {
+      document.body.dispatchEvent(new Event('keydown', { bubbles: true }));
+    },
+    ({ rerender, paginating }) =>
+      rerender({ layout: layout(9, true), queries: paginating, session: {} as YrsSession }),
+    () => {
+      version = '2';
+    },
+    ({ result }) => result.current.scrollToPageImpl(9),
+  ];
+  for (const drop of drops) {
+    version = '1';
+    const api = paginatingApi(session);
+    await act(async () => api.result.current.scrollToPositionImpl(5000));
+    await act(async () => drop(api));
+    await act(async () => api.rerender({ layout: layout(10), queries: api.laidOut, session }));
+    expect(api.scrolls).toEqual(drop === drops[4] ? [8300] : []);
+    api.scroller.remove();
+  }
+});
+
+test('a paragraph navigation that waits for the layout still focuses the input', async () => {
+  const session = {
+    version: () => '1',
+    storyIds: () => ['body'],
+    paragraphs: () => [{ paraId: 'P1' }],
+    locateParagraph: () => ({ start: 0, end: 4 }),
+    setSelection: () => {},
+  } as unknown as YrsSession;
+  const { result, rerender, scroller, scrolls, focused, laidOut } = paginatingApi(session);
+  await act(async () => {
+    result.current.scrollToParaIdImpl('P1');
+  });
+  await act(async () => rerender({ layout: layout(10), queries: laidOut, session }));
+  await act(() => new Promise((resolve) => setTimeout(resolve, 100)));
+  expect(scrolls).toHaveLength(1);
+  expect(focused).toHaveLength(1);
+  scroller.remove();
+});
+
+test('a waiting position resumed onto an unbuilt page stops following it on an edit or a key press', async () => {
+  let version = '1';
+  const session = { version: () => version } as unknown as YrsSession;
+  const placeholder = { pageIndex: 8, x: 20, y: 20, width: 0, height: 0 };
+  const drops = [
+    () => {
+      version = '2';
+    },
+    () => {
+      document.body.dispatchEvent(new Event('keydown', { bubbles: true }));
+    },
+  ];
+  for (const drop of drops) {
+    version = '1';
+    const { result, rerender, scroller, scrolls, laidOut } = paginatingApi(session);
+    await act(async () => result.current.scrollToPositionImpl(5000));
+    const building = unbuiltQueries([0, 1, 2, 3, 4, 5, 6, 7], placeholder);
+    await act(async () => rerender({ layout: layout(10), queries: building, session }));
+    expect(scrolls).toHaveLength(1);
+    await act(async () => drop());
+    await act(async () => rerender({ layout: layout(10), queries: laidOut, session }));
+    expect(scrolls).toHaveLength(1);
+    scroller.remove();
+  }
+});
