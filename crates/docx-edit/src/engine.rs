@@ -367,6 +367,7 @@ impl Drop for MovedArenaGuard<'_> {
         if !pagination.moved_blocks.is_empty() {
             pagination.input = None;
             pagination.measured_with = None;
+            pagination.set_font_dependencies(Vec::new(), None);
             pagination.retain_matches.clear();
             pagination.moved_blocks.clear();
         }
@@ -1190,6 +1191,7 @@ struct PaginationState {
     /// and whether floating zones shaped it.
     measured_widths: Vec<f64>,
     measured_font_dependencies: Vec<FontChainDependencies>,
+    measured_font_chains: Option<BTreeMap<String, Vec<u32>>>,
     measured_table_wrap_frames: Vec<bool>,
     measured_float_geometry: Option<[f64; 5]>,
     measured_with_floats: bool,
@@ -1224,6 +1226,17 @@ struct PaginationState {
 }
 
 impl PaginationState {
+    fn set_font_dependencies(
+        &mut self,
+        dependencies: Vec<FontChainDependencies>,
+        chains: Option<&BTreeMap<String, Vec<u32>>>,
+    ) {
+        self.measured_font_dependencies = dependencies;
+        if self.measured_font_chains.as_ref() != chains {
+            self.measured_font_chains = chains.cloned();
+        }
+    }
+
     fn pending_display_pages(&self) -> impl Iterator<Item = usize> + '_ {
         let fallback = (self.display_layout_pending && self.rebuilt_page_ranges.is_empty())
             .then_some(self.rebuilt_page_start..self.rebuilt_page_end);
@@ -1371,6 +1384,15 @@ enum RegionResidentPhase {
     Measured,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct FontDependencyWork {
+    oracle: bool,
+    validations: usize,
+    identity_skips: usize,
+    reuse_sets: Vec<Vec<usize>>,
+}
+
 /// Long-lived owner of the authoritative editing document and its retained
 /// render projections.
 ///
@@ -1392,6 +1414,8 @@ pub struct EngineSession {
     preview_font_requirements: RefCell<Option<PreviewFontRequirements>>,
     preview_locality: RefCell<Option<PreviewLocality>>,
     measurement: RefCell<MeasurementState>,
+    #[cfg(test)]
+    font_dependency_work: RefCell<FontDependencyWork>,
     regions: RefCell<Option<ResidentRegionState>>,
     pagination: RefCell<PaginationState>,
     display: RefCell<DisplayState>,
@@ -3519,6 +3543,8 @@ impl EngineSession {
             preview_font_requirements: RefCell::new(None),
             preview_locality: RefCell::new(None),
             measurement: RefCell::new(MeasurementState::default()),
+            #[cfg(test)]
+            font_dependency_work: RefCell::new(FontDependencyWork::default()),
             regions: RefCell::new(None),
             pagination: RefCell::new(PaginationState::default()),
             display: RefCell::new(DisplayState::default()),
@@ -3623,6 +3649,7 @@ impl EngineSession {
         if !pagination.moved_blocks.is_empty() {
             pagination.input = None;
             pagination.measured_with = None;
+            pagination.set_font_dependencies(Vec::new(), None);
             pagination.checkpoints.clear();
             pagination.block_fingerprints.clear();
         }
@@ -3652,7 +3679,7 @@ impl EngineSession {
         pagination.retain_matches = Vec::new();
         pagination.moved_blocks = BTreeSet::new();
         pagination.measured_widths = Vec::new();
-        pagination.measured_font_dependencies = Vec::new();
+        pagination.set_font_dependencies(Vec::new(), None);
         pagination.measured_table_wrap_frames = Vec::new();
         pagination.measured_float_geometry = None;
         pagination.measured_with_floats = false;
@@ -5310,6 +5337,10 @@ impl EngineSession {
             (true, Some(env)) => Some((self.regional_fingerprint(&regions, env), env.clone())),
             _ => None,
         };
+        self.pagination.borrow_mut().set_font_dependencies(
+            measured_font_dependencies,
+            resident_body.then_some(&measurement.font_chains),
+        );
         self.regions.replace(Some(ResidentRegionState {
             request_json: input_json,
             request_fingerprint,
@@ -5336,7 +5367,6 @@ impl EngineSession {
         pagination.lowered_from = lowered_from;
         pagination.input_lowering = input_lowering;
         pagination.measured_widths = measured_widths;
-        pagination.measured_font_dependencies = measured_font_dependencies;
         pagination.measured_table_wrap_frames = measured_table_wrap_frames;
         pagination.measured_float_geometry = measured_float_geometry;
         pagination.measured_with_floats = has_floats;
@@ -5816,6 +5846,10 @@ impl EngineSession {
             )?,
             None => Vec::new(),
         };
+        self.pagination.borrow_mut().set_font_dependencies(
+            measured_font_dependencies,
+            resident_body.then_some(&measurement.font_chains),
+        );
         self.regions.replace(Some(ResidentRegionState {
             request_json: input_json,
             request_fingerprint,
@@ -5843,7 +5877,6 @@ impl EngineSession {
         pagination.retain_matches = retain_matches;
         pagination.input_lowering = input_lowering;
         pagination.measured_widths = measured_widths;
-        pagination.measured_font_dependencies = measured_font_dependencies;
         pagination.measured_table_wrap_frames = measured_table_wrap_frames;
         pagination.measured_float_geometry = measured_float_geometry;
         pagination.measured_with_floats = has_floats;
@@ -6654,7 +6687,7 @@ impl EngineSession {
             pagination.retain_matches.clear();
         }
         pagination.measured_with = None;
-        pagination.measured_font_dependencies.clear();
+        pagination.set_font_dependencies(Vec::new(), None);
         pagination.lowered_from = None;
         pagination.input_lowering = None;
         if trigger.uses_region_path() {
@@ -6940,6 +6973,30 @@ impl EngineSession {
         })
     }
 
+    fn font_dependency_matches(
+        &self,
+        dependencies: &FontChainDependencies,
+        chains: &BTreeMap<String, Vec<u32>>,
+        unchanged: bool,
+    ) -> bool {
+        #[cfg(test)]
+        let unchanged = {
+            let mut work = self.font_dependency_work.borrow_mut();
+            let unchanged = unchanged && !work.oracle;
+            if unchanged {
+                work.identity_skips += 1;
+            } else {
+                work.validations += 1;
+            }
+            unchanged
+        };
+        if unchanged {
+            dependencies.matches_unchanged()
+        } else {
+            dependencies.matches(FontChains::BTree(chains))
+        }
+    }
+
     /// Reuse retained extents for blocks that cannot have changed (equal
     /// normalized block, width, config, and section-break adjacency).
     /// `Ok(None)` means the caller must measure the whole story.
@@ -7001,6 +7058,8 @@ impl EngineSession {
         }
         let contexts = normalization_contexts(regions, measurement, &pagination.retain_matches)?;
         let previous_fingerprints = &pagination.block_fingerprints;
+        let font_chains_unchanged =
+            pagination.measured_font_chains.as_ref() == Some(&measurement.font_chains);
         let mut dependencies = pagination.measured_font_dependencies.clone();
         let mut candidates = Vec::with_capacity(blocks.len());
         let mut reused = vec![false; blocks.len()];
@@ -7048,9 +7107,11 @@ impl EngineSession {
                     _ => lowered.get(index) == Some(next_block),
                 }
             });
-            let width_clean = dependencies[index]
-                .matches(FontChains::BTree(&measurement.font_chains))
-                && section_break_mark == retained_section_break_mark
+            let width_clean = self.font_dependency_matches(
+                &dependencies[index],
+                &measurement.font_chains,
+                font_chains_unchanged,
+            ) && section_break_mark == retained_section_break_mark
                 && widths.get(index) == previous_widths.get(index)
                 && matches!(previous_entry.measure, BlockExtent::Unsupported)
                     == matches!(next_block, LayoutBlock::Unsupported)
@@ -7221,7 +7282,15 @@ impl EngineSession {
             pagination.retain_match_calls += certificates.iter().flatten().count() as u64;
         }
         pagination.retain_matches = certificates;
-        pagination.measured_font_dependencies = dependencies;
+        #[cfg(test)]
+        self.font_dependency_work.borrow_mut().reuse_sets.push(
+            reused
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &reused)| reused.then_some(index))
+                .collect(),
+        );
+        pagination.set_font_dependencies(dependencies, None);
         let mut measurement_state = self.measurement.borrow_mut();
         measurement_state.resident_measure_calls = measurement_state
             .resident_measure_calls
@@ -7275,6 +7344,8 @@ impl EngineSession {
             return Ok(None);
         }
         let previous_fingerprints = &pagination.block_fingerprints;
+        let font_chains_unchanged =
+            pagination.measured_font_chains.as_ref() == Some(&measurement.font_chains);
         let mut dependencies = pagination.measured_font_dependencies.clone();
         let float_blocks = if floats.is_some() { blocks.len() } else { 0 };
         let mut float_dirty = vec![false; float_blocks];
@@ -7284,6 +7355,8 @@ impl EngineSession {
         let mut block_fingerprints = Vec::with_capacity(blocks.len());
         let mut measure_calls = 0_u64;
         let mut reused_blocks = 0_u64;
+        #[cfg(test)]
+        let mut reused = vec![false; blocks.len()];
         let mut section_index = 0_usize;
         for index in 0..blocks.len() {
             let next_block = blocks.get(index).expect("body block");
@@ -7313,9 +7386,11 @@ impl EngineSession {
                 restore_moved_measures(&mut previous.measured, measured);
                 return Ok(None);
             }
-            let width_clean = dependencies[index]
-                .matches(FontChains::BTree(&measurement.font_chains))
-                && section_break_mark == retained_section_break_mark
+            let width_clean = self.font_dependency_matches(
+                &dependencies[index],
+                &measurement.font_chains,
+                font_chains_unchanged,
+            ) && section_break_mark == retained_section_break_mark
                 && widths.get(index) == previous_widths.get(index)
                 && matches!(previous_entry.measure, BlockExtent::Unsupported)
                     == matches!(next_block, LayoutBlock::Unsupported)
@@ -7330,6 +7405,10 @@ impl EngineSession {
                 });
                 block_fingerprints.push(previous_fingerprints[index]);
                 reused_blocks = reused_blocks.wrapping_add(1);
+                #[cfg(test)]
+                {
+                    reused[index] = true;
+                }
             } else {
                 let mut owned = next_block.clone();
                 resolve_line_unit_spacing(
@@ -7367,6 +7446,10 @@ impl EngineSession {
                     });
                     block_fingerprints.push(previous_fingerprints[index]);
                     reused_blocks = reused_blocks.wrapping_add(1);
+                    #[cfg(test)]
+                    {
+                        reused[index] = true;
+                    }
                 } else if floats.is_some() {
                     float_dirty[index] = true;
                     measured.push(MeasuredBlock {
@@ -7495,13 +7578,25 @@ impl EngineSession {
                         };
                         measured[start + offset] = entry;
                         dependencies[start + offset] = reads[offset].clone();
+                        #[cfg(test)]
+                        {
+                            reused[start + offset] = false;
+                        }
                         measure_calls = measure_calls.wrapping_add(1);
                     }
                 }
                 start = end;
             }
         }
-        pagination.measured_font_dependencies = dependencies;
+        #[cfg(test)]
+        self.font_dependency_work.borrow_mut().reuse_sets.push(
+            reused
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &reused)| reused.then_some(index))
+                .collect(),
+        );
+        pagination.set_font_dependencies(dependencies, None);
         let mut measurement_state = self.measurement.borrow_mut();
         measurement_state.resident_measure_calls = measurement_state
             .resident_measure_calls
@@ -7641,6 +7736,11 @@ impl EngineSession {
                     }
                     let (widths, geometry, previous_pages) = {
                         let pagination = self.pagination.borrow();
+                        if pagination.measured_font_chains.as_ref()
+                            != Some(&measurement.font_chains)
+                        {
+                            return Ok(None);
+                        }
                         let (Some(input), Some(layout), false) = (
                             pagination.input.as_ref(),
                             pagination.layout.as_ref(),
@@ -7724,6 +7824,7 @@ impl EngineSession {
                 let mut pagination = self.pagination.borrow_mut();
                 pagination.block_fingerprints.clear();
                 pagination.measured_with = None;
+                pagination.set_font_dependencies(Vec::new(), None);
             }
             return Err(error);
         }
@@ -7732,7 +7833,8 @@ impl EngineSession {
         // The fast path measures through the region config too, so its
         // retained arena is also eligible for the next pass's reuse walk.
         pagination.measured_with = Some(measurement_fingerprint);
-        pagination.measured_font_dependencies = resident.font_dependencies;
+        pagination
+            .set_font_dependencies(resident.font_dependencies, Some(&measurement.font_chains));
         pagination.measured_widths = widths;
         let serial = pagination.layout_epoch;
         let layout = pagination
@@ -8892,6 +8994,9 @@ pub(crate) mod preview_fixture;
 
 #[cfg(test)]
 mod trigger_routing_tests;
+
+#[cfg(test)]
+mod font_dependency_tests;
 
 #[cfg(test)]
 mod tests {
@@ -12431,11 +12536,9 @@ mod tests {
             let extras = json!({"fontChains": request["measurement"]["fontChains"]}).to_string();
             engine.build_display_list_frame(&extras, 0).unwrap();
             if missing_record {
-                engine
-                    .pagination
-                    .borrow_mut()
-                    .measured_font_dependencies
-                    .clear();
+                let mut pagination = engine.pagination.borrow_mut();
+                let chains = pagination.measured_font_chains.clone();
+                pagination.set_font_dependencies(Vec::new(), chains.as_ref());
             }
             engine
                 .doc()
@@ -12918,7 +13021,7 @@ mod tests {
                 measured_fingerprints(pagination.input.as_ref().unwrap()).unwrap();
             pagination.measured_with = Some(prepared.measurement_fingerprint);
             pagination.measured_widths = vec![300.0];
-            pagination.measured_font_dependencies = vec![dependencies.clone()];
+            pagination.set_font_dependencies(vec![dependencies.clone()], None);
         }
         let (reused, fingerprints) = engine
             .resident_region_measured(
@@ -13217,7 +13320,7 @@ mod tests {
                 .unwrap();
             {
                 let mut pagination = engine.pagination.borrow_mut();
-                pagination.measured_font_dependencies = flow.font_dependencies().to_vec();
+                pagination.set_font_dependencies(flow.font_dependencies().to_vec(), None);
                 pagination.input = Some(LayoutInput {
                     measured: blocks
                         .iter()
