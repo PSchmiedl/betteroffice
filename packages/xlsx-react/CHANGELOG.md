@@ -1,5 +1,32 @@
 # @betteroffice/xlsx-react
 
+## 0.4.0
+
+### Minor Changes
+
+- 14919ef: Editable sessions with `experimentalWorkerOpen` now use the worker-owned editor and show pending cell text before edits commit. The flag remains experimental and opt-in; the default editor is unchanged.
+- f7cf3ff: `XlsxEditor` with `readOnly` and `experimentalWorkerOpen` opens the workbook in a worker, which builds the frames the page paints, keeping the page responsive while large workbooks open. Off by default.
+
+### Patch Changes
+
+- Updated dependencies [1ed2ad0]
+- Updated dependencies [14919ef]
+- Updated dependencies [d920761]
+- Updated dependencies [4d0cbda]
+- Updated dependencies [2f7efc6]
+- Updated dependencies [11db7d8]
+- Updated dependencies [355675f]
+- Updated dependencies [f2042f0]
+- Updated dependencies [30bf7b2]
+- Updated dependencies [400ac5e]
+- Updated dependencies [accc7a0]
+- Updated dependencies [d402284]
+- Updated dependencies [3e47c79]
+- Updated dependencies [f7cf3ff]
+- Updated dependencies [a0c86f2]
+  - @betteroffice/xlsx@0.4.0
+  - @betteroffice/xlsx-i18n@0.4.0
+
 ## 0.3.0
 
 ### Minor Changes

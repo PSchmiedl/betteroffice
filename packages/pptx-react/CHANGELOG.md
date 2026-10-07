@@ -1,5 +1,23 @@
 # @betteroffice/pptx-react
 
+## 0.3.0
+
+### Minor Changes
+
+- f6e3563: Read-only `PptxEditor` can open presentations in a worker with the experimental `experimentalWorkerOpen` prop. Off by default.
+
+### Patch Changes
+
+- 01c8ecb: Large presentations show their first slide sooner and edit faster: thumbnails are laid out after the first paint, and unchanged slides keep their cached layouts and thumbnails, so typing and remote edits lay out only the slides they change.
+- Updated dependencies [1ed2ad0]
+- Updated dependencies [73959ca]
+- Updated dependencies [4a780fd]
+- Updated dependencies [01c8ecb]
+- Updated dependencies [550b200]
+- Updated dependencies [d402284]
+  - @betteroffice/pptx@0.3.0
+  - @betteroffice/pptx-i18n@0.3.0
+
 ## 0.2.0
 
 ### Minor Changes
