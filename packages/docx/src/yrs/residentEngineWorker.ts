@@ -1602,6 +1602,12 @@ async function handle(request: ResidentEngineWorkerRequest): Promise<void> {
       case 'readParagraphs':
         value = engine.readParagraphs(request.read.request);
         break;
+      case 'listStories':
+        value = session.listStories();
+        break;
+      case 'readStories':
+        value = session.readStories(request.read.request);
+        break;
       case 'findText':
         value = engine.findText(request.read.request);
         break;
