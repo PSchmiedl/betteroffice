@@ -9,17 +9,21 @@ import { createTestWorkbookSession, loadWorkbookSessionFixtures } from '../../..
 import { openWorkbook, type WorkbookHandle } from '../../../xlsx/src/wasm/loader';
 import { XlsxCommandAdmissionError } from './createXlsxCommandStore';
 import type { InputDraft, InputSeal } from './inputCoordinator';
+import { WorkerDraftController } from '../worker/WorkerDraftController';
+import { createPeerlessPluginDocument } from '../plugins/createPeerlessPluginDocument';
+import type { PeerlessWorkbookSession } from '../worker/usePeerlessSessionWorkbook';
 import { createWorkerInputCoordinator, WorkerInputNotReadyError, WorkerInputRefusal, type WorkerInputCoordinator } from './workerInputCoordinator';
 import {
   createPeerlessWorkerInputCoordinator, type PeerlessWorkerCommand, type PeerlessWorkerCommandInput,
   type PeerlessWorkerInputEvent,
 } from './peerlessWorkerInputCoordinator';
 
-function peerlessHarness(maxOutstanding = 8, maxQueued = 8) {
+function peerlessHarness(maxOutstanding = 8, maxQueued = 8, controller?: WorkerDraftController) {
   const sent: PeerlessWorkerCommand[] = [];
   const events: PeerlessWorkerInputEvent[] = [];
   const errors: unknown[] = [];
   const listeners = new Set<(ack: WorkbookAck) => void>();
+  const failures = new Set<(error: SessionFailure) => void>();
   const replies = new Map<number, ReturnType<typeof deferred<CommandStatus>>>();
   const saved: number[] = [];
   const state = { generation: 1, navigation: 0, throughSeq: 0, version: 'v1', ready: true,
@@ -38,6 +42,10 @@ function peerlessHarness(maxOutstanding = 8, maxQueued = 8) {
       listeners.add(listener);
       return () => { listeners.delete(listener); };
     },
+    onFailure(listener: (error: SessionFailure) => void) {
+      failures.add(listener);
+      return () => { failures.delete(listener); };
+    },
     save: async () => { saved.push(state.throughSeq); return new Uint8Array([1]); },
     whenPresented: async (_seq: number) => {},
   };
@@ -46,7 +54,8 @@ function peerlessHarness(maxOutstanding = 8, maxQueued = 8) {
     isReady: () => state.ready,
     selectionRevision: () => state.navigation,
     frame: () => state.frame,
-    seal: () => state.seal, sync: () => {},
+    seal: () => controller?.seal() ?? state.seal, sync: () => controller?.sync(),
+    compositionId: () => controller?.compositionId,
     target: (sheet, row, col) => ({ sheetId: `sheet:${sheet}`, range: {
       kind: 'rowCol', start: { row, col }, end: { row, col },
     } }),
@@ -56,17 +65,260 @@ function peerlessHarness(maxOutstanding = 8, maxQueued = 8) {
   const draft = (value: string, row = 0): InputDraft => ({
     generation: state.generation, sheet: 0, row, col: 0, source: 'cell', value,
   });
-  const ack = (seq: number, status: CommandStatus['status'] = 'applied') => {
+  const ack = (seq: number, status: CommandStatus['status'] = 'applied', result?: unknown) => {
     state.throughSeq = seq;
     state.version = `v${seq + 1}`;
-    const receipt: CommandStatus = { seq, status, ...(status === 'refused' ? { reason: 'locked-target' } : {}) };
+    const receipt: CommandStatus = { seq, status, ...(result === undefined ? {} : { result }), ...(status === 'refused' ? { reason: 'locked-target' } : {}) };
     for (const listener of listeners) listener({ throughSeq: seq, version: state.version, statuses: [receipt] });
     replies.get(seq)?.resolve(receipt);
   };
-  return { coordinator, session, state, sent, events, errors, saved, draft, ack, replies, listeners };
+  const failSession = (error: SessionFailure) => { for (const listener of failures) listener(error); };
+  return { coordinator, session, state, sent, events, errors, saved, draft, ack, replies, listeners, failSession };
 }
 
+describe('completed composition recovery', () => {
+  function setup() {
+    const selected = { anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } };
+    const controller = new WorkerDraftController({
+      generation: () => 1, identity: () => 'book', navigation: () => 0,
+      selection: () => selected, sheet: () => 0,
+      target: () => ({ sheetId: 'sheet:0', range: { kind: 'a1', a1: 'A1' } }),
+      resolveSheet: () => 0, editable: () => true, prefill: async () => '',
+      select: () => {}, selectionTarget: () => undefined, dependency: () => null,
+      navigate: () => {}, committed: () => {}, fail: (error) => { throw error; }, focus: () => {},
+    });
+    const harness = peerlessHarness(8, 8, controller);
+    controller.attach(harness.coordinator);
+    return { ...harness, controller };
+  }
+
+  for (const source of ['cell', 'formula'] as const) {
+    for (const failed of ['read', 'session'] as const) {
+      test(`retains ${source} reservations in command order after ${failed} failure`, async () => {
+        const { coordinator, controller, sent, errors, draft, failSession } = setup();
+        const entered = deferred<void>();
+        const reply = deferred<void>();
+        const reading = coordinator.runAfterPendingInput(async () => {
+          entered.resolve();
+          try { await reply.promise; }
+          catch (error) { coordinator.fail(error); throw error; }
+        }, true);
+        await entered.promise;
+        const before = coordinator.submit(draft('before', 1));
+        controller.start(source);
+        const firstValue = source === 'cell' ? '変換' : '=SUM(A2:A4)';
+        controller.change(source, firstValue, null);
+        const first = coordinator.save();
+        const repeated = coordinator.save();
+        controller.end();
+        await Promise.resolve();
+        const middle = coordinator.submit(draft('middle', 2));
+        controller.start(source);
+        const secondValue = source === 'cell' ? '次' : '=A2*2';
+        controller.change(source, secondValue, null);
+        const second = coordinator.save();
+        controller.end();
+        await Promise.resolve();
+        const after = coordinator.submit(draft('after', 3));
+        expect(sent).toEqual([]);
+        const failure = new SessionFailure('crash', `Failed ${failed}`);
+        if (failed === 'read') reply.reject(failure);
+        else failSession(failure);
+        const settled = await Promise.allSettled([
+          reading, first, repeated, second, before.result, middle.result, after.result,
+        ]);
+        for (const outcome of settled) expect(outcome).toEqual({ status: 'rejected', reason: failure });
+        expect(errors).toEqual([failure]);
+        expect(coordinator.recoveryCommands.map((command) => command.kind === 'editCell' ? command.payload.args : command.kind))
+          .toEqual([[0, 1, 0, 'before'], [0, 0, 0, firstValue], [0, 2, 0, 'middle'],
+            [0, 0, 0, secondValue], [0, 3, 0, 'after']]);
+        expect(coordinator.recoveryCommands[1]).toMatchObject({ payload: { target: {
+          sheetId: 'sheet:0', range: { kind: 'rowCol', start: { row: 0, col: 0 }, end: { row: 0, col: 0 } },
+        } } });
+        expect(sent).toEqual([]);
+      });
+    }
+
+    test(`retains ${source} input when the session fails before its active gate resumes`, async () => {
+      const { coordinator, controller, sent, failSession } = setup();
+      controller.start(source);
+      controller.change(source, 'completed', null);
+      const saving = coordinator.save();
+      controller.end();
+      const failure = new SessionFailure('crash', 'Worker stopped');
+      queueMicrotask(() => failSession(failure));
+      await expect(saving).rejects.toBe(failure);
+      expect(sent).toEqual([]);
+      expect(coordinator.recoveryCommands).toMatchObject([
+        { kind: 'editCell', payload: { args: [0, 0, 0, 'completed'] } },
+      ]);
+    });
+  }
+
+  test('omits cancelled and unfinished compositions from recovery', async () => {
+    const { coordinator, controller, sent, draft, failSession } = setup();
+    const entered = deferred<void>();
+    const reading = coordinator.runAfterPendingInput(() => {
+      entered.resolve();
+      return new Promise<void>(() => {});
+    }, true);
+    await entered.promise;
+    controller.start('cell');
+    controller.change('cell', 'cancelled', null);
+    const cancelled = coordinator.save();
+    controller.cancel();
+    controller.start('formula');
+    controller.change('formula', '=1+2', null);
+    const unfinished = coordinator.save();
+    const later = coordinator.submit(draft('later', 1));
+    failSession(new SessionFailure('crash', 'Worker stopped'));
+    await Promise.allSettled([reading, cancelled, unfinished, later.result]);
+    expect(coordinator.recoveryCommands).toMatchObject([
+      { kind: 'editCell', payload: { args: [0, 1, 0, 'later'] } },
+    ]);
+    expect(sent).toEqual([]);
+  });
+
+  test('does not duplicate a composition already dispatched when the session fails', async () => {
+    const { coordinator, controller, sent, draft, failSession } = setup();
+    const posted = deferred<void>();
+    coordinator.subscribe((event) => { if (event.type === 'dispatched') posted.resolve(); });
+    controller.start('cell');
+    controller.change('cell', 'completed', null);
+    const saving = coordinator.save();
+    const later = coordinator.submit(draft('later', 1));
+    controller.end();
+    await posted.promise;
+    failSession(new SessionFailure('crash', 'Worker stopped'));
+    await Promise.allSettled([saving, later.result]);
+    expect(sent).toHaveLength(1);
+    expect(coordinator.recoveryCommands).toMatchObject([
+      { kind: 'editCell', payload: { args: [0, 1, 0, 'later'] } },
+    ]);
+  });
+});
+
+describe('queued composition snapshots', () => {
+  for (const source of ['cell', 'formula'] as const) {
+    for (const successor of ['composition', 'typing'] as const) {
+      test(`preserves completed ${source} input before later ${successor} and saves each boundary`, async () => {
+        const selected = { anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } };
+        const controller = new WorkerDraftController({
+          generation: () => 1, identity: () => 'book', navigation: () => 0,
+          selection: () => selected, sheet: () => 0,
+          target: () => ({ sheetId: 'sheet:0', range: { kind: 'a1', a1: 'A1' } }),
+          resolveSheet: () => 0, editable: () => true, prefill: async () => '',
+          select: () => {}, selectionTarget: () => undefined, dependency: () => null,
+          navigate: () => {}, committed: () => {}, fail: (error) => { throw error; }, focus: () => {},
+        });
+        const { coordinator, sent, saved, ack } = peerlessHarness(8, 8, controller);
+        controller.attach(coordinator);
+        coordinator.subscribe((event) => {
+          if (event.type === 'dispatched' && event.seq !== null) queueMicrotask(() => ack(event.seq!));
+        });
+        const entered = deferred<void>();
+        const reply = deferred<void>();
+        const reading = coordinator.runAfterPendingInput(() => {
+          entered.resolve();
+          return reply.promise;
+        }, true);
+        await entered.promise;
+        controller.start(source);
+        controller.change(source, 'first', null);
+        const first = coordinator.save();
+        controller.end();
+        await Promise.resolve();
+        if (successor === 'composition') controller.start(source);
+        controller.change(source, 'second', null);
+        const second = coordinator.save();
+        if (successor === 'composition') controller.end();
+        await Promise.resolve();
+        expect(saved).toEqual([]);
+        reply.resolve();
+        await Promise.all([reading, first, second]);
+        expect(sent.map((command) => command.kind === 'editCell' ? command.payload.args[3] : command.kind))
+          .toEqual(['first', 'second']);
+        expect(saved).toEqual([1, 2]);
+      });
+    }
+  }
+});
+
 describe('peerless worker input', () => {
+  test('refuses overlapping plugin edits behind invalid input and accepts a correction', async () => {
+    const { coordinator, session, draft, sent, ack } = peerlessHarness();
+    const owner = { current: true, retiring: false, ready: true, failure: null,
+      session: { ...session, editState: { readOnly: false } } } as unknown as PeerlessWorkbookSession;
+    const document = createPeerlessPluginDocument({
+      owner: () => owner, coordinator: () => coordinator, readOnly: () => false,
+      commands: () => null, selection: () => null,
+      navigator: { selectCells: async () => null, scrollToCell: async () => null },
+    });
+    const request = { expectVersion: 'v1', steps: [{ op: 'setCellInputs' as const,
+      target: { sheetId: 'sheet:0', range: { kind: 'a1' as const, a1: 'B1' } }, inputs: [['host']] }] };
+    coordinator.setDraft(draft('invalid'));
+    const first = document.admitEdits!(owner, request, () => null, (write) => write());
+    const second = document.admitEdits!(owner, request, () => null, (write) => write());
+    for (const command of sent) ack(command.seq, command === sent[0] ? 'refused' : 'cancelled');
+    const outcomes = await Promise.all([first, second]);
+    expect(outcomes).toEqual([
+      expect.objectContaining({ ok: false, code: 'input-failed' }),
+      expect.objectContaining({ ok: false, code: 'input-failed' }),
+    ]);
+    expect(sent.map((command) => command.kind)).toEqual(['editCell', 'applyEdits', 'applyEdits']);
+    expect(sent.slice(1).every((command) => command.afterSeq === 1)).toBe(true);
+    expect(coordinator.error).toBeNull();
+    coordinator.setDraft(draft('corrected'));
+    const corrected = document.admitEdits!(owner, request, () => null, (write) => write());
+    for (const command of sent.slice(3)) ack(command.seq, 'applied', { ok: true, version: 'v2', previews: [] });
+    expect(await corrected).toMatchObject({ ok: true, value: { ok: true } });
+  });
+
+  for (const source of ['cell', 'formula'] as const) {
+    for (const completion of ['success', 'cancel'] as const) {
+      test(`retains the save reservation through real ${source} IME ${completion}`, async () => {
+        const selected = { anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } };
+        const controller = new WorkerDraftController({
+          generation: () => 1, identity: () => 'book', navigation: () => 0,
+          selection: () => selected, sheet: () => 0,
+          target: () => ({ sheetId: 'sheet:0', range: { kind: 'a1', a1: 'A1' } }),
+          resolveSheet: () => 0, editable: () => true, prefill: async () => '',
+          select: () => {}, selectionTarget: () => undefined, dependency: () => null,
+          navigate: () => {}, committed: () => {}, fail: (error) => { throw error; }, focus: () => {},
+        });
+        const { coordinator, sent, saved, ack } = peerlessHarness(8, 8, controller);
+        controller.attach(coordinator);
+        coordinator.subscribe((event) => {
+          if (event.type === 'dispatched' && event.seq !== null) queueMicrotask(() => ack(event.seq!));
+        });
+        const entered = deferred<void>();
+        const reply = deferred<void>();
+        const reading = coordinator.runAfterPendingInput(() => {
+          entered.resolve();
+          return reply.promise;
+        }, true);
+        await entered.promise;
+        controller.start(source);
+        const first = coordinator.save();
+        if (completion === 'success') {
+          controller.change(source, 'completed', null);
+          controller.end();
+          await Promise.resolve();
+        } else {
+          controller.cancel();
+          controller.change(source, 'fresh', null);
+        }
+        const second = coordinator.save();
+        expect(saved).toEqual([]);
+        reply.resolve();
+        await Promise.all([reading, first, second]);
+        expect(saved).toEqual(completion === 'success' ? [1, 1] : [0, 1]);
+        expect(sent.map((command) => command.kind === 'editCell' ? command.payload.args[3] : command.kind))
+          .toEqual([completion === 'success' ? 'completed' : 'fresh']);
+      });
+    }
+  }
+
   test('save skips an untouched draft awaiting prefill', async () => {
     const { coordinator, draft, sent, saved, ack } = peerlessHarness();
     coordinator.setDraft({ ...draft(''), modified: false } as InputDraft);

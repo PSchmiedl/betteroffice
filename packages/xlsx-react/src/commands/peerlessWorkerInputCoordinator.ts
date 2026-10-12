@@ -1,5 +1,5 @@
 import { XlsxCommandAdmissionError } from './createXlsxCommandStore';
-import type { InputCoordinatorHooks, InputDraft } from './inputCoordinator';
+import type { InputCoordinatorHooks, InputDraft, InputSeal } from './inputCoordinator';
 import type {
   CommandStatus, WorkbookAck, WorkbookCommand, WorkbookCommandFrameRequest,
   WorkbookCommandSelection, WorkbookSession, XlsxRangeTarget,
@@ -102,8 +102,13 @@ export type PeerlessWorkerInputEvent = {
   ack: WorkbookAck;
 };
 
+export interface PeerlessWorkerInputSeal extends InputSeal {
+  compositionDraft?(): InputDraft | null;
+}
+
 export interface PeerlessWorkerInputCoordinatorHooks
   extends Pick<InputCoordinatorHooks, 'generation' | 'seal' | 'sync'> {
+  seal(): PeerlessWorkerInputSeal;
   session(): PeerlessWorkerCommandSession | null;
   isReady(): boolean;
   compositionId?(): string | undefined;
@@ -175,6 +180,13 @@ interface PeerlessEntry {
 interface PeerlessGate {
   run(): void | Promise<void>;
   reject(error: unknown): void;
+  recoveryInput?(): PeerlessWorkerCommandInput | null;
+}
+
+interface PeerlessInputBarrier {
+  ticket?: PeerlessWorkerCommandTicket;
+  composition?: Promise<boolean>;
+  compositionDraft?(): InputDraft | null;
 }
 
 function commandTarget(input: PeerlessWorkerCommandInput): XlsxRangeTarget | null {
@@ -213,6 +225,8 @@ export function createPeerlessWorkerInputCoordinator(
   let suspended = false;
   let nextSeq = 1;
   let throughSeq = 0;
+  let presentationSeq = 0;
+  let inputBarrier: PeerlessInputBarrier | undefined;
   let boundary: PeerlessWorkerCommandTicket | undefined;
   let last: PeerlessWorkerCommandTicket | undefined;
   let compositions = new Map<string, PeerlessWorkerCommandTicket>();
@@ -223,7 +237,7 @@ export function createPeerlessWorkerInputCoordinator(
   let offAck = () => {};
   let offFailure = () => {};
   let pumping = false;
-  let blocked: object | null = null;
+  let blocked: PeerlessEntry | PeerlessGate | null = null;
   let insertion: number | null = null;
   let admittedReadOnly: boolean | null = null;
   let admittedAfter: { last: PeerlessWorkerCommandTicket | null;
@@ -261,6 +275,7 @@ export function createPeerlessWorkerInputCoordinator(
     blocked = null;
     cycle = deferred<never>();
     boundary = undefined;
+    inputBarrier = undefined;
     last = undefined;
     draft = null;
     rejected = [];
@@ -282,6 +297,7 @@ export function createPeerlessWorkerInputCoordinator(
     failure = null;
     localReadOnly = hooks.readOnly?.() ?? false;
     throughSeq = session?.throughSeq ?? 0;
+    presentationSeq = throughSeq;
     nextSeq = throughSeq + 1;
     const lease = cycle;
     offAck = session?.onAck((ack) => {
@@ -310,9 +326,12 @@ export function createPeerlessWorkerInputCoordinator(
   };
   const fail = (error: unknown) => {
     if (failure || retired) return;
-    recoveryCommands = queue.filter((entry): entry is PeerlessEntry => 'ticket' in entry &&
-      !entry.ticket.failure && !dependencyFailed(entry) && entry.input !== null)
-      .map((entry) => structuredClone(entry.input!));
+    const pending = blocked && !('ticket' in blocked) ? [blocked, ...queue] : queue;
+    recoveryCommands = pending.flatMap((entry) => {
+      if ('ticket' in entry && (entry.ticket.failure || dependencyFailed(entry))) return [];
+      const input = 'ticket' in entry ? entry.input : entry.recoveryInput?.();
+      return input ? [structuredClone(input)] : [];
+    });
     failure = { error };
     localReadOnly = true;
     cycle.reject(error);
@@ -414,6 +433,8 @@ export function createPeerlessWorkerInputCoordinator(
           queue.shift();
           const dispatch = () => {
             const seq = nextSeq++;
+            if (entry.frame || !(entry.input?.kind === 'applyOps' && 'toolbar' in entry.input.payload &&
+              entry.input.payload.toolbar.id === 'refreshProposals')) presentationSeq = seq;
             Object.defineProperty(entry.ticket, 'seq', { value: seq, configurable: true });
             const command = { ...structuredClone(entry.input!), ...session!.commandIdentity, seq,
               basis: { ...session!.confirmedBasis }, ...(afterSeq ? { afterSeq } : {}),
@@ -569,25 +590,64 @@ export function createPeerlessWorkerInputCoordinator(
       const after = { last: last ?? null, boundary: boundary ?? null };
       const seal = hooks.seal();
       if (seal.refused) throw new XlsxCommandAdmissionError(seal.refused);
-      const composedTarget = seal.composition && draft ? { ...draft } : null;
-      const compositionId = seal.composition ? hooks.compositionId?.() ?? compositionIds.get(seal.composition) ??
+      const previousInput = inputBarrier;
+      const composition = seal.composition !== previousInput?.composition ? seal.composition : undefined;
+      if (!seal.composition) hooks.sync();
+      const completed = previousInput?.compositionDraft?.();
+      const changed = completed && draft && (!sameCell(completed, draft) || completed.value !== draft.value ||
+        'revision' in completed && 'revision' in draft && completed.revision !== draft.revision);
+      const input: PeerlessInputBarrier = !composition && previousInput?.composition && !changed ? previousInput : {};
+      const reserved = composition ? deferred<CommandStatus>() : undefined;
+      const retainInput = (ticket?: PeerlessWorkerCommandTicket) => {
+        input.ticket = ticket;
+        const clear = () => { if (inputBarrier === input) inputBarrier = undefined; };
+        if (ticket) void ticket.result.then(clear, clear);
+        else clear();
+      };
+      const composedTarget = composition && draft ? { ...draft } : null;
+      const captureComposition = (finished: InputDraft) => composedTarget
+        ? { ...finished, generation: composedTarget.generation, sheet: composedTarget.sheet,
+          row: composedTarget.row, col: composedTarget.col, source: composedTarget.source } : finished;
+      const compositionId = composition ? hooks.compositionId?.() ?? compositionIds.get(composition) ??
         `local-composition:${nextCompositionId++}` : undefined;
-      if (seal.composition && compositionId) compositionIds.set(seal.composition, compositionId);
+      if (composition && compositionId) compositionIds.set(composition, compositionId);
       let sealed: PeerlessWorkerCommandTicket | undefined;
-      if (!seal.composition) { hooks.sync(); if (draft) sealed = submit(draft); }
+      let compositionSubmitted = false;
+      if (reserved) {
+        const ticket: PeerlessTicket = { seq: null, result: reserved.promise, lease: cycle };
+        Object.defineProperty(ticket, 'seq', { get: () => sealed?.seq ?? null });
+        void reserved.promise.then((status) => { ticket.outcome = status; pump(); }, (error) => { ticket.failure = { error }; pump(); });
+        void result.promise.catch(reserved.reject);
+        input.composition = composition;
+        input.compositionDraft = seal.compositionDraft;
+        inputBarrier = input;
+        retainInput(ticket);
+      } else if (!input.composition) {
+        if (seal.composition) hooks.sync();
+        if (draft) {
+          inputBarrier = input;
+          sealed = submit(draft, { after: previousInput?.ticket });
+          retainInput(sealed);
+        }
+      }
       const ahead = [...outstanding.values(), ...queue.slice(0, insertion ?? queue.length)
         .filter((entry): entry is PeerlessEntry => 'ticket' in entry)]
         .map((entry) => entry.ticket.result);
+      if (input.ticket) ahead.push(input.ticket.result);
       const invoke = () => {
         if (lease !== cycle) throw new XlsxCommandAdmissionError('document-replaced');
         check();
         const previous = admittedReadOnly;
         const previousAfter = admittedAfter;
         admittedReadOnly = readOnly;
-        admittedAfter = sealed ? { last: sealed, boundary: sealed } : after;
+        const dependency = sealed ?? input.ticket ?? previousInput?.ticket;
+        admittedAfter = dependency ? { last: dependency, boundary: dependency } : after;
         try {
           const value = operation();
-          void lease.wait(value).then(result.resolve, result.reject);
+          void lease.wait(value).then((value) => {
+            seal.restoreFocus?.();
+            result.resolve(value);
+          }, result.reject);
           return fence === true ? Promise.resolve(value).then(() => {}) : undefined;
         } finally { admittedReadOnly = previous; admittedAfter = previousAfter; }
       };
@@ -598,29 +658,42 @@ export function createPeerlessWorkerInputCoordinator(
         if (rejected.length) throw new XlsxCommandAdmissionError('input-failed');
         await invoke();
       };
-      enqueue({ reject: result.reject, run: () => {
-        if (seal.composition || fence) return (async () => {
-          if (seal.composition) {
-            const ended = await lease.wait(seal.composition);
+      enqueue({ reject: result.reject, recoveryInput: () => {
+        if (!composition || compositionSubmitted || readOnly ||
+          (input.ticket as PeerlessTicket | undefined)?.failure ||
+          (previousInput?.ticket as PeerlessTicket | undefined)?.failure) return null;
+        const finished = seal.compositionDraft?.();
+        if (!finished || finished.generation !== generation || finished.value === '' ||
+          'modified' in finished && finished.modified === false) return null;
+        const captured = captureComposition(finished);
+        const target = hooks.draftTarget?.(captured) ?? hooks.target(captured.sheet, captured.row, captured.col);
+        return { kind: 'editCell', payload: {
+          args: [captured.sheet, captured.row, captured.col, captured.value], target,
+        } };
+      }, run: () => {
+        if (composition || fence) return (async () => {
+          if (composition) {
+            const ended = await lease.wait(composition);
             if (lease !== cycle) throw new XlsxCommandAdmissionError('document-replaced');
             pumping = true;
             insertion = 0;
             try {
               if (ended) {
-                hooks.sync();
+                let finished = seal.compositionDraft?.();
+                if (!seal.compositionDraft) { hooks.sync(); finished = draft; }
                 const previous = admittedReadOnly;
                 admittedReadOnly = readOnly;
                 try {
-                  if (draft) {
-                    const finished = composedTarget ? { ...draft, generation: composedTarget.generation,
-                      sheet: composedTarget.sheet, row: composedTarget.row, col: composedTarget.col,
-                      source: composedTarget.source } : draft;
-                    sealed = submit(finished, { compositionId });
-                    ahead.push(sealed.result);
+                  if (finished) {
+                    compositionSubmitted = true;
+                    sealed = submit(captureComposition(finished), { compositionId, after: previousInput?.ticket });
                   }
                 }
                 finally { admittedReadOnly = previous; }
               }
+              sealed ??= previousInput?.ticket;
+              reserved!.resolve(sealed?.result ?? { seq: 0, status: 'noop', committed: false });
+              input.composition = undefined;
               if (fence) enqueue({ run: fencedInvoke, reject: result.reject });
               else invoke();
             } finally {
@@ -654,7 +727,11 @@ export function createPeerlessWorkerInputCoordinator(
     get throughSeq() { current(); return throughSeq; },
     get submittedThroughSeq() { current(); return nextSeq - 1; },
     get recoveryCommands() { return structuredClone(recoveryCommands); },
-    setDraft(value) { current(); draft = value ? Object.freeze({ ...value }) : null; },
+    setDraft(value) {
+      current();
+      if (!value || (!draft && !inputBarrier?.composition)) inputBarrier = undefined;
+      draft = value ? Object.freeze({ ...value }) : null;
+    },
     discardRejected(value) {
       current();
       rejected = rejected.filter((entry) => !sameCell(entry, value));
@@ -729,7 +806,7 @@ export function createPeerlessWorkerInputCoordinator(
       } catch (error) { return Promise.reject(error); }
     },
     save: () => runAfterPendingInput(() => session!.save(), true),
-    whenPresented: (seq) => runAfterPendingInput(() => session!.whenPresented(seq ?? nextSeq - 1), true),
+    whenPresented: (seq) => runAfterPendingInput(() => session!.whenPresented(seq ?? presentationSeq), true),
     subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     fail,
     reset() { current(); invalidate(new XlsxCommandAdmissionError('document-replaced')); suspended = true; },
