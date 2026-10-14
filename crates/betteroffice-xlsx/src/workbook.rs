@@ -3,6 +3,8 @@ pub(crate) mod batch;
 mod edit_tests;
 #[cfg(test)]
 mod format_calculation_tests;
+#[cfg(test)]
+mod format_facets_tests;
 mod geometry;
 mod recovery;
 #[cfg(test)]
@@ -1544,6 +1546,7 @@ impl Workbook {
                 .into_iter()
                 .map(|(_, format)| format)
                 .collect(),
+            kept: Vec::new(),
         })
     }
 

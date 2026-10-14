@@ -1,8 +1,8 @@
 use std::collections::LinkedList;
 
 use xlsx_model::styles::{
-    Alignment, Border, BorderEdge, BorderStyle, Color, Fill, Font, HAlign, PatternType, Theme,
-    VAlign, Xf,
+    Alignment, Border, BorderEdge, BorderStyle, Color, Fill, Font, HAlign, PatternType, Protection,
+    Theme, VAlign, Xf,
 };
 use xlsx_model::{AnchorCell, ChartRefKind};
 
@@ -338,6 +338,17 @@ impl Codec for u16 {
     fn read(r: &mut Reader<'_>) -> SnapshotResult<Self> {
         u16::try_from(r.var_u32()?)
             .map_err(|_| SnapshotError::new("snapshot integer overflows u16"))
+    }
+}
+
+impl Codec for i32 {
+    fn write(&self, w: &mut Writer) {
+        w.var_i64(i64::from(*self));
+    }
+
+    fn read(r: &mut Reader<'_>) -> SnapshotResult<Self> {
+        i32::try_from(r.var_i64()?)
+            .map_err(|_| SnapshotError::new("snapshot integer overflows i32"))
     }
 }
 
@@ -809,14 +820,98 @@ struct_codec!(Alignment {
     h,
     v,
     wrap_text,
+    shrink_to_fit,
+    text_rotation,
+    indent,
+    relative_indent,
+    justify_last_line,
+    reading_order
+});
+struct_codec!(Protection { locked, hidden });
+
+/// `Alignment` as laid out before format facets.
+struct LegacyAlignment {
+    h: Option<HAlign>,
+    v: Option<VAlign>,
+    wrap_text: bool,
+    shrink_to_fit: bool,
+}
+struct_codec!(LegacyAlignment {
+    h,
+    v,
+    wrap_text,
     shrink_to_fit
 });
-struct_codec!(Xf {
+
+/// `Xf` as laid out before format facets, which it reads as absent.
+pub(crate) struct LegacyXf {
+    font: Option<u32>,
+    fill: Option<u32>,
+    border: Option<u32>,
+    num_fmt_id: Option<u16>,
+    alignment: Option<LegacyAlignment>,
+}
+struct_codec!(LegacyXf {
     font,
     fill,
     border,
     num_fmt_id,
     alignment
+});
+
+impl From<&Xf> for LegacyXf {
+    fn from(xf: &Xf) -> Self {
+        let alignment = xf.alignment.as_ref();
+        Self {
+            font: xf.font,
+            fill: xf.fill,
+            border: xf.border,
+            num_fmt_id: xf.num_fmt_id,
+            alignment: alignment.map(|alignment| LegacyAlignment {
+                h: alignment.h,
+                v: alignment.v,
+                wrap_text: alignment.wrap_text,
+                shrink_to_fit: alignment.shrink_to_fit,
+            }),
+        }
+    }
+}
+
+impl From<LegacyXf> for Xf {
+    fn from(xf: LegacyXf) -> Self {
+        let LegacyXf {
+            font,
+            fill,
+            border,
+            num_fmt_id,
+            alignment,
+        } = xf;
+        Self {
+            font,
+            fill,
+            border,
+            num_fmt_id,
+            alignment: alignment.map(|alignment| Alignment {
+                h: alignment.h,
+                v: alignment.v,
+                wrap_text: alignment.wrap_text,
+                shrink_to_fit: alignment.shrink_to_fit,
+                ..Alignment::default()
+            }),
+            ..Self::default()
+        }
+    }
+}
+struct_codec!(Xf {
+    font,
+    fill,
+    border,
+    num_fmt_id,
+    alignment,
+    protection,
+    xf_id,
+    quote_prefix,
+    pivot_button
 });
 struct_codec!(AnchorCell {
     col,
@@ -1190,17 +1285,40 @@ impl Codec for ChartAnchor {
 }
 
 const BASE_SECTIONS: usize = 16;
-/// Record tags of the fill and border sections since patterned fills; the section
-/// numbers themselves tag records in the released layout.
+const XF_SECTION: usize = 13;
+/// Tags an `XF_SECTION` record laid out with format facets; a record tagged
+/// with the section itself predates them.
+const XF_V2_TAG: usize = 17;
 const FILL_RECORD: usize = 18;
 const BORDER_RECORD: usize = 19;
 
 fn base_section(tag: usize) -> usize {
     match tag {
+        XF_V2_TAG => XF_SECTION,
         FILL_RECORD => 11,
         BORDER_RECORD => 12,
         tag => tag,
     }
+}
+
+/// `record` as releases before format facets wrote it: an `XF_SECTION` record
+/// holding such a release's reading moves to their layout, any other stays as
+/// it is.
+#[cfg(test)]
+pub(crate) fn released_base_layout(record: &[u8]) -> Vec<u8> {
+    if record.first() != Some(&(XF_V2_TAG as u8)) {
+        return record.to_vec();
+    }
+    let xf = Xf::read(&mut Reader::new(&record[1..])).unwrap();
+    let mut w = Writer::new();
+    w.u8(XF_SECTION as u8);
+    LegacyXf::from(&xf).write(&mut w);
+    let released = w.into_bytes();
+    assert_eq!(
+        Xf::from(LegacyXf::read(&mut Reader::new(&released[1..])).unwrap()),
+        xf
+    );
+    released
 }
 
 fn base_counts(base: &WorkbookBase) -> [usize; BASE_SECTIONS] {
@@ -1305,10 +1423,12 @@ impl BaseCursor {
             styles,
             tables,
         } = base;
+        let released = self.section == XF_SECTION && styles.is_released_xf(self.index);
         let mut w = Writer::new();
         w.u8(match self.section {
             11 => FILL_RECORD,
             12 => BORDER_RECORD,
+            XF_SECTION if !released => XF_V2_TAG,
             section => section,
         } as u8);
         let index = self.index;
@@ -1337,6 +1457,7 @@ impl BaseCursor {
             10 => styles.fonts[index].write(&mut w),
             11 => styles.fills[index].write(&mut w),
             12 => styles.borders[index].write(&mut w),
+            13 if released => LegacyXf::from(&styles.cell_xfs[index]).write(&mut w),
             13 => styles.cell_xfs[index].write(&mut w),
             14 => styles.num_fmts[index].write(&mut w),
             15 => styles.indexed_colors[index].write(&mut w),
@@ -1602,6 +1723,7 @@ enum BaseRecord {
     Fill(Fill),
     Border(Border),
     Xf(Xf),
+    ReleasedXf(Xf),
     NumberFormat((u16, String)),
     Color(String),
     Table(Table),
@@ -1632,7 +1754,8 @@ impl BaseRecord {
             10 => r.value::<Font>()?,
             11 => r.value::<Released<Fill>>()?,
             12 => r.value::<Released<Border>>()?,
-            13 => r.value::<Xf>()?,
+            XF_SECTION => r.value::<LegacyXf>()?,
+            XF_V2_TAG => r.value::<Xf>()?,
             14 => r.value::<(u16, String)>()?,
             16 => r.value::<Table>()?,
             FILL_RECORD => r.value::<Fill>()?,
@@ -1663,7 +1786,8 @@ impl BaseRecord {
             10 => Font::decode_cost(),
             11 => Released::<Fill>::decode_cost(),
             12 => Released::<Border>::decode_cost(),
-            13 => Xf::decode_cost(),
+            XF_SECTION => LegacyXf::decode_cost(),
+            XF_V2_TAG => Xf::decode_cost(),
             14 => <(u16, String)>::decode_cost(),
             16 => Table::decode_cost(),
             FILL_RECORD => Fill::decode_cost(),
@@ -1719,7 +1843,8 @@ impl BaseRecord {
             10 => Self::Font(r.value()?),
             11 => Self::Fill(r.value::<Released<Fill>>()?.0),
             12 => Self::Border(r.value::<Released<Border>>()?.0),
-            13 => Self::Xf(r.value()?),
+            XF_SECTION => Self::ReleasedXf(r.value::<LegacyXf>()?.into()),
+            XF_V2_TAG => Self::Xf(r.value()?),
             14 => Self::NumberFormat(r.value()?),
             15 => Self::Color(r.value()?),
             16 => Self::Table(r.value()?),
@@ -1846,6 +1971,7 @@ impl BaseBuilder {
                     BaseRecord::Fill(value) => base.styles.fills.push(value),
                     BaseRecord::Border(value) => base.styles.borders.push(value),
                     BaseRecord::Xf(value) => base.styles.cell_xfs.push(value),
+                    BaseRecord::ReleasedXf(value) => base.styles.push_released_xf(value),
                     BaseRecord::NumberFormat(value) => base.styles.num_fmts.push(value),
                     BaseRecord::Color(value) => base.styles.indexed_colors.push(value),
                     BaseRecord::Table(value) => base.tables.push(value),
@@ -1941,7 +2067,8 @@ impl BaseBuilder {
                     .styles
                     .borders
                     .push(Released::<Border>::read(&mut r)?.0),
-                13 => base.styles.cell_xfs.push(Codec::read(&mut r)?),
+                XF_V2_TAG => base.styles.cell_xfs.push(Codec::read(&mut r)?),
+                XF_SECTION => base.styles.push_released_xf(LegacyXf::read(&mut r)?.into()),
                 14 => base.styles.num_fmts.push(Codec::read(&mut r)?),
                 15 => base.styles.indexed_colors.push(Codec::read(&mut r)?),
                 16 => base.tables.push(Codec::read(&mut r)?),
@@ -3269,7 +3396,19 @@ mod tests {
                     v: Some(VAlign::Top),
                     wrap_text: true,
                     shrink_to_fit: false,
+                    text_rotation: Some(255),
+                    indent: Some(4),
+                    relative_indent: Some(-2),
+                    justify_last_line: Some(true),
+                    reading_order: Some(2),
                 }),
+                protection: Some(Protection {
+                    locked: false,
+                    hidden: true,
+                }),
+                xf_id: Some(1),
+                quote_prefix: true,
+                pivot_button: true,
             },
             Xf::default(),
         ];
@@ -3698,6 +3837,69 @@ mod tests {
                 hydrator.finish().err().unwrap().to_string(),
                 "authority snapshot has pending Yrs state"
             );
+        }
+    }
+
+    #[test]
+    fn base_xf_records_released_before_format_facets_still_decode() {
+        let mut a = source();
+        let base = Arc::make_mut(&mut a.base);
+        base.styles.fonts = vec![Font::default()];
+        base.styles.cell_xfs = vec![
+            Xf {
+                font: Some(0),
+                num_fmt_id: Some(9),
+                alignment: Some(Alignment {
+                    h: Some(HAlign::Right),
+                    v: Some(VAlign::Center),
+                    wrap_text: true,
+                    ..Alignment::default()
+                }),
+                ..Xf::default()
+            },
+            Xf::default(),
+        ];
+        let records = base_records(&a.base);
+        let first = 1 + base_counts(&a.base)[..12].iter().sum::<usize>();
+        let xfs = first..first + a.base.styles.cell_xfs.len();
+        let released = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                if !xfs.contains(&index) {
+                    return record.clone();
+                }
+                let xf = &a.base.styles.cell_xfs[index - first];
+                let mut w = Writer::new();
+                w.u8(13);
+                xf.font.write(&mut w);
+                xf.fill.write(&mut w);
+                xf.border.write(&mut w);
+                xf.num_fmt_id.write(&mut w);
+                w.option(xf.alignment.as_ref(), |w, alignment| {
+                    alignment.h.write(w);
+                    alignment.v.write(w);
+                    alignment.wrap_text.write(w);
+                    alignment.shrink_to_fit.write(w);
+                });
+                w.into_bytes()
+            })
+            .collect::<Vec<_>>();
+        let budget = SnapshotBudget::new(1, 4096).unwrap();
+        let mut bounded = BaseBuilder::default();
+        let mut whole = BaseBuilder::default();
+        for record in &released {
+            while !bounded.push_bounded(record, budget).unwrap() {}
+            whole.push(record).unwrap();
+        }
+        for builder in [bounded, whole] {
+            assert_eq!(
+                builder.finish().unwrap().styles.cell_xfs,
+                a.base.styles.cell_xfs
+            );
+        }
+        for index in xfs {
+            assert_ne!(records[index][0], 13);
         }
     }
 }

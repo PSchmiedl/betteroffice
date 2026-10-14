@@ -33,7 +33,7 @@ mod style_match;
 mod style_match_tests;
 
 pub use style_match::keeps_source;
-pub(crate) use style_match::{SourceStyles, StyleMatch};
+pub(crate) use style_match::{SourceStyles, StyleMatch, keeps_source_xf, retains_source_styles};
 
 #[cfg(any(test, feature = "test-oracle"))]
 thread_local! {

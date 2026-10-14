@@ -386,13 +386,51 @@ pub struct Alignment {
     pub v: Option<VAlign>,
     pub wrap_text: bool,
     pub shrink_to_fit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_rotation: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indent: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_indent: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub justify_last_line: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading_order: Option<u32>,
 }
 
 impl Alignment {
     /// true when the element carries no meaningful alignment.
     pub fn is_empty(&self) -> bool {
-        self.h.is_none() && self.v.is_none() && !self.wrap_text && !self.shrink_to_fit
+        self.h.is_none()
+            && self.v.is_none()
+            && !self.wrap_text
+            && !self.shrink_to_fit
+            && self.text_rotation.is_none()
+            && self.indent.is_none()
+            && self.relative_indent.is_none()
+            && self.justify_last_line.is_none()
+            && self.reading_order.is_none()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Protection {
+    pub locked: bool,
+    pub hidden: bool,
+}
+
+impl Default for Protection {
+    fn default() -> Self {
+        Self {
+            locked: true,
+            hidden: false,
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// a cell format record (`CT_Xf` in cellXfs). a `None` pool index means
@@ -404,6 +442,40 @@ pub struct Xf {
     pub border: Option<u32>,
     pub num_fmt_id: Option<u16>,
     pub alignment: Option<Alignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection: Option<Protection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xf_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quote_prefix: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pivot_button: bool,
+}
+
+impl Xf {
+    /// this entry as releases before format facets read it: no protection,
+    /// parent style or prefix flags, and only the alignment they modeled.
+    pub fn released_reading(&self) -> Self {
+        let alignment = self
+            .alignment
+            .as_ref()
+            .map(|alignment| Alignment {
+                h: alignment.h,
+                v: alignment.v,
+                wrap_text: alignment.wrap_text,
+                shrink_to_fit: alignment.shrink_to_fit,
+                ..Alignment::default()
+            })
+            .filter(|alignment| !alignment.is_empty());
+        Self {
+            font: self.font,
+            fill: self.fill,
+            border: self.border,
+            num_fmt_id: self.num_fmt_id,
+            alignment,
+            ..Self::default()
+        }
+    }
 }
 
 /// the workbook theme colors in clrScheme declaration order
@@ -670,6 +742,10 @@ pub struct Stylesheet {
     /// `#rrggbb` entries; empty strings preserve omitted colors and use the default index.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub indexed_colors: Vec<String>,
+    /// set at the `cell_xfs` indices read from snapshot records written before
+    /// format facets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    released_xfs: Vec<bool>,
     #[serde(skip)]
     font_memo: PoolMemo,
     #[serde(skip)]
@@ -722,6 +798,14 @@ pub struct CellFormat {
     pub border: Border,
     pub number_format: NumberFormat,
     pub alignment: Alignment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection: Option<Protection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xf_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quote_prefix: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pivot_button: bool,
 }
 
 /// borrowed view of a resolved cell format; defaults mirror [`CellFormat::default`].
@@ -732,6 +816,10 @@ pub struct ResolvedFormat<'a> {
     pub border: &'a Border,
     pub number_format: FormatCode<'a>,
     pub alignment: &'a Alignment,
+    pub protection: Option<&'a Protection>,
+    pub xf_id: Option<u32>,
+    pub quote_prefix: bool,
+    pub pivot_button: bool,
 }
 
 const DEFAULT_FONT: Font = Font {
@@ -756,6 +844,11 @@ const DEFAULT_ALIGNMENT: Alignment = Alignment {
     v: None,
     wrap_text: false,
     shrink_to_fit: false,
+    text_rotation: None,
+    indent: None,
+    relative_indent: None,
+    justify_last_line: None,
+    reading_order: None,
 };
 
 impl Stylesheet {
@@ -769,6 +862,7 @@ impl Stylesheet {
             num_fmts,
             theme: _,
             indexed_colors,
+            released_xfs: _,
             font_memo: _,
             fill_memo: _,
             border_memo: _,
@@ -866,6 +960,10 @@ impl Stylesheet {
                 },
             },
             alignment: resolved.alignment.clone(),
+            protection: resolved.protection.copied(),
+            xf_id: resolved.xf_id,
+            quote_prefix: resolved.quote_prefix,
+            pivot_button: resolved.pivot_button,
         }
     }
 
@@ -893,6 +991,10 @@ impl Stylesheet {
             alignment: xf
                 .and_then(|xf| xf.alignment.as_ref())
                 .unwrap_or(&DEFAULT_ALIGNMENT),
+            protection: xf.and_then(|xf| xf.protection.as_ref()),
+            xf_id: xf.and_then(|xf| xf.xf_id),
+            quote_prefix: xf.is_some_and(|xf| xf.quote_prefix),
+            pivot_button: xf.is_some_and(|xf| xf.pivot_button),
         }
     }
 
@@ -924,6 +1026,10 @@ impl Stylesheet {
                 border: (format.border != Border::default()).then_some(border),
                 num_fmt_id,
                 alignment,
+                protection: format.protection,
+                xf_id: format.xf_id,
+                quote_prefix: format.quote_prefix,
+                pivot_button: format.pivot_button,
             };
             if let Some(index) = xf.font
                 && xf.fill.is_none()
@@ -960,6 +1066,10 @@ impl Stylesheet {
                 border: (format.border != Border::default()).then_some(border),
                 num_fmt_id,
                 alignment,
+                protection: format.protection,
+                xf_id: format.xf_id,
+                quote_prefix: format.quote_prefix,
+                pivot_button: format.pivot_button,
             };
             return Ok(Some(intern_linear(&mut self.cell_xfs, &xf)));
         }
@@ -985,6 +1095,10 @@ impl Stylesheet {
                 border: has_border.then_some(border),
                 num_fmt_id,
                 alignment,
+                protection: format.protection,
+                xf_id: format.xf_id,
+                quote_prefix: format.quote_prefix,
+                pivot_button: format.pivot_button,
             };
             let has_new_facet = (self.fonts.len() != font_len && has_font)
                 || (self.fills.len() != fill_len && has_fill)
@@ -1034,6 +1148,10 @@ impl Stylesheet {
             border: (format.border != Border::default()).then_some(border),
             num_fmt_id,
             alignment,
+            protection: format.protection,
+            xf_id: format.xf_id,
+            quote_prefix: format.quote_prefix,
+            pivot_button: format.pivot_button,
         };
         self.intern_xf(&xf)
     }
@@ -1056,7 +1174,25 @@ impl Stylesheet {
         self.fills.truncate(marks.fills);
         self.borders.truncate(marks.borders);
         self.cell_xfs.truncate(marks.cell_xfs);
+        self.released_xfs.truncate(marks.cell_xfs);
         self.num_fmts.truncate(marks.num_fmts);
+    }
+
+    /// appends `xf` as read from a snapshot record written before format facets.
+    #[doc(hidden)]
+    pub fn push_released_xf(&mut self, xf: Xf) {
+        self.released_xfs.resize(self.cell_xfs.len(), false);
+        self.released_xfs.push(true);
+        self.cell_xfs.push(xf);
+    }
+
+    /// whether `cell_xfs[index]` was read from a snapshot record written before
+    /// format facets and still holds only what such a record carries.
+    #[doc(hidden)]
+    pub fn is_released_xf(&self, index: usize) -> bool {
+        let entry = self.cell_xfs.get(index);
+        self.released_xfs.get(index) == Some(&true)
+            && entry.is_some_and(|xf| *xf == xf.released_reading())
     }
 
     fn intern_font(&mut self, value: &Font) -> u32 {
@@ -1335,6 +1471,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn format_facets_intern_and_serialize_in_small_and_large_pools() {
+        let mut value = serde_json::to_value(CellFormat::default()).unwrap();
+        value["protection"] = serde_json::json!({"locked": false, "hidden": true});
+        value["xfId"] = serde_json::json!(3);
+        value["quotePrefix"] = serde_json::json!(true);
+        value["pivotButton"] = serde_json::json!(true);
+        value["alignment"]["text_rotation"] = serde_json::json!(255);
+        value["alignment"]["indent"] = serde_json::json!(4);
+        value["alignment"]["relative_indent"] = serde_json::json!(-2);
+        value["alignment"]["justify_last_line"] = serde_json::json!(true);
+        value["alignment"]["reading_order"] = serde_json::json!(2);
+        let format: CellFormat = serde_json::from_value(value.clone()).unwrap();
+        for size in [0, INTERN_CACHE_MIN_POOL, INTERN_CACHE_MIN_POOL + 1] {
+            let mut styles = Stylesheet::default();
+            for id in 0..size {
+                styles.cell_xfs.push(Xf {
+                    num_fmt_id: Some(id as u16),
+                    ..Default::default()
+                });
+            }
+            for number_format in [
+                NumberFormat::default(),
+                NumberFormat::Custom {
+                    pattern: "0.000".into(),
+                },
+            ] {
+                let mut format = format.clone();
+                format.number_format = number_format;
+                let index = styles.intern_cell_format(&format).unwrap().unwrap();
+                assert_eq!(styles.intern_cell_format(&format).unwrap(), Some(index));
+                let resolved = styles.cell_format(Some(index));
+                let mut expected = value.clone();
+                expected["numberFormat"] = serde_json::to_value(&format.number_format).unwrap();
+                assert_eq!(serde_json::to_value(&resolved).unwrap(), expected);
+                let mut other = expected.clone();
+                other["protection"]["locked"] = serde_json::json!(true);
+                let other = serde_json::from_value(other).unwrap();
+                let other_index = styles.intern_cell_format(&other).unwrap().unwrap();
+                assert_ne!(index, other_index);
+                assert_ne!(
+                    styles.resolved_format(Some(index)),
+                    styles.resolved_format(Some(other_index))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_cell_format_json_stays_unchanged() {
+        let value = serde_json::json!({
+            "font": {"name": null, "size_pt": null, "bold": false, "italic": false,
+                "underline": false, "strike": false, "color": null},
+            "fill": "None", "border": {"left": null, "right": null, "top": null, "bottom": null},
+            "numberFormat": {"kind": "builtin", "id": 0},
+            "alignment": {"h": null, "v": null, "wrap_text": false, "shrink_to_fit": false}
+        });
+        let format: CellFormat = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(format, CellFormat::default());
+        assert_eq!(serde_json::to_value(format).unwrap(), value);
+        let xf = serde_json::json!({"font": null, "fill": null, "border": null,
+            "num_fmt_id": null, "alignment": null});
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<Xf>(xf.clone()).unwrap()).unwrap(),
+            xf
+        );
+    }
+
+    #[test]
     fn theme_slot_swaps_first_two_pairs() {
         let t = Theme::default();
         assert_eq!(t.slot(0), Some("#ffffff"));
@@ -1428,7 +1632,9 @@ mod tests {
                         v: Some(VAlign::Center),
                         wrap_text: true,
                         shrink_to_fit: false,
+                        ..Alignment::default()
                     }),
+                    ..Xf::default()
                 },
             ],
             num_fmts: vec![(164, "0.0\"%\"".into())],
