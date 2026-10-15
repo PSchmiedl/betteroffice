@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useInsertionEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent, type ReactElement, type ReactNode, type RefObject } from 'react';
 import type { DocxEchoRect } from '@betteroffice/docx/peerless';
 import type { DocxCommandPageIdentity } from '@betteroffice/docx/peerless';
+import { displayPageNoteAnchorRevision, displayPageRevision } from '@betteroffice/docx/layout/render';
 import { findVerticalScrollParentOrRoot } from '@betteroffice/docx/utils/findVerticalScrollParent';
 import { nextPageWindow } from '../CanvasPagesView';
 import { viewportColumnBand } from '../internals/viewportBand';
@@ -34,10 +35,12 @@ function pageLayout(pages: readonly PageGeometry[]) {
   return layout;
 }
 
-const PeerlessPage = memo(function PeerlessPage({ geometry, canvasForPage, visible, hold, fullMirror }: {
+const PeerlessPage = memo(function PeerlessPage({ geometry, canvasForPage, visible, noteAnchorRevision, hold, fullMirror }: {
   geometry: PageGeometry;
   canvasForPage(page: DocxCommandPageIdentity): HTMLCanvasElement | null;
   visible: boolean;
+  revision: number;
+  noteAnchorRevision: number;
   hold: PageChromeHold;
   fullMirror: boolean;
 }): ReactElement {
@@ -59,10 +62,12 @@ const PeerlessPage = memo(function PeerlessPage({ geometry, canvasForPage, visib
     data-page-index={geometry.page.pageIndex}
     className="paged-editor__page canvas-page"
     style={{ position: 'absolute', left: geometry.bounds.x, top: geometry.bounds.y, width: geometry.bounds.width, height: geometry.bounds.height, background: 'white', touchAction: 'none' }}
-  >{geometry.displayPage && <CanvasPageMirror page={geometry.displayPage} active={visible && fullMirror} visible={visible} hold={hold} />}</div>;
+  >{geometry.displayPage && <CanvasPageMirror page={geometry.displayPage} active={visible && fullMirror} visible={visible}
+    noteAnchorRevision={noteAnchorRevision} hold={hold} />}</div>;
 }, (previous, next) => previous.canvasForPage === next.canvasForPage &&
   previous.visible === next.visible && previous.hold === next.hold && previous.fullMirror === next.fullMirror &&
   previous.geometry.displayPage === next.geometry.displayPage &&
+  previous.revision === next.revision && previous.noteAnchorRevision === next.noteAnchorRevision &&
   previous.geometry.page.pageId === next.geometry.page.pageId &&
   previous.geometry.page.pageIndex === next.geometry.page.pageIndex &&
   previous.geometry.bounds.x === next.geometry.bounds.x && previous.geometry.bounds.y === next.geometry.bounds.y &&
@@ -78,7 +83,9 @@ const PeerlessPages = memo(function PeerlessPages({ pages, visiblePages, canvasF
   const visible = new Set(visiblePages.map(({ page }) => page.pageId));
   return <>{pages.filter((page) => visible.has(page.page.pageId) || page.displayPage?.unbuilt === false ||
     (page.displayPage && !page.displayPage.unbuilt)).map((page) => <PeerlessPage key={page.page.pageId}
-      geometry={page} visible={visible.has(page.page.pageId)} hold={hold} fullMirror={!textMirror} canvasForPage={canvasForPage} />)}</>;
+      geometry={page} visible={visible.has(page.page.pageId)} hold={hold} fullMirror={!textMirror} canvasForPage={canvasForPage}
+      revision={page.displayPage ? displayPageRevision(page.displayPage) : 0}
+      noteAnchorRevision={page.displayPage ? displayPageNoteAnchorRevision(page.displayPage) : 0} />)}</>;
 });
 
 function PeerlessCaret({ caret, input }: { caret: DocxEchoRect; input: RefObject<HTMLTextAreaElement | null> }): ReactElement {
