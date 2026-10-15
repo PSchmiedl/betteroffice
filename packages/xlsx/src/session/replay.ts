@@ -1,12 +1,16 @@
 import type { MethodPolicies } from '../../../../shared/office-session';
-import type { WorkbookCalculationContext, WorkbookHandle } from '../wasm/loader';
+import type { StaleProposalTarget, Viewport, WorkbookCalculationContext, WorkbookHandle } from '../wasm/loader';
 import type { WorkbookSession } from './client';
+import type { WorkbookFrame, WorkbookWireFrame } from './methods';
 
 export const WORKBOOK_REPLAY_MUTATORS = {
   editCell: true,
   editCells: true,
   applyEdits: true,
   applyOps: true,
+  propose: true,
+  acceptProposal: true,
+  rejectProposal: true,
   patchRangeStyle: true,
   setNumberFormat: true,
   applyFormat: true,
@@ -20,12 +24,13 @@ export type WorkbookReplayMethod = keyof typeof WORKBOOK_REPLAY_MUTATORS;
 
 export type WorkbookReplayOp = {
   [K in WorkbookReplayMethod]: { method: K; args: Parameters<WorkbookHandle[K]> }
-}[WorkbookReplayMethod];
+}[WorkbookReplayMethod] & { calculation?: WorkbookCalculationContext };
 
 export interface WorkbookReplayEnvelope {
   sequence: number;
   calculation: WorkbookCalculationContext;
   op: WorkbookReplayOp;
+  staleProposal?: { cells: string[]; targets: StaleProposalTarget[] };
 }
 
 export interface WorkbookReplayReply {
@@ -36,18 +41,39 @@ export interface WorkbookReplayReply {
 }
 
 export type WorkbookInternalSessionMethods = {
+  beginPeerSnapshot(records: number, bytes: number): { version: string; sequence: number };
+  pullPeerSnapshot(): ArrayBuffer[] | undefined;
+  endPeerSnapshot(discard: boolean): void;
+  attachPeer(version: string, sequence: number): void;
+  detachPeer(): void;
   replay(envelope: WorkbookReplayEnvelope): WorkbookReplayReply;
+  preview(viewport: Viewport, sheet: number, ops: readonly WorkbookReplayOp[]): WorkbookWireFrame;
 };
 
-export const WORKBOOK_INTERNAL_SESSION_METHODS = { replay: true } as const;
+export const WORKBOOK_INTERNAL_SESSION_METHODS = {
+  beginPeerSnapshot: true, pullPeerSnapshot: true, endPeerSnapshot: true,
+  attachPeer: true, detachPeer: true, replay: true, preview: true,
+} as const;
 
 export const WORKBOOK_INTERNAL_SESSION_POLICIES: MethodPolicies<WorkbookInternalSessionMethods> = {
+  beginPeerSnapshot: { lane: 'interactive', reorderable: false },
+  pullPeerSnapshot: { lane: 'interactive', reorderable: false },
+  endPeerSnapshot: { lane: 'interactive', reorderable: false },
+  preview: { lane: 'input', reorderable: false },
+  attachPeer: { lane: 'input', reorderable: false },
+  detachPeer: { lane: 'input', reorderable: false },
   replay: { lane: 'input', mutates: true, userInput: true, reorderable: false },
 };
 
 export const workbookSessionInternals = new WeakMap<WorkbookSession, {
   replay(envelope: WorkbookReplayEnvelope): Promise<WorkbookReplayReply>;
+  initialVersion?: string;
+  attachPeer?(version: string): Promise<void>;
+  detachPeer?(): Promise<void>;
   editPeerAttached: boolean;
+  cellInput?(sheet: number, row: number, col: number): Promise<string>;
+  initialCalculation?: WorkbookCalculationContext | null;
+  preview?(viewport: Viewport, sheet: number, ops: readonly WorkbookReplayOp[]): Promise<WorkbookFrame>;
 }>();
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -156,6 +182,9 @@ function editRequest(value: unknown): boolean {
     })) return false;
     switch (step.op) {
       case 'setCellInputs': return matrix(step.inputs);
+      case 'setCellValues': return Array.isArray(step.values) && Array.from(step.values).every(
+        row => Array.isArray(row) && Array.from(row).every(cell => record(cell) && guard({ value: cell }))
+      );
       case 'setFormulas': return matrix(step.formulas);
       case 'setNumberFormat': return numberFormat(step.format);
       case 'patchStyle': return style(step.patch);
@@ -165,9 +194,50 @@ function editRequest(value: unknown): boolean {
 }
 
 function capturedCellFormat(value: unknown): boolean {
-  return record(value) && record(value.font) && (value.fill === 'None' || record(value.fill)) &&
-    record(value.border) && record(value.numberFormat) &&
+  return record(value) && record(value.font) && capturedFill(value.fill) &&
+    capturedBorder(value.border) && record(value.numberFormat) &&
     typeof value.numberFormat.kind === 'string' && record(value.alignment);
+}
+
+const patternTypes = new Set([
+  'gray125', 'gray0625', 'mediumGray', 'darkGray', 'lightGray', 'darkHorizontal',
+  'darkVertical', 'darkDown', 'darkUp', 'darkGrid', 'darkTrellis', 'lightHorizontal',
+  'lightVertical', 'lightDown', 'lightUp', 'lightGrid', 'lightTrellis',
+]);
+const capturedBorderStyles = new Set([
+  'Thin', 'Medium', 'Thick', 'Dashed', 'Dotted', 'Double', 'Hair', 'MediumDashed',
+  'DashDot', 'MediumDashDot', 'DashDotDot', 'MediumDashDotDot', 'SlantDashDot',
+]);
+
+function capturedColor(value: unknown): boolean {
+  if (value === 'Auto') return true;
+  if (!record(value) || Object.keys(value).length !== 1) return false;
+  if ('Rgb' in value) return typeof value.Rgb === 'string';
+  if ('Indexed' in value) return integer(value.Indexed) && value.Indexed <= 255;
+  return record(value.Theme) && integer(value.Theme.idx) && value.Theme.idx <= 255 &&
+    typeof value.Theme.tint === 'number' && Number.isFinite(value.Theme.tint);
+}
+
+function optionalCapturedColor(value: unknown): boolean {
+  return value === undefined || value === null || capturedColor(value);
+}
+
+function capturedFill(value: unknown): boolean {
+  if (value === 'None') return true;
+  if (!record(value) || Object.keys(value).length !== 1) return false;
+  if ('Solid' in value) return capturedColor(value.Solid);
+  const pattern = value.Pattern;
+  return record(pattern) && typeof pattern.pattern === 'string' && patternTypes.has(pattern.pattern) &&
+    optionalCapturedColor(pattern.fg) && optionalCapturedColor(pattern.bg);
+}
+
+function capturedEdge(value: unknown): boolean {
+  return value === undefined || value === null || (record(value) &&
+    typeof value.style === 'string' && capturedBorderStyles.has(value.style) && optionalCapturedColor(value.color));
+}
+
+function capturedBorder(value: unknown): boolean {
+  return record(value) && ['left', 'right', 'top', 'bottom'].every((side) => capturedEdge(value[side]));
 }
 
 function validOp(value: unknown): boolean {
@@ -183,6 +253,17 @@ function validOp(value: unknown): boolean {
     case 'applyOps':
       return args.length === 1 && Array.isArray(args[0]) &&
         Array.from(args[0]).every((op) => record(op) && typeof op.type === 'string');
+    case 'propose':
+      return args.length === 3 && typeof args[0] === 'string' &&
+        (args[1] === null || typeof args[1] === 'string') && Array.isArray(args[2]) &&
+        Array.from(args[2]).every((edit) => record(edit) && integer(edit.sheet) && point(edit) &&
+          typeof edit.input === 'string' && optionalFields(edit, { numberFormat }));
+    case 'acceptProposal':
+      return args.length >= 1 && args.length <= 2 && typeof args[0] === 'string' &&
+        (args[1] === undefined || (record(args[1]) && optionalFields(args[1], {
+          force: (field) => typeof field === 'boolean',
+        })));
+    case 'rejectProposal': return args.length === 1 && typeof args[0] === 'string';
     case 'patchRangeStyle':
       return args.length === 3 && integer(args[0]) && typeof args[1] === 'string' && style(args[2]);
     case 'setNumberFormat':
@@ -205,7 +286,14 @@ export function validateWorkbookReplayEnvelope(value: unknown): asserts value is
   if (!record(value) || !integer(value.sequence) || value.sequence === 0 ||
     !record(value.calculation) || !finite(value.calculation.nowSerial) ||
     !integer(value.calculation.randSeed) || value.calculation.randSeed > 0xffff_ffff ||
-    !validOp(value.op)) {
+    !validOp(value.op) || (value.staleProposal !== undefined && (
+      !record(value.staleProposal) || !strings(value.staleProposal.cells) ||
+      !Array.isArray(value.staleProposal.targets) ||
+      !Array.from(value.staleProposal.targets).every((target) => record(target) &&
+        integer(target.sheet) && integer(target.row) && integer(target.col) &&
+        typeof target.sheetId === 'string' && typeof target.a1 === 'string') ||
+      !record(value.op) || value.op.method !== 'acceptProposal'
+    ))) {
     const error = new TypeError('Malformed workbook replay envelope');
     error.name = 'WorkbookReplayValidationError';
     throw error;
@@ -224,6 +312,9 @@ export function applyWorkbookReplayOp(
     case 'editCells': return handle.editCells(...op.args);
     case 'applyEdits': return handle.applyEdits(...op.args);
     case 'applyOps': return handle.applyOps(...op.args);
+    case 'propose': return handle.propose(...op.args);
+    case 'acceptProposal': return handle.acceptProposal(...op.args);
+    case 'rejectProposal': return handle.rejectProposal(...op.args);
     case 'patchRangeStyle': return handle.patchRangeStyle(...op.args);
     case 'setNumberFormat': return handle.setNumberFormat(...op.args);
     case 'applyFormat': return handle.applyFormat(...op.args);

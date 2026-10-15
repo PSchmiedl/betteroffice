@@ -1,3 +1,4 @@
+import { normalizeSeedError } from './documentToYrs';
 import { readRetainedLayoutMeta } from './layoutMeta';
 import type {
   YrsChangeTarget,
@@ -36,6 +37,7 @@ import type { EditSession } from './wasm/index';
 import { resolveCommentMedia } from './hostMedia';
 import { registerSessionInternals } from './sessionInternals';
 import { editorSaveKeys } from './editorSaveKeys';
+import { checkPeerMetadataHeader, PeerMetadataError } from './peerMetadata';
 import { noteYrsStoriesDirty } from './yrsToDocument';
 import type {
   DocxParagraphAnchorResult,
@@ -46,15 +48,17 @@ import type {
 import { decodeS9Envelope, decodeS9EnvelopeValue } from '../docx/rustParseFacade';
 import { decodeEncodedSelection } from './encodedSelection';
 import type { CollaborationTextInsertion, CollaborationUpdateOrigin } from '../collaboration/types';
+import type { DocxListStoriesResult } from './stories';
 import type {
   DocxEditResult,
   DocxFindTextResult,
   DocxReadParagraphsResult,
+  DocxReadStoriesResult,
   DocxTextTarget,
   DocxValidationResult,
 } from './edits';
 import type { DocxParagraphHeading } from './readTypes';
-import { createProposalRegistry } from './proposals';
+import { createProposalRegistry, type DocxProposalSession } from './proposals';
 import type { DocxContentControlsResult } from './contentControls';
 import type {
   DocxExportFailure,
@@ -123,6 +127,14 @@ function docxSourceBuffer(bytes: Uint8Array): ArrayBuffer {
   return new Uint8Array(bytes).buffer as ArrayBuffer;
 }
 
+function peerMetadataFailure(error: unknown): unknown {
+  if (error instanceof Error && error.name === 'PeerMetadataError') {
+    const code = (error as Error & { code?: unknown }).code;
+    if (typeof code === 'string') return new PeerMetadataError(code, error.message);
+  }
+  return error;
+}
+
 /**
  * Decodes the host metadata a resident worker's `open` replied with, for the
  * package `source` it opened. @internal
@@ -172,6 +184,10 @@ export function wrapSession(
   clientId: number,
   opened?: { source: Uint8Array; host: YrsDocxHost }
 ): YrsSession {
+  const peerSession = session as EditSession & {
+    encode_peer_metadata?: () => Uint8Array;
+    bootstrap_peer?: (state: Uint8Array, metadata: Uint8Array, source?: Uint8Array) => void;
+  };
   const listeners = new Map<
     number,
     (update: Uint8Array, origin: CollaborationUpdateOrigin) => void
@@ -215,7 +231,34 @@ export function wrapSession(
     ? editorSaveKeys(opened.host.document)
     : null;
 
+  let readCacheRevision = 0;
+  let cachedHeaderFooterAliases: {
+    revision: number;
+    aliases: ReadonlyMap<string, string>;
+  } | null = null;
+  const headerFooterAliases = (): ReadonlyMap<string, string> => {
+    if (!cachedHeaderFooterAliases || cachedHeaderFooterAliases.revision !== readCacheRevision) {
+      let aliases = new Map<string, string>();
+      if (!destroyed) {
+        try {
+          const value: unknown = JSON.parse(session.header_footer_aliases_json());
+          if (
+            value !== null &&
+            typeof value === 'object' &&
+            Object.getPrototypeOf(value) === Object.prototype &&
+            Object.values(value).every((entry) => typeof entry === 'string')
+          ) {
+            aliases = new Map(Object.entries(value) as Array<[string, string]>);
+          }
+        } catch {}
+      }
+      cachedHeaderFooterAliases = { revision: readCacheRevision, aliases };
+    }
+    return cachedHeaderFooterAliases.aliases;
+  };
+
   const invalidateReadCaches = (): void => {
+    readCacheRevision += 1;
     cachedSelection = undefined;
     cachedSelectionContext = null;
   };
@@ -301,6 +344,7 @@ export function wrapSession(
     if (observing) return;
     session.set_update_observer((update: Uint8Array, origin: number) => {
       if (origin !== 0 && origin !== 1) return;
+      readCacheRevision += 1;
       pendingUpdates.push({
         update: update.slice(),
         origin: origin === 0 ? 'local' : 'remote',
@@ -335,12 +379,17 @@ export function wrapSession(
     resetMedia();
     const json = mutate(() => {
       session.set_media_tokens(options.mediaTokens === true);
-      const opened = session.open_docx(
-        source,
-        seedStories,
-        options.generation,
-        preparedDigests.get(bytes)
-      );
+      let opened: string;
+      try {
+        opened = session.open_docx(
+          source,
+          seedStories,
+          options.generation,
+          preparedDigests.get(bytes)
+        );
+      } catch (error) {
+        throw normalizeSeedError(error);
+      }
       proposals.reset();
       return opened;
     });
@@ -367,7 +416,7 @@ export function wrapSession(
   };
 
   let workerDocumentVersion: string | null = null;
-  const proposals = createProposalRegistry({
+  const proposalHooks: DocxProposalSession = {
     version: () => session.version(),
     resolveParagraphAnchor: (anchor) => facade.resolveParagraphAnchor(anchor),
     findText: (request) => facade.findText(request),
@@ -393,7 +442,9 @@ export function wrapSession(
           },
         }
       : {}),
-  });
+  };
+  const proposals = createProposalRegistry(proposalHooks);
+  const detachedProposals = new Set<ReturnType<typeof createProposalRegistry>>();
 
   const facade: YrsSession = {
     clientId,
@@ -617,6 +668,22 @@ export function wrapSession(
     displayVerticalMoveJson: (position, direction, goalX) =>
       session.display_vertical_move_json(position, direction, goalX),
     displayRangeRectsJson: (from, to) => session.display_range_rects_json(from, to),
+    displayRangeRectsOnPagesJson: (from, to, firstPage, lastPage) => {
+      const query = (session as EditSession & {
+        display_range_rects_on_pages_json?: (
+          from: number,
+          to: number,
+          firstPage: number,
+          lastPage: number
+        ) => string;
+      }).display_range_rects_on_pages_json;
+      if (query) return query.call(session, from, to, firstPage, lastPage);
+      return JSON.stringify(
+        (JSON.parse(session.display_range_rects_json(from, to)) as { pageIndex: number }[]).filter(
+          (rect) => rect.pageIndex >= firstPage && rect.pageIndex <= lastPage
+        )
+      );
+    },
     displayRangeRectsRegionJson: (region, rId, from, to) =>
       session.display_range_rects_region_json(region, rId, from, to),
     outlineGlyphJson: (fontId, glyphId) => session.outline_glyph_json(fontId, glyphId),
@@ -627,6 +694,49 @@ export function wrapSession(
         session.load(update);
         proposals.reset();
       });
+    },
+    encodePeerMetadata: () => {
+      if (typeof peerSession.encode_peer_metadata !== 'function') {
+        throw new PeerMetadataError('missing-capability', 'Editing wasm cannot encode peer metadata');
+      }
+      try {
+        return peerSession.encode_peer_metadata();
+      } catch (error) {
+        throw peerMetadataFailure(error);
+      }
+    },
+    bootstrapPeer: (state, metadata, bytes, workerHost, options = {}) => {
+      checkPeerMetadataHeader(metadata);
+      if (typeof peerSession.bootstrap_peer !== 'function') {
+        throw new PeerMetadataError('missing-capability', 'Editing wasm cannot bootstrap peers');
+      }
+      const source = bytes?.slice() ?? docxSource;
+      if (!source) {
+        throw new PeerMetadataError('source-required', 'Peer bootstrap requires retained source bytes');
+      }
+      const { wholeBody: _wholeBody, ...sourceHost } = workerHost;
+      const host: YrsDocxHost = {
+        ...sourceHost,
+        document: { ...workerHost.document, originalBuffer: docxSourceBuffer(source) },
+        unusedScriptFonts: [],
+      };
+      const keys = editorSaveKeys(host.document);
+      const bootstrap = peerSession.bootstrap_peer;
+      mutate(() => {
+        try {
+          bootstrap.call(session, state, metadata, bytes === undefined ? undefined : source);
+        } catch (error) {
+          throw peerMetadataFailure(error);
+        }
+        session.set_media_tokens(options.mediaTokens === true);
+        markDirty('all');
+        resetMedia();
+        docxSource = source;
+        docxSourceKeys = keys;
+        partialDocument = false;
+        proposals.reset();
+      });
+      return withHostMedia(host);
     },
     seedFromDocx: (bytes, options) => openDocx(bytes, true, options),
     openDocx,
@@ -1257,6 +1367,26 @@ export function wrapSession(
       ),
     writtenParagraphIds: (bytes) =>
       JSON.parse(session.written_paragraph_ids(bytes)) as Record<string, string[]>,
+    runInheritance: (styles) => {
+      const inheritance = session.run_inheritance(JSON.stringify(styles ?? null));
+      return {
+        attributes: (paragraphStyle, runStyle, tableRun) =>
+          JSON.parse(inheritance.attributes(paragraphStyle, runStyle, tableRun ? JSON.stringify(tableRun) : undefined)) as Record<string, unknown>,
+        paragraphFormatting: (paragraphStyle, tableFormatting) =>
+          JSON.parse(inheritance.paragraph_formatting(
+            paragraphStyle, JSON.stringify(tableFormatting ?? null)
+          )) ?? undefined,
+        tableAttributes: (table) => JSON.parse(inheritance.table_attributes(JSON.stringify({
+          formatting: table.formatting,
+          columnWidths: table.columnWidths,
+          rows: table.rows.map((row) => ({
+            formatting: row.formatting,
+            cells: row.cells.map((cell) => ({ formatting: cell.formatting })),
+          })),
+        }))),
+        dispose: () => inheritance.free(),
+      };
+    },
     exportStructured: (options) =>
       JSON.parse(
         session.export_structured_json(JSON.stringify(options))
@@ -1297,6 +1427,9 @@ export function wrapSession(
     version: () => workerDocumentVersion ?? session.version(),
     readParagraphs: (request) =>
       JSON.parse(session.read_paragraphs_json(JSON.stringify(request))) as DocxReadParagraphsResult,
+    readStories: (request) =>
+      JSON.parse(session.read_stories_json(JSON.stringify(request))) as DocxReadStoriesResult,
+    listStories: () => JSON.parse(session.list_stories_json()) as DocxListStoriesResult,
     findText: (request) =>
       JSON.parse(session.find_text_json(JSON.stringify(request))) as DocxFindTextResult,
     validateEdits: (request) =>
@@ -1313,6 +1446,19 @@ export function wrapSession(
     setProposalStates: (request) => proposals.setStates(request),
     withdrawProposals: (request) => mutate(() => proposals.withdraw(request)),
     getProposals: () => proposals.snapshot(),
+    createWorkerProposalRegistry: (state) => {
+      if (destroyed) throw new Error('yrs session is destroyed');
+      const registry = createProposalRegistry(proposalHooks);
+      registry.mirror({ version: session.version(), proposals: state });
+      registry.mirror(null);
+      detachedProposals.add(registry);
+      return {
+        ...registry,
+        propose: (request) => mutate(() => registry.propose(request)),
+        withdraw: (request) => mutate(() => registry.withdraw(request)),
+        destroy: () => { registry.destroy(); detachedProposals.delete(registry); },
+      };
+    },
     mirrorWorkerDocument: (mirror) => {
       workerDocumentVersion = mirror?.version ?? null;
       proposals.mirror(mirror);
@@ -1357,12 +1503,15 @@ export function wrapSession(
     destroy: () => {
       if (destroyed) return;
       destroyed = true;
+      invalidateReadCaches();
       residentFonts.length = 0;
       docxSource = null;
       docxSourceKeys = null;
       resetMedia();
       listeners.clear();
       proposals.destroy();
+      for (const registry of detachedProposals) registry.destroy();
+      detachedProposals.clear();
       pendingUpdates.length = 0;
       if (observing) session.clear_update_observer();
       session.free();
@@ -1370,6 +1519,8 @@ export function wrapSession(
   };
 
   registerSessionInternals(facade, {
+    headerFooterAliases,
+    setHeaderFooterAliases: (json) => mutate(() => session.set_header_footer_aliases(json)),
     sourcePackage: () =>
       docxSource && docxSourceKeys
         ? { buffer: docxSourceBuffer(docxSource), keys: docxSourceKeys }

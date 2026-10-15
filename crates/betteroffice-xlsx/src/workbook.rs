@@ -2,18 +2,33 @@ pub(crate) mod batch;
 #[cfg(test)]
 mod edit_tests;
 #[cfg(test)]
+mod format_calculation_tests;
+#[cfg(test)]
+mod format_facets_tests;
+mod geometry;
+mod recovery;
+#[cfg(test)]
 mod save_oracle_tests;
+#[path = "snapshot/assembly.rs"]
+pub(crate) mod snapshot_assembly;
 mod staging;
 pub(crate) mod target;
+#[cfg(test)]
+mod update_tests;
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, Weak};
 
 use ooxml_drawingml::chart::ChartSpace;
+use serde::{Deserialize, Serialize};
 use xlsx_calc::graph::DepGraph;
-use xlsx_calc::{RecalcResult, rebuild_and_recalc_all_with_seed, recalc_after_with_seed};
+use xlsx_calc::{
+    RecalcResult, rebuild_and_recalc_all_with_seed, recalc_after_with_recomputed,
+    recalc_after_with_seed,
+};
 use xlsx_model::{
     Border, BorderEdge, BorderStyle, CellFormat, CellRange, CellRef, CellValue, ChartAnchor, Fill,
     FormatCode, FreezePane, HAlign, Hyperlink, MAX_COLS, MAX_ROWS, NumberFormat, Sheet, SheetChart,
@@ -35,9 +50,8 @@ use xlsx_render::region::{
 use xlsx_render::scaled;
 use xlsx_render::{
     ChartRegion, DisplayList, GhostEdit, GridGeometry, PrintMetrics, RenderError, Viewport,
-    autofit_relevant, build_display_list_with_geometry, build_print_display_list_with_charts,
-    chart_at_point, display_text, moved_chart_anchor, resolve_chart_anchor,
-    visible_merged_ranges_with_geometry,
+    build_display_list_with_geometry, build_print_display_list_with_charts, chart_at_point,
+    display_text, moved_chart_anchor, resolve_chart_anchor, visible_merged_ranges_with_geometry,
 };
 
 use crate::authority::{
@@ -48,6 +62,7 @@ use crate::sheet_json::{
     MAX_CHART_ANCHORS_PER_DRAWING, MAX_CHART_FIELD_BYTES, MAX_CHART_REFS_PER_CHART,
     MAX_CHARTS_PER_SHEET, MAX_HYPERLINK_FIELD_BYTES, MAX_HYPERLINKS_PER_SHEET,
 };
+use crate::snapshot::package::PackageSlot;
 use crate::structured::ExportSource;
 use crate::{
     CalculationOptions, CalculationResult, CellAddress, CellEdit, CellInput, EditProfile,
@@ -110,16 +125,16 @@ enum WorkbookMode {
 /// sheet it came from and the shared-string entry each of its cells was
 /// authored against.
 #[derive(Default)]
-struct PreservedSheetState {
-    origins: Vec<Option<usize>>,
-    shared_string_cells: Arc<Vec<xlsx_parse::SharedStringCells>>,
+pub(crate) struct PreservedSheetState {
+    pub(crate) origins: Vec<Option<usize>>,
+    pub(crate) shared_string_cells: Arc<Vec<xlsx_parse::SharedStringCells>>,
     /// Where each sheet's source rows and columns sit after the row and column
     /// edits made since the package was read. `None` once an identity-less
     /// replay replaced the model wholesale, which reserializes edited sheets.
-    axes: Vec<Option<xlsx_parse::SheetAxes>>,
+    pub(crate) axes: Vec<Option<xlsx_parse::SheetAxes>>,
     /// Whether each sheet was added in this session, so its properties are the
     /// defaults of a new sheet rather than unknown ones.
-    created: Vec<bool>,
+    pub(crate) created: Vec<bool>,
 }
 
 impl Clone for PreservedSheetState {
@@ -157,6 +172,17 @@ impl PreservedSheetState {
             .insert(index, xlsx_parse::SharedStringCells::new());
         self.axes.insert(index, None);
         self.created.insert(index.min(self.created.len()), true);
+    }
+
+    fn move_sheet(&mut self, from: usize, to: usize) {
+        let origin = self.origins.remove(from);
+        self.origins.insert(to, origin);
+        let cells = Arc::make_mut(&mut self.shared_string_cells).remove(from);
+        Arc::make_mut(&mut self.shared_string_cells).insert(to, cells);
+        let axes = self.axes.remove(from);
+        self.axes.insert(to, axes);
+        let created = self.created.remove(from);
+        self.created.insert(to, created);
     }
 
     fn remove(&mut self, index: usize) {
@@ -223,25 +249,27 @@ struct PreservedStateHistory {
     after: PreservedSheetState,
 }
 
-/// A memoized `sheet_info` plus the two inputs that decide whether a committed
-/// op can have moved it: the active sheet's used range and the grid geometry
-/// the content extent was measured in.
 struct SheetInfoCache {
     info: SheetInfo,
     bounds: Option<CellRange>,
-    geometry: Arc<GridGeometry>,
+    geometry_generation: Option<u64>,
 }
 
 impl SheetInfoCache {
-    /// Grow the used range to cover `at` and re-derive the fields it drives.
-    /// Ids, names, the active sheet and the freeze pane can't move here.
-    fn extend_bounds(&mut self, at: CellRef, freeze_pane: Option<FreezePane>) {
+    fn extend_bounds(&mut self, at: CellRef) {
+        if self.bounds.is_some_and(|bounds| bounds.contains(at)) {
+            return;
+        }
         let bounds = self.bounds.get_or_insert(CellRange::new(at, at));
         *bounds = CellRange::new(
             CellRef::new(bounds.start.row.min(at.row), bounds.start.col.min(at.col)),
             CellRef::new(bounds.end.row.max(at.row), bounds.end.col.max(at.col)),
         );
-        let content = sheet_content(self.bounds, freeze_pane, &self.geometry);
+        self.geometry_generation = None;
+    }
+
+    fn refresh_content(&mut self, freeze_pane: Option<FreezePane>, geometry: &GridGeometry) {
+        let content = sheet_content(self.bounds, freeze_pane, geometry);
         self.info.content_width = content.width;
         self.info.content_height = content.height;
         self.info.frozen_rows = content.frozen_rows;
@@ -330,7 +358,8 @@ pub struct Workbook {
     mode: WorkbookMode,
     pending_remote_updates: Vec<Vec<u8>>,
     model: WorkbookModel,
-    source_package: Option<xlsx_parse::PreservedPackage>,
+    source_package: Option<PackageSlot>,
+    snapshot_package_lineage: Option<snapshot_assembly::Lineage>,
     /// Source bytes for verbatim member passthrough on save.
     source_container: Option<ooxml_opc::SourceContainer>,
     preserved: PreservedSheetState,
@@ -338,6 +367,7 @@ pub struct Workbook {
     preserved_redo: Vec<PreservedStateHistory>,
     edited_since_open: bool,
     recalculated_since_open: bool,
+    calculations_since_open: u64,
     moved_references_since_open: bool,
     active_sheet: SheetId,
     undo: UndoStack,
@@ -353,7 +383,7 @@ pub struct Workbook {
     sheet_info_cache: Mutex<Option<SheetInfoCache>>,
     /// Mutation counter; chart resolutions cache against it.
     model_epoch: u64,
-    geometry_cache: Mutex<HashMap<SheetId, (u64, Arc<GridGeometry>)>>,
+    geometry_cache: Mutex<HashMap<SheetId, geometry::GeometryState>>,
     /// Rotated whenever the authority is replaced; half of [`Workbook::version`].
     version_nonce: String,
     /// Changes committed since the nonce was minted; the other half.
@@ -378,7 +408,150 @@ struct CachedChartSpace {
     space: Arc<ChartSpace>,
 }
 
+type PeerHydrationCell = (CellRef, CellValue, Option<String>, Option<u32>);
+
+#[derive(Serialize, Deserialize)]
+#[doc(hidden)]
+pub struct PeerHydration {
+    cells: Vec<Vec<PeerHydrationCell>>,
+    delta: bool,
+    deleted_cells: Vec<Vec<CellRef>>,
+    arrays: Vec<Vec<(CellRef, CellRange)>>,
+    last_calculation: CalculationResult,
+    recalculated_since_open: bool,
+    calculations_since_open: u64,
+    rand_seed: Option<u32>,
+    active_sheet: SheetId,
+    version_nonce: String,
+    committed_changes: u64,
+    client_id: Option<u64>,
+    #[serde(default)]
+    proposal_id_counter: u64,
+}
+
 impl Workbook {
+    #[doc(hidden)]
+    pub fn peer_hydration_json(&self) -> Result<String> {
+        serde_json::to_string(&self.peer_hydration()?)
+            .map_err(|error| Error::InvalidRequest(error.to_string()))
+    }
+
+    #[doc(hidden)]
+    pub fn peer_hydration(&self) -> Result<PeerHydration> {
+        if self.edited_since_open || !self.proposals.list().is_empty() {
+            return Err(Error::InvalidOperation(
+                "Peer hydration requires an unedited workbook without proposals".into(),
+            ));
+        }
+        let delta = self.calculations_since_open == 1;
+        let mut cells = vec![Vec::new(); self.model.sheets.len()];
+        let mut deleted_cells = vec![Vec::new(); self.model.sheets.len()];
+        if delta {
+            for address in &self.last_calculation.changed {
+                let index = address.sheet.0 as usize;
+                let at = address.cell;
+                if let Some(cell) = self.model.sheets[index].cell(at) {
+                    cells[index].push((at, cell.value.clone(), cell.formula.clone(), cell.style));
+                } else {
+                    deleted_cells[index].push(at);
+                }
+            }
+        } else {
+            for (index, sheet) in self.model.sheets.iter().enumerate() {
+                cells[index] = sheet
+                    .iter_cells()
+                    .map(|(at, cell)| (at, cell.value.clone(), cell.formula.clone(), cell.style))
+                    .collect();
+            }
+        }
+        Ok(PeerHydration {
+            cells,
+            delta,
+            deleted_cells,
+            arrays: self
+                .model
+                .sheets
+                .iter()
+                .map(|sheet| sheet.array_formulas().collect())
+                .collect(),
+            last_calculation: self.last_calculation.clone(),
+            recalculated_since_open: self.recalculated_since_open,
+            calculations_since_open: self.calculations_since_open,
+            rand_seed: self.rand_seed,
+            active_sheet: self.active_sheet,
+            version_nonce: self.version_nonce.clone(),
+            committed_changes: self.committed_changes,
+            client_id: self.is_collaborative().then(|| self.client_id()),
+            proposal_id_counter: self.proposals.id_counter(),
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_peer_hydration_json(bytes: &[u8], hydration: &str) -> Result<Self> {
+        let hydration: PeerHydration = serde_json::from_str(hydration)
+            .map_err(|error| Error::InvalidRequest(error.to_string()))?;
+        Self::open_with_peer_hydration(bytes, hydration)
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_peer_hydration(bytes: &[u8], hydration: PeerHydration) -> Result<Self> {
+        let mut workbook = Self::open_internal(bytes, false, hydration.client_id)?;
+        if hydration.cells.len() != workbook.model.sheets.len()
+            || hydration.arrays.len() != workbook.model.sheets.len()
+            || hydration.deleted_cells.len() != workbook.model.sheets.len()
+        {
+            return Err(Error::InvalidRequest(
+                "Peer hydration sheet count differs".into(),
+            ));
+        }
+        for (((sheet, cells), arrays), deleted_cells) in workbook
+            .model
+            .sheets
+            .iter_mut()
+            .zip(hydration.cells)
+            .zip(hydration.arrays)
+            .zip(hydration.deleted_cells)
+        {
+            let cells = cells.into_iter().map(|(at, value, formula, style)| {
+                (
+                    at,
+                    xlsx_model::Cell {
+                        value,
+                        formula,
+                        style,
+                    },
+                )
+            });
+            if hydration.delta {
+                for (at, cell) in cells {
+                    sheet.set_cell(at, cell);
+                }
+                for at in deleted_cells {
+                    sheet.set_cell(at, xlsx_model::Cell::default());
+                }
+            } else {
+                sheet.adopt_cells(cells.map(|(at, cell)| ((at.row, at.col), cell)).collect());
+            }
+            let previous: Vec<_> = sheet.array_formulas().map(|(at, _)| at).collect();
+            for at in previous {
+                sheet.clear_array_formula(at);
+            }
+            for (at, range) in arrays {
+                sheet.set_array_formula(at, range);
+            }
+        }
+        validate_model(&workbook.model)?;
+        workbook.last_calculation = hydration.last_calculation;
+        workbook.recalculated_since_open = hydration.recalculated_since_open;
+        workbook.calculations_since_open = hydration.calculations_since_open;
+        workbook.rand_seed = hydration.rand_seed;
+        workbook.set_active_sheet(hydration.active_sheet)?;
+        workbook.version_nonce = hydration.version_nonce;
+        workbook.committed_changes = hydration.committed_changes;
+        workbook.proposals = ProposalSet::with_id_counter(hydration.proposal_id_counter);
+        Ok(workbook)
+    }
+
     pub fn open(bytes: &[u8]) -> Result<Self> {
         Self::open_internal(bytes, true, None)
     }
@@ -438,6 +611,9 @@ impl Workbook {
     }
 
     pub fn set_rand_seed(&mut self, seed: Option<u32>) {
+        if self.rand_seed != seed {
+            self.snapshot_package_lineage = None;
+        }
         self.rand_seed = seed;
     }
 
@@ -553,13 +729,15 @@ impl Workbook {
             mode,
             pending_remote_updates: Vec::new(),
             model,
-            source_package,
+            source_package: source_package.map(PackageSlot::Present),
+            snapshot_package_lineage: None,
             source_container: None,
             preserved,
             preserved_undo: Vec::new(),
             preserved_redo: Vec::new(),
             edited_since_open: false,
             recalculated_since_open: false,
+            calculations_since_open: 0,
             moved_references_since_open: false,
             active_sheet,
             undo: UndoStack::new(),
@@ -579,6 +757,16 @@ impl Workbook {
         })
     }
 
+    fn require_snapshot_standalone(&self) -> crate::snapshot::SnapshotResult<()> {
+        if matches!(self.mode, WorkbookMode::Standalone) {
+            Ok(())
+        } else {
+            Err(crate::snapshot::SnapshotError::new(
+                "collaborative workbooks cannot be snapshotted",
+            ))
+        }
+    }
+
     pub fn client_id(&self) -> u64 {
         self.authority.client_id()
     }
@@ -588,6 +776,27 @@ impl Workbook {
     /// active sheet and proposals do not.
     pub fn version(&self) -> DocumentVersion {
         DocumentVersion::new(&self.version_nonce, self.committed_changes)
+    }
+
+    #[doc(hidden)]
+    pub fn adopt_peer_version(&mut self, version: &str) -> Result<()> {
+        if self.edited_since_open {
+            return Err(Error::InvalidOperation(
+                "Peer version adoption requires an unedited workbook".into(),
+            ));
+        }
+        let (nonce, changes) = version
+            .rsplit_once('-')
+            .ok_or_else(|| Error::InvalidRequest("Invalid peer version".into()))?;
+        let changes = changes
+            .parse::<u64>()
+            .map_err(|error| Error::InvalidRequest(error.to_string()))?;
+        if nonce.is_empty() {
+            return Err(Error::InvalidRequest("Invalid peer nonce".into()));
+        }
+        self.version_nonce = nonce.to_owned();
+        self.committed_changes = changes;
+        Ok(())
     }
 
     pub fn is_collaborative(&self) -> bool {
@@ -632,6 +841,9 @@ impl Workbook {
         let before = self.model.clone();
         if self.restore_snapshot(update, options)? {
             return Ok(self.remote_mutation_result(&before, true));
+        }
+        if self.authority.seeds_another_bootstrap(update) {
+            return Err(Error::CollaborativeStructureChanged);
         }
         let staged = self.stage_remote_updates(&[update], None)?;
         if staged.structure != structure {
@@ -732,7 +944,12 @@ impl Workbook {
     /// an adopted snapshot are the same foreign bytes and get the same answer.
     fn gate_incoming(&self, model: &WorkbookModel) -> Result<()> {
         validate_model(model)?;
-        validate_chart_source(model, self.source_package.is_some())?;
+        validate_chart_source(
+            model,
+            self.source_package
+                .as_ref()
+                .is_some_and(|package| package.facts().source_present()),
+        )?;
         self.validate_incoming_anchors(model)
     }
 
@@ -920,6 +1137,7 @@ impl Workbook {
         validate_chart_source(&self.model, self.source_package.is_some())?;
         match &self.source_package {
             Some(package) => {
+                let package = package.materialize()?;
                 let parts = xlsx_parse::serialize_workbook_with_package_and_origins_after_edits_and_active_sheet_with_axes(
                     &self.model,
                     package,
@@ -954,20 +1172,20 @@ impl Workbook {
     }
 
     fn has_uncached_source_formulas(&self) -> bool {
-        self.source_package.as_ref().is_some_and(|package| {
-            (0..package.source_sheet_count()).any(|index| {
-                package
-                    .source_cell_facts(index)
-                    .is_some_and(|facts| !facts.uncached_formulas.is_empty())
-            })
-        })
+        self.source_package
+            .as_ref()
+            .is_some_and(|package| package.facts().has_uncached_source_formulas())
     }
 
     /// The committed state a structured export reads.
-    pub(crate) fn export_source(&self) -> ExportSource<'_> {
-        ExportSource {
+    pub(crate) fn try_export_source(&self) -> Result<ExportSource<'_>> {
+        Ok(ExportSource {
             model: &self.model,
-            package: self.source_package.as_ref(),
+            package: self
+                .source_package
+                .as_ref()
+                .map(PackageSlot::materialize)
+                .transpose()?,
             origins: &self.preserved.origins,
             shared_string_cells: &self.preserved.shared_string_cells,
             axes: &self.preserved.axes,
@@ -976,11 +1194,39 @@ impl Workbook {
             edited: self.edited_since_open || self.recalculated_since_open,
             part_hashes: &self.source_part_hashes,
             sheet_ids: self.sheet_keys(),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn export_source(&self) -> ExportSource<'_> {
+        self.try_export_source().unwrap()
     }
 
     pub fn into_model(self) -> WorkbookModel {
         self.model
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defer_source_package_for_test(&mut self) -> Result<()> {
+        let source = self
+            .source_container
+            .as_ref()
+            .ok_or_else(|| Error::Package("source container is unavailable".to_owned()))?;
+        let package = self
+            .source_package
+            .as_ref()
+            .ok_or_else(|| Error::Package("source package is unavailable".to_owned()))?;
+        let facts = xlsx_parse::PackageFacts::from_package(package.materialize()?);
+        self.source_package = Some(PackageSlot::deferred(source.clone(), facts));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_package_is_unmaterialized_for_test(&self) -> bool {
+        matches!(
+            &self.source_package,
+            Some(PackageSlot::Deferred { rebuilt, .. }) if rebuilt.get().is_none()
+        )
     }
 
     pub fn sheet(&self, sheet: SheetId) -> Result<&Sheet> {
@@ -1001,23 +1247,30 @@ impl Workbook {
 
     pub fn set_active_sheet(&mut self, sheet: SheetId) -> Result<()> {
         self.sheet(sheet)?;
+        if self.active_sheet != sheet {
+            self.snapshot_package_lineage = None;
+        }
         self.active_sheet = sheet;
         self.invalidate_sheet_info();
         Ok(())
     }
 
     pub fn sheet_info(&self) -> Result<SheetInfo> {
+        let sheet = self.sheet(self.active_sheet)?;
+        let (geometry, generation) = self.sheet_geometry_with_generation(self.active_sheet)?;
         {
-            let slot = self
+            let mut slot = self
                 .sheet_info_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(cached) = &*slot {
+            if let Some(cached) = &mut *slot {
+                if cached.geometry_generation != Some(generation) {
+                    cached.refresh_content(sheet.freeze_pane, &geometry);
+                    cached.geometry_generation = Some(generation);
+                }
                 return Ok(cached.info.clone());
             }
         }
-        let sheet = self.sheet(self.active_sheet)?;
-        let geometry = self.sheet_geometry(self.active_sheet)?;
         let bounds = sheet.used_range();
         let content = sheet_content(bounds, sheet.freeze_pane, &geometry);
         let info = SheetInfo {
@@ -1042,7 +1295,7 @@ impl Workbook {
             .unwrap_or_else(|p| p.into_inner()) = Some(SheetInfoCache {
             info: info.clone(),
             bounds,
-            geometry,
+            geometry_generation: Some(generation),
         });
         Ok(info)
     }
@@ -1245,11 +1498,14 @@ impl Workbook {
             })),
             fill_color: uniform(formats.iter().map(|(_, format)| {
                 match &format.fill {
-                    Fill::Solid(color) => styles
+                    Fill::Solid(color)
+                    | Fill::Pattern {
+                        fg: Some(color), ..
+                    } => styles
                         .resolve_color(color)
                         .unwrap_or_else(|| "#ffffff".into())
                         .to_ascii_lowercase(),
-                    Fill::None => "#ffffff".into(),
+                    Fill::None | Fill::Pattern { fg: None, .. } => "#ffffff".into(),
                 }
             })),
             border_preset: detect_border_preset(&formats, range),
@@ -1293,14 +1549,25 @@ impl Workbook {
 
     pub fn capture_format(&self, sheet: SheetId, range: CellRange) -> Result<CapturedFormat> {
         let (rows, columns) = self.validate_bounded_range(sheet, range)?;
+        let formats = self.range_formats(sheet, range)?;
+        let source_styles: Vec<_> = formats
+            .iter()
+            .map(|(at, _)| {
+                self.model.sheets[sheet.0 as usize]
+                    .cell(*at)
+                    .and_then(|cell| cell.style)
+            })
+            .collect();
         Ok(CapturedFormat {
             rows: rows as u32,
             columns: columns as u32,
-            formats: self
-                .range_formats(sheet, range)?
-                .into_iter()
-                .map(|(_, format)| format)
+            source_formats: source_styles
+                .iter()
+                .map(|style| xlsx_ops::PreservedCellFormat::from_style(&self.model.styles, *style))
                 .collect(),
+            source_styles,
+            formats: formats.into_iter().map(|(_, format)| format).collect(),
+            kept: Vec::new(),
         })
     }
 
@@ -1524,16 +1791,28 @@ impl Workbook {
         }
         let invalidates_proposals = ops.iter().any(invalidates_proposals);
         let mut preview = self.model.clone();
+        let mut origins = self.preserved.origins.clone();
         let mut names = self.sheet_names();
         let mut per_op = Vec::with_capacity(ops.len());
         for op in &ops {
             if let Some(sheet) = worksheet_edit_target(op) {
-                self.ensure_worksheet_sheet(sheet)?;
+                self.ensure_worksheet_sheet_in(&preview, &origins, sheet)?;
             }
             self.ensure_references_stay_valid(&names, op)?;
             validate_op(&preview, op)?;
             validate_insert_capacity(&preview, op)?;
             per_op.push(xlsx_ops::apply_in_place(&mut preview, op)?.0);
+            match *op {
+                Op::AddSheet { index, .. } => origins.insert(index, None),
+                Op::RemoveSheet { index } => {
+                    origins.remove(index);
+                }
+                Op::MoveSheet { from, to } => {
+                    let origin = origins.remove(from);
+                    origins.insert(to, origin);
+                }
+                _ => {}
+            }
             rename_sheet_view(&mut names, op);
         }
         validate_model_sheets(&preview)?;
@@ -1542,11 +1821,20 @@ impl Workbook {
             return Ok(MutationResult::default());
         }
         mark(EditStage::Validated);
+        // replicas holding stale results converge only through the full
+        // recalculation every one of them runs on each exchange
+        let scope = if self.is_collaborative() {
+            CalculationScope::Full
+        } else {
+            CalculationScope::of(&self.model, &ops)
+        };
+        let reached = reached_sheets(&ops);
         let mut inverse = Vec::new();
         for chunk in per_op.into_iter().rev() {
             inverse.extend(chunk);
         }
-        let active_name = self.active_sheet_name();
+        let active_sheet = self.active_sheet_after_ops(&ops);
+        let rewritten = rewritten_formulas(&inverse);
         let prepared = self.prepare_commit(
             ops,
             StagedApply::new(preview, inverse),
@@ -1554,13 +1842,15 @@ impl Workbook {
             CommitHistory::Separate,
             None,
         )?;
+        let inputs = CalculationInputs::of(&self.model, &reached);
+        let scope = scope.confirmed(&inputs, &prepared.model);
         let update = self.commit_prepared(prepared)?;
-        self.restore_active_sheet(active_name.as_deref());
+        self.restore_active_sheet(active_sheet);
         if invalidates_proposals {
             self.proposals.clear();
         }
         mark(EditStage::Applied);
-        let result = self.rebuild_and_recalculate(options);
+        let result = self.recalculate_scope(scope, &rewritten, options);
         mark(EditStage::Recalculated);
         self.publish(update);
         Ok(MutationResult {
@@ -1636,18 +1926,29 @@ impl Workbook {
         if self.is_collaborative() {
             return self.collaborative_history_step(options, false);
         }
-        let active_name = self.active_sheet_name();
         let names_before = self.sheet_names();
         let Some(ops) = self.undo.next_undo().map(<[Op]>::to_vec) else {
             return Ok(MutationResult::default());
         };
+        let active_sheet = self.active_sheet_after_ops(&ops);
+        let scope = CalculationScope::of(&self.model, &ops);
+        let reached = reached_sheets(&ops);
+        let before = (scope != CalculationScope::Full)
+            .then(|| CalculationInputs::of(&self.model, &reached).into_owned());
         let update = self
             .authority
-            .apply_ops(&ops, SyncOrigin::Undo, &self.model.styles)
+            .apply_ops_with_update(
+                &ops,
+                SyncOrigin::Undo,
+                &self.model.styles,
+                self.has_update_consumers(),
+            )
             .map_err(authority_error)?;
         let prior_styles = self.pre_edit_cell_styles(&ops);
-        self.bump_model_epoch();
+        let delta = self.geometry_delta(&ops);
         self.apply_model_history(|undo, model| undo.undo(model))?;
+        self.bump_model_epoch();
+        self.queue_geometry_delta(delta);
         self.edited_since_open = true;
         self.update_sheet_info_cache(&ops, &prior_styles);
         if let Some(history) = self.preserved_undo.pop() {
@@ -1656,11 +1957,16 @@ impl Workbook {
         } else {
             self.apply_preserved_state_ops(&names_before, &ops);
         }
-        self.restore_active_sheet(active_name.as_deref());
+        self.restore_active_sheet(active_sheet);
         if ops.iter().any(invalidates_proposals) {
             self.proposals.clear();
         }
-        let result = self.rebuild_and_recalculate(options);
+        let scope = match before {
+            Some(before) => scope.confirmed(&before, &self.model),
+            None => CalculationScope::Full,
+        };
+        let rewritten = rewritten_formulas(self.undo.next_redo().unwrap_or_default());
+        let result = self.recalculate_scope(scope, &rewritten, options);
         self.publish(update);
         Ok(MutationResult {
             applied: true,
@@ -1674,18 +1980,29 @@ impl Workbook {
         if self.is_collaborative() {
             return self.collaborative_history_step(options, true);
         }
-        let active_name = self.active_sheet_name();
         let names_before = self.sheet_names();
         let Some(ops) = self.undo.next_redo().map(<[Op]>::to_vec) else {
             return Ok(MutationResult::default());
         };
+        let active_sheet = self.active_sheet_after_ops(&ops);
+        let scope = CalculationScope::of(&self.model, &ops);
+        let reached = reached_sheets(&ops);
+        let before = (scope != CalculationScope::Full)
+            .then(|| CalculationInputs::of(&self.model, &reached).into_owned());
         let update = self
             .authority
-            .apply_ops(&ops, SyncOrigin::Redo, &self.model.styles)
+            .apply_ops_with_update(
+                &ops,
+                SyncOrigin::Redo,
+                &self.model.styles,
+                self.has_update_consumers(),
+            )
             .map_err(authority_error)?;
         let prior_styles = self.pre_edit_cell_styles(&ops);
-        self.bump_model_epoch();
+        let delta = self.geometry_delta(&ops);
         self.apply_model_history(|undo, model| undo.redo(model))?;
+        self.bump_model_epoch();
+        self.queue_geometry_delta(delta);
         self.edited_since_open = true;
         self.update_sheet_info_cache(&ops, &prior_styles);
         if let Some(history) = self.preserved_redo.pop() {
@@ -1694,11 +2011,16 @@ impl Workbook {
         } else {
             self.apply_preserved_state_ops(&names_before, &ops);
         }
-        self.restore_active_sheet(active_name.as_deref());
+        self.restore_active_sheet(active_sheet);
         if ops.iter().any(invalidates_proposals) {
             self.proposals.clear();
         }
-        let result = self.rebuild_and_recalculate(options);
+        let scope = match before {
+            Some(before) => scope.confirmed(&before, &self.model),
+            None => CalculationScope::Full,
+        };
+        let rewritten = rewritten_formulas(self.undo.next_undo().unwrap_or_default());
+        let result = self.recalculate_scope(scope, &rewritten, options);
         self.publish(update);
         Ok(MutationResult {
             applied: true,
@@ -1758,14 +2080,14 @@ impl Workbook {
         if &history.structure != structure {
             return Err(Error::CollaborativeStructureChanged);
         }
-        let active_name = self.active_sheet_name();
+        let active_sheet = self.active_sheet;
         let before = self.model.clone();
         let mut restored = history.model;
         retain_array_formulas(&self.model, &mut restored);
         self.install_model(restored)?;
         self.invalidate_sheet_info();
         self.edited_since_open = true;
-        self.restore_active_sheet(active_name.as_deref());
+        self.restore_active_sheet(Some(active_sheet));
         self.preserved.forget_shared_strings();
         self.preserved.forget_axes();
         self.proposals.clear();
@@ -2264,12 +2586,13 @@ impl Workbook {
         range: CellRange,
     ) -> Result<Vec<(CellRef, CellFormat)>> {
         let sheet_ref = self.sheet(sheet)?;
+        let mut defaults = xlsx_model::workbook::ColumnDefaults::new(sheet_ref);
         let mut formats = Vec::new();
         for row in range.start.row..=range.end.row {
             for col in range.start.col..=range.end.col {
                 let at = CellRef::new(row, col);
-                let style = sheet_ref.cell(at).and_then(|cell| cell.style);
-                formats.push((at, self.model.styles.cell_format(style)));
+                let style = defaults.effective_style(at);
+                formats.push((at, self.model.styles.cell_format(Some(style.unwrap_or(0)))));
             }
         }
         Ok(formats)
@@ -2289,7 +2612,7 @@ impl Workbook {
     /// what the ops before it left behind rather than what the workbook opened
     /// with.
     fn ensure_references_stay_valid(&self, names: &[String], op: &Op) -> Result<()> {
-        let Some(package) = self.source_package.as_ref() else {
+        let Some(package) = self.source_package.as_ref().map(PackageSlot::facts) else {
             return Ok(());
         };
         let at = |sheet: SheetId| {
@@ -2307,6 +2630,11 @@ impl Workbook {
             Op::RemoveSheet { index } => {
                 package.reference_naming_sheet(at(SheetId(*index as u32))?)
             }
+            Op::MoveSheet { from, to } => names
+                .get((*from).min(*to)..=(*from).max(*to))
+                .ok_or_else(|| Error::InvalidOperation("sheet move index out of range".into()))?
+                .iter()
+                .find_map(|name| package.reference_naming_sheet(name)),
             Op::InsertRows { sheet, at: row, .. } | Op::DeleteRows { sheet, at: row, .. } => {
                 package.reference_moved_by_rows(at(*sheet)?, *row)
             }
@@ -2334,7 +2662,7 @@ impl Workbook {
     /// Whether an op moves cells a preserved part names and no save rewrites,
     /// which is what a save has to be told about.
     fn moves_referenced_cells(&self, names: &[String], op: &Op) -> bool {
-        let Some(package) = self.source_package.as_ref() else {
+        let Some(package) = self.source_package.as_ref().map(PackageSlot::facts) else {
             return false;
         };
         let (sheet, at, by_rows) = match *op {
@@ -2358,17 +2686,21 @@ impl Workbook {
 
     /// Rejects edits aimed at a preserved chartsheet or dialogsheet.
     fn ensure_worksheet_sheet(&self, sheet: SheetId) -> Result<()> {
-        self.sheet(sheet)?;
-        let origin = self
-            .preserved
-            .origins
-            .get(sheet.0 as usize)
-            .copied()
-            .flatten();
+        self.ensure_worksheet_sheet_in(&self.model, &self.preserved.origins, sheet)
+    }
+
+    fn ensure_worksheet_sheet_in(
+        &self,
+        model: &WorkbookModel,
+        origins: &[Option<usize>],
+        sheet: SheetId,
+    ) -> Result<()> {
+        model.sheet(sheet).ok_or(Error::SheetOutOfRange(sheet))?;
+        let origin = origins.get(sheet.0 as usize).copied().flatten();
         if origin.is_some_and(|origin| {
             self.source_package
                 .as_ref()
-                .is_some_and(|package| !package.source_sheet_is_worksheet(origin))
+                .is_some_and(|package| !package.facts().source_sheet_is_worksheet(origin))
         }) {
             return Err(Error::InvalidOperation(format!(
                 "sheet {} is not an editable worksheet",
@@ -2381,7 +2713,7 @@ impl Workbook {
     /// Commits a single-cell edit without staging a copy of the authority. Returns the update
     /// to publish once the caller has recalculated.
     fn commit_user(&mut self, ops: &[Op]) -> Result<Option<Vec<u8>>> {
-        self.bump_model_epoch();
+        let delta = self.geometry_delta(ops);
         let preserved_before = (!self.is_collaborative()).then(|| self.preserved.clone());
         let names_before = self.sheet_names();
         let prior_styles = self.pre_edit_cell_styles(ops);
@@ -2393,16 +2725,23 @@ impl Workbook {
             let mut model = staged.model;
             retain_formula_caches(&self.model, &mut model);
             retain_array_formulas(&self.model, &mut model);
-            self.install_model(model)?;
+            self.install_model_with_ops(model, ops)?;
             self.update_sheet_info_cache(ops, &prior_styles);
             Some(staged.update)
         } else {
             let update = self
                 .authority
-                .apply_ops(ops, SyncOrigin::User, &self.model.styles)
+                .apply_ops_with_update(
+                    ops,
+                    SyncOrigin::User,
+                    &self.model.styles,
+                    self.has_update_consumers(),
+                )
                 .map_err(authority_error)?;
             let transaction = Transaction::new(ops.to_vec(), Provenance::User);
             self.apply_model_history(|undo, model| undo.commit(model, &transaction))?;
+            self.bump_model_epoch();
+            self.queue_geometry_delta(delta);
             self.update_sheet_info_cache(ops, &prior_styles);
             update
         };
@@ -2439,10 +2778,6 @@ impl Workbook {
     /// the update, so they see the recalculated state it produced.
     fn publish(&mut self, update: Option<Vec<u8>>) {
         self.committed_changes += 1;
-        self.geometry_cache
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
         if let Some(update) = update {
             self.emit_update(UpdateEvent {
                 update,
@@ -2466,6 +2801,16 @@ impl Workbook {
         validate_collaboration_size(&staged.update)?;
         validate_collaboration_state(staged.state_bytes, staged.state_vector_entries)?;
         Ok(staged)
+    }
+
+    fn has_update_consumers(&self) -> bool {
+        self.is_collaborative()
+            || !self
+                .update_observers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .listeners
+                .is_empty()
     }
 
     fn emit_update(&self, event: UpdateEvent) {
@@ -2519,12 +2864,6 @@ impl Workbook {
             .collect()
     }
 
-    /// Fold a committed op batch into the `sheet_info` memo. A `SetCell` that
-    /// keeps its target's style and can't contribute to row autofit only moves
-    /// the used range outward, which `extend_bounds` folds in without a rescan;
-    /// a cell leaving the used-range edge, a style change (fonts feed autofit),
-    /// or an op touching sheets, names, geometry or the freeze drops the memo
-    /// for the next `sheet_info` to rebuild.
     fn update_sheet_info_cache(&self, ops: &[Op], prior_styles: &HashMap<CellRef, Option<u32>>) {
         let mut slot = self
             .sheet_info_cache
@@ -2537,6 +2876,7 @@ impl Workbook {
             match op {
                 Op::AddSheet { .. }
                 | Op::RemoveSheet { .. }
+                | Op::MoveSheet { .. }
                 | Op::RenameSheet { .. }
                 | Op::RestoreSheet { .. } => {
                     *slot = None;
@@ -2551,6 +2891,7 @@ impl Workbook {
                 | Op::SetFreezePane { sheet, .. }
                 | Op::SetHyperlinks { sheet, .. }
                 | Op::RestoreColStyles { sheet, .. }
+                | Op::RestoreRowStyles { sheet, .. }
                 | Op::MergeCells { sheet, .. }
                 | Op::UnmergeCells { sheet, .. }
                 | Op::PatchRangeStyle { sheet, .. }
@@ -2565,53 +2906,102 @@ impl Workbook {
                     if *sheet != self.active_sheet {
                         continue;
                     }
-                    let prior = prior_styles.get(at);
-                    let invalid = if *cell == CellState::default() {
-                        prior.is_some()
-                            && (on_used_edge(cache.bounds, *at)
-                                || self.cell_moves_row_fit(*at, prior.copied().flatten()))
-                    } else {
-                        match prior {
-                            // style moved -> the autofit contribution moved
-                            Some(&prior) if prior != cell.style => true,
-                            // pure value change on a live cell
-                            Some(_) => false,
-                            // new cell: only grows the result if its font fits
-                            // its row taller than what the row already had
-                            None => self.cell_moves_row_fit(*at, cell.style),
-                        }
-                    };
-                    if invalid {
+                    if prior_styles.get(at).copied().flatten() != cell.style {
                         *slot = None;
                         return;
                     }
-                    cache.extend_bounds(*at, self.active_sheet_freeze_pane());
+                    if self
+                        .model
+                        .sheet(*sheet)
+                        .and_then(|sheet| sheet.cell(*at))
+                        .is_some()
+                    {
+                        cache.extend_bounds(*at);
+                    } else if prior_styles.contains_key(at) && on_used_edge(cache.bounds, *at) {
+                        *slot = None;
+                        return;
+                    }
                 }
                 Op::SetCharts { .. } | Op::SetChartAnchor { .. } | Op::SetDefinedNames { .. } => {}
             }
         }
     }
 
-    /// Whether a cell carrying `style` at `at` participates in the active
-    /// sheet's row autofit — unsized rows take their tallest content.
-    fn cell_moves_row_fit(&self, at: CellRef, style: Option<u32>) -> bool {
-        self.model
-            .sheet(self.active_sheet)
-            .is_some_and(|sheet| autofit_relevant(sheet, &self.model.styles, at, style))
+    /// A kept batch moves no value, so the last calculation keeps its cycle and
+    /// limited cells and reports nothing changed. `rewritten` are the formula
+    /// cells the batch's renames rewrote.
+    fn recalculate_scope(
+        &mut self,
+        scope: CalculationScope,
+        rewritten: &[(SheetId, CellRef)],
+        options: CalculationOptions,
+    ) -> CalculationResult {
+        match scope {
+            CalculationScope::Kept => {
+                self.bump_model_epoch();
+                self.last_calculation.changed.clear();
+                CalculationResult::default()
+            }
+            CalculationScope::Renamed if self.graph.is_some() => {
+                self.recalculate_renamed(rewritten, options)
+            }
+            _ => self.rebuild_and_recalculate(options),
+        }
     }
 
-    fn active_sheet_freeze_pane(&self) -> Option<FreezePane> {
-        self.model
-            .sheet(self.active_sheet)
-            .and_then(|sheet| sheet.freeze_pane)
+    /// The run re-evaluates only what the rename reaches, so every formula
+    /// outside it keeps the cycle or limited status it last had.
+    fn recalculate_renamed(
+        &mut self,
+        rewritten: &[(SheetId, CellRef)],
+        options: CalculationOptions,
+    ) -> CalculationResult {
+        self.bump_model_epoch();
+        let graph = self.graph.as_mut().expect("graph initialized");
+        let seeds = graph.rename_sheets(&self.model, rewritten);
+        let (result, recomputed) = recalc_after_with_recomputed(
+            &mut self.model,
+            graph,
+            &seeds,
+            options.now_serial,
+            self.rand_seed,
+        );
+        self.dirty_geometry_cells(&result.changed);
+        let recomputed: HashSet<_> = recomputed
+            .into_iter()
+            .map(|(sheet, cell)| (sheet.0, cell.row, cell.col))
+            .collect();
+        let untouched = |address: &&CellAddress| {
+            !recomputed.contains(&(address.sheet.0, address.cell.row, address.cell.col))
+        };
+        let previous = &self.last_calculation;
+        let mut result = calculation_result(&result);
+        result.cycle_cells = previous
+            .cycle_cells
+            .iter()
+            .filter(untouched)
+            .copied()
+            .chain(result.cycle_cells)
+            .collect();
+        result.limited_cells = previous
+            .limited_cells
+            .iter()
+            .filter(untouched)
+            .copied()
+            .chain(result.limited_cells)
+            .collect();
+        self.last_calculation = result.clone();
+        result
     }
 
     fn rebuild_and_recalculate(&mut self, options: CalculationOptions) -> CalculationResult {
         self.bump_model_epoch();
         self.recalculated_since_open = true;
+        self.calculations_since_open = self.calculations_since_open.saturating_add(1);
         let (graph, result) =
             rebuild_and_recalc_all_with_seed(&mut self.model, options.now_serial, self.rand_seed);
         self.graph = Some(graph);
+        self.dirty_geometry_cells(&result.changed);
         let result = calculation_result(&result);
         self.last_calculation = result.clone();
         result
@@ -2629,6 +3019,7 @@ impl Workbook {
         result: RecalcResult,
         seeds: &[(SheetId, CellRef)],
     ) -> MutationResult {
+        self.dirty_geometry_cells(&result.changed);
         let seeds: HashSet<_> = seeds
             .iter()
             .map(|(sheet, cell)| (sheet.0, cell.row, cell.col))
@@ -2655,10 +3046,32 @@ impl Workbook {
         }
     }
 
-    fn active_sheet_name(&self) -> Option<String> {
-        self.model
-            .sheet(self.active_sheet)
-            .map(|sheet| sheet.name.clone())
+    fn active_sheet_after_ops(&self, ops: &[Op]) -> Option<SheetId> {
+        let mut index = self.active_sheet.0 as usize;
+        for op in ops {
+            match *op {
+                Op::AddSheet { index: added, .. } if index >= added => index += 1,
+                Op::RemoveSheet { index: removed } => {
+                    if index == removed {
+                        return None;
+                    }
+                    if index > removed {
+                        index -= 1;
+                    }
+                }
+                Op::MoveSheet { from, to } => {
+                    if index == from {
+                        index = to;
+                    } else if from < to && index > from && index <= to {
+                        index -= 1;
+                    } else if from > to && index >= to && index < from {
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(SheetId(index as u32))
     }
 
     /// `before` are the sheet names as they stood when `ops` were applied, so
@@ -2674,6 +3087,7 @@ impl Workbook {
             match *op {
                 Op::AddSheet { index, .. } => self.preserved.insert(index),
                 Op::RemoveSheet { index } => self.preserved.remove(index),
+                Op::MoveSheet { from, to } => self.preserved.move_sheet(from, to),
                 Op::InsertRows { sheet, .. }
                 | Op::DeleteRows { sheet, .. }
                 | Op::InsertCols { sheet, .. }
@@ -2683,15 +3097,9 @@ impl Workbook {
         }
     }
 
-    fn restore_active_sheet(&mut self, previous_name: Option<&str>) {
-        if let Some(name) = previous_name
-            && let Some((sheet, _)) = self.model.sheet_by_name(name)
-        {
-            self.active_sheet = sheet;
-            return;
-        }
+    fn restore_active_sheet(&mut self, previous: Option<SheetId>) {
         let last = self.model.sheets.len().saturating_sub(1) as u32;
-        self.active_sheet = SheetId(self.active_sheet.0.min(last));
+        self.active_sheet = SheetId(previous.unwrap_or(self.active_sheet).0.min(last));
     }
 
     pub fn last_calculation(&self) -> &CalculationResult {
@@ -2763,7 +3171,13 @@ fn uniform_border_value<T: PartialEq + Clone>(
 
 fn border_line_style(style: BorderStyle) -> BorderLineStyle {
     match style {
-        BorderStyle::Dashed => BorderLineStyle::Dashed,
+        BorderStyle::Dashed
+        | BorderStyle::MediumDashed
+        | BorderStyle::DashDot
+        | BorderStyle::MediumDashDot
+        | BorderStyle::DashDotDot
+        | BorderStyle::MediumDashDotDot
+        | BorderStyle::SlantDashDot => BorderLineStyle::Dashed,
         BorderStyle::Dotted | BorderStyle::Hair => BorderLineStyle::Dotted,
         BorderStyle::Double => BorderLineStyle::Double,
         BorderStyle::Thin | BorderStyle::Medium | BorderStyle::Thick => BorderLineStyle::Solid,
@@ -3029,10 +3443,6 @@ impl Workbook {
     /// charts revalidate against their refresh value after the bump.
     fn bump_model_epoch(&mut self) {
         self.model_epoch = self.model_epoch.wrapping_add(1);
-        self.geometry_cache
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
     }
 
     /// The one way a model becomes this workbook's own. Per-op commit paths
@@ -3042,24 +3452,10 @@ impl Workbook {
     /// what changed.
     fn install_model(&mut self, model: WorkbookModel) -> Result<()> {
         self.bump_model_epoch();
+        self.clear_geometry();
+        self.invalidate_sheet_info();
         self.model = model;
         Ok(())
-    }
-
-    fn sheet_geometry(&self, sheet: SheetId) -> Result<Arc<GridGeometry>> {
-        let sheet_ref = self.sheet(sheet)?;
-        let mut cache = self
-            .geometry_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some((epoch, geometry)) = cache.get(&sheet)
-            && *epoch == self.model_epoch
-        {
-            return Ok(Arc::clone(geometry));
-        }
-        let geometry = Arc::new(GridGeometry::new(sheet_ref, &self.model.styles));
-        cache.insert(sheet, (self.model_epoch, Arc::clone(&geometry)));
-        Ok(geometry)
     }
 }
 
@@ -3211,6 +3607,7 @@ fn worksheet_edit_target(op: &Op) -> Option<SheetId> {
         | Op::SetFreezePane { sheet, .. }
         | Op::SetHyperlinks { sheet, .. }
         | Op::RestoreColStyles { sheet, .. }
+        | Op::RestoreRowStyles { sheet, .. }
         | Op::SetCharts { sheet, .. }
         | Op::SetChartAnchor { sheet, .. }
         | Op::MergeCells { sheet, .. }
@@ -3220,6 +3617,7 @@ fn worksheet_edit_target(op: &Op) -> Option<SheetId> {
         | Op::ApplyRangeFormat { sheet, .. } => Some(*sheet),
         Op::AddSheet { .. }
         | Op::RemoveSheet { .. }
+        | Op::MoveSheet { .. }
         | Op::RenameSheet { .. }
         | Op::RestoreSheet { .. }
         | Op::SetDefinedNames { .. } => None,
@@ -3350,13 +3748,18 @@ fn validate_op(model: &WorkbookModel, op: &Op) -> Result<()> {
                 )));
             }
         }
+        Op::MoveSheet { from, to } => {
+            require_sheet(model, SheetId(*from as u32))?;
+            require_sheet(model, SheetId(*to as u32))?;
+        }
         Op::RenameSheet { sheet, .. } => {
             require_sheet(model, *sheet)?;
         }
         Op::RestoreSheet { .. }
         | Op::SetDefinedNames { .. }
         | Op::SetCharts { .. }
-        | Op::RestoreColStyles { .. } => {
+        | Op::RestoreColStyles { .. }
+        | Op::RestoreRowStyles { .. } => {
             return Err(Error::InvalidOperation(
                 "restore sheet operations are internal".to_string(),
             ));
@@ -3765,11 +4168,14 @@ fn edit_cell_state(
     cell: CellRef,
     input: &str,
 ) -> CellState {
-    let style = workbook
-        .sheet(sheet)
-        .and_then(|sheet| sheet.cell(cell))
-        .and_then(|cell| cell.style);
-    let number_format = workbook.styles.resolved_format(style).number_format;
+    let sheet = workbook.sheet(sheet);
+    let existing = sheet.and_then(|sheet| sheet.cell(cell));
+    let inherited = sheet.and_then(|sheet| sheet.inherited_style(cell));
+    let style = existing.map_or(inherited, |existing| existing.style);
+    let number_format = workbook
+        .styles
+        .resolved_format(Some(style.unwrap_or(0)))
+        .number_format;
     let mut state = if !input.is_empty()
         && matches!(
             number_format,
@@ -3784,7 +4190,13 @@ fn edit_cell_state(
     } else {
         cell_state_for_input_no_eval(input)
     };
-    state.style = style;
+    state.style = match existing {
+        None if input.is_empty() => None,
+        Some(_) if input.is_empty() && style.is_none() => inherited
+            .is_some_and(|inherited| inherited != 0)
+            .then_some(0),
+        _ => style,
+    };
     state
 }
 
@@ -4048,15 +4460,16 @@ impl Workbook {
         } else {
             None
         };
-        let package =
-            self.source_package
-                .as_ref()
-                .ok_or_else(|| RenderError::ChartSourceUnavailable {
-                    part: chart.part.clone(),
-                })?;
+        let package = self
+            .source_package
+            .as_ref()
+            .ok_or_else(|| RenderError::ChartSourceUnavailable {
+                part: chart.part.clone(),
+            })?
+            .facts();
         let bytes =
             package
-                .part_bytes(&chart.part)
+                .chart_part_bytes(&chart.part)
                 .ok_or_else(|| RenderError::ChartPartMissing {
                     part: chart.part.clone(),
                 })?;
@@ -4100,11 +4513,6 @@ fn validate_display_region(
     viewport: &Viewport,
 ) -> Result<()> {
     validate_viewport(viewport)?;
-    let right = viewport.x + viewport.width;
-    let bottom = viewport.y + viewport.height;
-    if right > geometry.col_x(MAX_COLS) || bottom > geometry.row_y(MAX_ROWS) {
-        return Err(Error::InvalidViewport);
-    }
     let (rows, columns) = geometry.viewport_range(viewport);
     let (frozen_rows, frozen_cols) = sheet
         .freeze_pane
@@ -4174,6 +4582,10 @@ fn rename_sheet_view(names: &mut Vec<String>, op: &Op) {
         Op::RemoveSheet { index } if *index < names.len() => {
             names.remove(*index);
         }
+        Op::MoveSheet { from, to } => {
+            let name = names.remove(*from);
+            names.insert(*to, name);
+        }
         Op::RenameSheet { sheet, name } | Op::RestoreSheet { sheet, name, .. } => {
             if let Some(slot) = names.get_mut(sheet.0 as usize) {
                 *slot = name.clone();
@@ -4181,6 +4593,254 @@ fn rename_sheet_view(names: &mut Vec<String>, op: &Op) {
         }
         _ => {}
     }
+}
+
+/// How much of the workbook a committed batch recalculates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CalculationScope {
+    /// Nothing the engine reads moved, so the graph and every value stand.
+    Kept,
+    /// Sheet names moved: references re-resolve, and the formulas whose
+    /// result the new names can change re-evaluate with the volatile cells.
+    Renamed,
+    Full,
+}
+
+impl CalculationScope {
+    /// What `ops` require of the engine, judged against `model` before they
+    /// apply. The engine reads values, formulas, sheet names, defined names,
+    /// tables, array extents and used extents; styles, merges, panes and
+    /// charts never reach it.
+    fn of(model: &WorkbookModel, ops: &[Op]) -> Self {
+        ops.iter()
+            .map(|op| Self::of_op(model, op))
+            .max()
+            .unwrap_or(Self::Kept)
+    }
+
+    fn of_op(model: &WorkbookModel, op: &Op) -> Self {
+        match op {
+            Op::PatchRangeStyle { .. }
+            | Op::SetRangeNumberFormat { .. }
+            | Op::ApplyRangeFormat { .. }
+            | Op::MergeCells { .. }
+            | Op::UnmergeCells { .. }
+            | Op::SetFreezePane { .. }
+            | Op::SetHyperlinks { .. }
+            | Op::RestoreColStyles { .. }
+            | Op::RestoreRowStyles { .. }
+            | Op::SetCharts { .. }
+            | Op::SetChartAnchor { .. } => Self::Kept,
+            Op::SetCell { sheet, at, cell } => {
+                if cell_content(model, *sheet, *at) == (&cell.value, cell.formula.as_deref()) {
+                    Self::Kept
+                } else {
+                    Self::Full
+                }
+            }
+            Op::RenameSheet { .. } => Self::Renamed,
+            // undo and redo of a rename restore formulas that an edit outside
+            // history may have changed in more than their sheet names
+            Op::RestoreSheet { .. } => Self::Full,
+            // a zero size hides a row or column, which hidden-aware functions read
+            Op::SetColWidth { .. } | Op::SetRowHeight { .. } => Self::Full,
+            Op::SetDefinedNames { .. }
+            | Op::AddSheet { .. }
+            | Op::RemoveSheet { .. }
+            | Op::MoveSheet { .. }
+            | Op::InsertRows { .. }
+            | Op::DeleteRows { .. }
+            | Op::InsertCols { .. }
+            | Op::DeleteCols { .. } => Self::Full,
+        }
+    }
+
+    /// The scope once the batch has applied: one that kept every value still
+    /// recalculates in full when it moved anything else the engine reads.
+    fn confirmed(self, before: &CalculationInputs<'_>, after: &WorkbookModel) -> Self {
+        if self != Self::Full && before.kept_in(after, self == Self::Renamed) {
+            self
+        } else {
+            Self::Full
+        }
+    }
+}
+
+/// The sheets `ops` name. A kept batch moves nothing the engine reads on any
+/// other sheet, and a rename only rewrites formula text there, which
+/// [`DepGraph::rename_sheets`] re-resolves.
+fn reached_sheets(ops: &[Op]) -> BTreeSet<SheetId> {
+    let mut sheets = BTreeSet::new();
+    for op in ops {
+        match op {
+            Op::RenameSheet { sheet, .. } => {
+                sheets.insert(*sheet);
+            }
+            Op::RestoreSheet {
+                sheet, formulas, ..
+            } => {
+                sheets.insert(*sheet);
+                sheets.extend(formulas.iter().map(|(sheet, ..)| *sheet));
+            }
+            op => sheets.extend(worksheet_edit_target(op)),
+        }
+    }
+    sheets
+}
+
+/// The formula cells whose text a batch's renames rewrote: its inverse
+/// restores each of them.
+fn rewritten_formulas(inverse: &[Op]) -> Vec<(SheetId, CellRef)> {
+    inverse
+        .iter()
+        .filter_map(|op| match op {
+            Op::RestoreSheet { formulas, .. } => Some(formulas),
+            _ => None,
+        })
+        .flatten()
+        .map(|(sheet, at, _)| (*sheet, *at))
+        .collect()
+}
+
+/// What the engine reads that a batch can reach: the workbook-level inputs
+/// and the sheets its ops name.
+struct CalculationInputs<'a> {
+    defined_names: Cow<'a, [xlsx_model::DefinedName]>,
+    tables: Cow<'a, [xlsx_model::Table]>,
+    date_system: xlsx_model::DateSystem,
+    sheet_names: Vec<Cow<'a, str>>,
+    sheets: Vec<(SheetId, Option<Cow<'a, Sheet>>)>,
+}
+
+impl<'a> CalculationInputs<'a> {
+    fn of(model: &'a WorkbookModel, sheets: &BTreeSet<SheetId>) -> Self {
+        Self {
+            defined_names: Cow::Borrowed(&model.defined_names),
+            tables: Cow::Borrowed(&model.tables),
+            date_system: model.date_system,
+            sheet_names: model
+                .sheets
+                .iter()
+                .map(|sheet| Cow::Borrowed(sheet.name.as_str()))
+                .collect(),
+            sheets: sheets
+                .iter()
+                .map(|&id| (id, model.sheet(id).map(Cow::Borrowed)))
+                .collect(),
+        }
+    }
+
+    /// A copy for history, which replays a batch in place.
+    fn into_owned(self) -> CalculationInputs<'static> {
+        CalculationInputs {
+            defined_names: Cow::Owned(self.defined_names.into_owned()),
+            tables: Cow::Owned(self.tables.into_owned()),
+            date_system: self.date_system,
+            sheet_names: self
+                .sheet_names
+                .into_iter()
+                .map(|name| Cow::Owned(name.into_owned()))
+                .collect(),
+            sheets: self
+                .sheets
+                .into_iter()
+                .map(|(id, sheet)| (id, sheet.map(|sheet| Cow::Owned(sheet.into_owned()))))
+                .collect(),
+        }
+    }
+
+    /// Whether `after` holds everything the engine read here. A rename
+    /// rewrites the formulas and defined names that name the renamed sheet, so
+    /// with `renamed` only their presence has to match.
+    fn kept_in(&self, after: &WorkbookModel, renamed: bool) -> bool {
+        keeps_defined_names(&self.defined_names, &after.defined_names, renamed)
+            && self.date_system == after.date_system
+            && self.tables[..] == after.tables[..]
+            && self.sheet_names.len() == after.sheets.len()
+            && (renamed || keeps_sheet_names(&self.sheet_names, &after.sheets))
+            && self
+                .sheets
+                .iter()
+                .all(|(id, sheet)| match (sheet, after.sheet(*id)) {
+                    (Some(old), Some(new)) => keeps_sheet_inputs(old, new, renamed),
+                    _ => false,
+                })
+    }
+}
+
+fn keeps_sheet_names(names: &[Cow<'_, str>], sheets: &[Sheet]) -> bool {
+    names
+        .iter()
+        .zip(sheets)
+        .all(|(name, sheet)| **name == *sheet.name)
+}
+
+/// The value and formula `model` holds at a cell; an absent cell holds neither.
+fn cell_content(model: &WorkbookModel, sheet: SheetId, at: CellRef) -> (&CellValue, Option<&str>) {
+    match model.sheet(sheet).and_then(|sheet| sheet.cell(at)) {
+        Some(cell) => (&cell.value, cell.formula.as_deref()),
+        None => (&CellValue::Empty, None),
+    }
+}
+
+fn keeps_defined_names(
+    before: &[xlsx_model::DefinedName],
+    after: &[xlsx_model::DefinedName],
+    renamed: bool,
+) -> bool {
+    if !renamed {
+        return before == after;
+    }
+    before.len() == after.len()
+        && before
+            .iter()
+            .zip(after)
+            .all(|(old, new)| old.name == new.name && old.local_sheet == new.local_sheet)
+}
+
+/// One pass over both sheets' cells in address order. Cells holding only a
+/// style read as empty, but they still count toward the used extent, which
+/// whole-row and whole-column reads are cut to; that extent is scanned only
+/// when a cell or hyperlink came or went.
+fn keeps_sheet_inputs(before: &Sheet, after: &Sheet, renamed: bool) -> bool {
+    let mut before_cells = before.iter_cells().peekable();
+    let mut after_cells = after.iter_cells().peekable();
+    let mut moved = before.hyperlinks != after.hyperlinks;
+    loop {
+        let next = match (before_cells.peek(), after_cells.peek()) {
+            (None, None) => break,
+            (Some((at, _)), Some((to, _))) => (at.row, at.col).cmp(&(to.row, to.col)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+        };
+        let kept = match next {
+            Ordering::Less => before_cells.next().is_some_and(|(_, cell)| !reads(cell)),
+            Ordering::Greater => after_cells.next().is_some_and(|(_, cell)| !reads(cell)),
+            Ordering::Equal => before_cells
+                .next()
+                .zip(after_cells.next())
+                .is_some_and(|((_, old), (_, new))| reads_same(old, new, renamed)),
+        };
+        if !kept {
+            return false;
+        }
+        moved |= next != Ordering::Equal;
+    }
+    let end = |sheet: &Sheet| sheet.used_range().map(|range| range.end);
+    before.array_formulas().eq(after.array_formulas()) && (!moved || end(before) == end(after))
+}
+
+fn reads(cell: &xlsx_model::Cell) -> bool {
+    cell.formula.is_some() || cell.value != CellValue::Empty
+}
+
+fn reads_same(old: &xlsx_model::Cell, new: &xlsx_model::Cell, renamed: bool) -> bool {
+    let formulas = if renamed {
+        old.formula.is_some() == new.formula.is_some()
+    } else {
+        old.formula == new.formula
+    };
+    old.value == new.value && formulas
 }
 
 fn invalidates_proposals(op: &Op) -> bool {
@@ -4192,9 +4852,11 @@ fn invalidates_proposals(op: &Op) -> bool {
             | Op::DeleteCols { .. }
             | Op::SetHyperlinks { .. }
             | Op::RestoreColStyles { .. }
+            | Op::RestoreRowStyles { .. }
             | Op::SetCharts { .. }
             | Op::AddSheet { .. }
             | Op::RemoveSheet { .. }
+            | Op::MoveSheet { .. }
             | Op::RenameSheet { .. }
             | Op::RestoreSheet { .. }
     )
@@ -4301,13 +4963,15 @@ impl Workbook {
             mode,
             pending_remote_updates: Vec::new(),
             model,
-            source_package,
+            source_package: source_package.map(PackageSlot::Present),
+            snapshot_package_lineage: None,
             source_container: None,
             preserved,
             preserved_undo: Vec::new(),
             preserved_redo: Vec::new(),
             edited_since_open: false,
             recalculated_since_open: false,
+            calculations_since_open: 0,
             moved_references_since_open: false,
             active_sheet,
             undo: UndoStack::new(),
@@ -4542,6 +5206,245 @@ mod tests {
         let end = xml.find("</sheetData>").unwrap() + "</sheetData>".len();
         *sheet = format!("{}{}{}", &xml[..start], sheet_data, &xml[end..]).into_bytes();
         ooxml_opc::rezip_parts(&parts).unwrap()
+    }
+
+    #[test]
+    fn peer_hydration_preserves_seeded_edits_and_active_sheet() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Workbook>();
+        let mut model = crate::authority::open_test_cases::matrix().remove(0).model;
+        model.sheets[0].set_cell(
+            CellRef::new(0, 1),
+            xlsx_model::Cell {
+                value: CellValue::Number { value: 0.0 },
+                formula: Some("RANDBETWEEN(1,1000000)+A1".into()),
+                style: None,
+            },
+        );
+        model.sheets.push(Sheet::new("Second"));
+        let bytes = ooxml_opc::rezip_parts(&generated_source_parts(&model)).unwrap();
+        let options = CalculationOptions {
+            now_serial: Some(45_000.25),
+        };
+        let mut worker =
+            Workbook::open_recalculated_with_seed(&bytes, options, Some(0x5eed)).unwrap();
+        let active = SheetId((worker.sheet_count() - 1) as u32);
+        assert_ne!(active, worker.active_sheet());
+        worker.set_active_sheet(active).unwrap();
+        let hydration = worker.peer_hydration_json().unwrap();
+        let mut peer = Workbook::open_with_peer_hydration_json(&bytes, &hydration).unwrap();
+        assert_eq!(peer.active_sheet(), active);
+        assert_eq!(peer.rand_seed(), Some(0x5eed));
+        assert_eq!(peer.model, worker.model);
+        assert_eq!(peer.version(), worker.version());
+        for input in ["3", "4"] {
+            let cell = CellRef::new(0, 0);
+            let expected = worker.edit_cell(SheetId(0), cell, input, options).unwrap();
+            let actual = peer.edit_cell(SheetId(0), cell, input, options).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(peer.model, worker.model);
+            assert_eq!(peer.version(), worker.version());
+            assert!(matches!(
+                peer.model.sheets[0].cell(CellRef::new(0, 1)).unwrap().value,
+                CellValue::Number { value } if value > 0.0
+            ));
+        }
+    }
+
+    #[test]
+    fn peer_hydration_refuses_pending_proposals() {
+        let bytes = source_with_sheet_data(
+            r#"<sheetData><row r="1"><c r="A1"><v>2</v></c></row></sheetData>"#,
+        );
+        let mut worker =
+            Workbook::open_recalculated(&bytes, CalculationOptions::default()).unwrap();
+        worker
+            .propose(
+                ProposalRequest {
+                    agent_id: "agent".into(),
+                    note: None,
+                    edits: vec![crate::ProposalEditInput {
+                        sheet: SheetId(0),
+                        cell: CellRef::new(0, 0),
+                        input: "3".into(),
+                        number_format: None,
+                    }],
+                },
+                CalculationOptions::default(),
+            )
+            .unwrap();
+        assert!(!worker.edited_since_open);
+        assert_eq!(worker.proposals().len(), 1);
+        assert!(matches!(
+            worker.peer_hydration_json(),
+            Err(Error::InvalidOperation(_))
+        ));
+    }
+
+    #[test]
+    fn peer_hydration_preserves_rejected_proposal_id_counter() {
+        let bytes = source_with_sheet_data(
+            r#"<sheetData><row r="1"><c r="A1"><v>2</v></c></row></sheetData>"#,
+        );
+        let options = CalculationOptions::default();
+        let mut worker = Workbook::open_recalculated(&bytes, options).unwrap();
+        let request = ProposalRequest {
+            agent_id: "agent".into(),
+            note: None,
+            edits: vec![crate::ProposalEditInput {
+                sheet: SheetId(0),
+                cell: CellRef::new(0, 0),
+                input: "3".into(),
+                number_format: None,
+            }],
+        };
+        let first = worker.propose(request.clone(), options).unwrap();
+        assert_eq!(first.id, "p1");
+        assert!(worker.reject_proposal(&first.id));
+        assert!(worker.proposals().is_empty());
+        let hydration = worker.peer_hydration_json().unwrap();
+        let mut peer = Workbook::open_with_peer_hydration_json(&bytes, &hydration).unwrap();
+        let original_proposal = worker.propose(request.clone(), options).unwrap();
+        let peer_proposal = peer.propose(request, options).unwrap();
+        assert_eq!(original_proposal.id, "p2");
+        assert_eq!(peer_proposal.id, original_proposal.id);
+        assert_eq!(peer_proposal, original_proposal);
+        let accepted = worker
+            .accept_proposal(&peer_proposal.id, false, options)
+            .unwrap();
+        assert_eq!(accepted.proposal_id, peer_proposal.id);
+        assert!(accepted.mutation.applied);
+        let peer_accepted = peer
+            .accept_proposal(&peer_proposal.id, false, options)
+            .unwrap();
+        assert_eq!(peer_accepted, accepted);
+        assert_eq!(peer.model, worker.model);
+        assert_eq!(peer.version(), worker.version());
+        assert_eq!(peer.save().unwrap(), worker.save().unwrap());
+    }
+
+    fn opening_hydration_bytes() -> Vec<u8> {
+        source_with_sheet_data(
+            r#"<sheetData><row r="1"><c r="A1"><v>2</v></c><c r="B1" s="1"><f>A1+3</f><v>999</v></c><c r="C1"><f>NOW()</f><v>0</v></c><c r="D1"><f>RANDBETWEEN(1,1000000)</f><v>0</v></c><c r="E1"><f t="array" ref="E1:E2">SEQUENCE(4)</f><v>1</v></c><c r="G1"><f t="array" ref="G1:G4">SEQUENCE(2)</f><v>1</v></c><c r="I1"><f>1/0</f><v>0</v></c></row><row r="2"><c r="E2"><v>2</v></c><c r="G2"><v>2</v></c></row><row r="3"><c r="G3"><v>3</v></c></row><row r="4"><c r="G4"><v>4</v></c></row></sheetData>"#,
+        )
+    }
+
+    fn assert_hydrated_opening_equal(peer: &Workbook, worker: &Workbook) {
+        assert_eq!(peer.model, worker.model);
+        for (actual, expected) in peer.model.sheets.iter().zip(&worker.model.sheets) {
+            assert_eq!(
+                actual.array_formulas().collect::<Vec<_>>(),
+                expected.array_formulas().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(peer.version(), worker.version());
+        assert_eq!(peer.last_calculation(), worker.last_calculation());
+        assert_eq!(peer.rand_seed(), worker.rand_seed());
+        assert_eq!(peer.active_sheet(), worker.active_sheet());
+        assert_eq!(peer.recalculated_since_open, worker.recalculated_since_open);
+        assert_eq!(peer.calculations_since_open, worker.calculations_since_open);
+        assert_eq!(peer.save().unwrap(), worker.save().unwrap());
+    }
+
+    #[test]
+    fn peer_hydration_opening_delta_preserves_stale_volatile_and_resized_spills() {
+        let bytes = opening_hydration_bytes();
+        let worker = Workbook::open_recalculated_with_seed(
+            &bytes,
+            CalculationOptions {
+                now_serial: Some(45_000.25),
+            },
+            Some(0x5eed),
+        )
+        .unwrap();
+        let hydration = worker.peer_hydration_json().unwrap();
+        let transferred: PeerHydration = serde_json::from_str(&hydration).unwrap();
+        assert!(transferred.delta);
+        assert_eq!(transferred.calculations_since_open, 1);
+        let changed: HashSet<_> = worker
+            .last_calculation
+            .changed
+            .iter()
+            .map(|address| (address.sheet.0 as usize, address.cell))
+            .collect();
+        let sent: HashSet<_> = transferred
+            .cells
+            .iter()
+            .enumerate()
+            .flat_map(|(sheet, cells)| cells.iter().map(move |(at, _, _, _)| (sheet, *at)))
+            .chain(
+                transferred
+                    .deleted_cells
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(sheet, cells)| cells.iter().map(move |at| (sheet, *at))),
+            )
+            .collect();
+        assert_eq!(sent, changed);
+        assert!(!sent.contains(&(0, CellRef::new(0, 0))));
+        assert!(transferred.deleted_cells[0].contains(&CellRef::new(2, 6)));
+        assert!(transferred.deleted_cells[0].contains(&CellRef::new(3, 6)));
+        let sheet = &worker.model.sheets[0];
+        assert_eq!(
+            sheet.cell(CellRef::new(0, 1)).unwrap().value,
+            CellValue::Number { value: 5.0 }
+        );
+        assert_eq!(
+            sheet.cell(CellRef::new(0, 2)).unwrap().value,
+            CellValue::Number { value: 45_000.25 }
+        );
+        assert!(matches!(
+            sheet.cell(CellRef::new(0, 3)).unwrap().value,
+            CellValue::Number { value } if value > 0.0
+        ));
+        assert_eq!(
+            sheet.array_formula(CellRef::new(0, 4)),
+            Some(CellRange::parse_a1("E1:E4").unwrap())
+        );
+        assert_eq!(
+            sheet.array_formula(CellRef::new(0, 6)),
+            Some(CellRange::parse_a1("G1:G2").unwrap())
+        );
+        let peer = Workbook::open_with_peer_hydration_json(&bytes, &hydration).unwrap();
+        assert_hydrated_opening_equal(&peer, &worker);
+    }
+
+    #[test]
+    fn peer_hydration_uses_full_cells_after_two_calculations() {
+        let bytes = opening_hydration_bytes();
+        let mut worker = Workbook::open_recalculated_with_seed(
+            &bytes,
+            CalculationOptions {
+                now_serial: Some(45_000.25),
+            },
+            Some(0x5eed),
+        )
+        .unwrap();
+        worker.recalculate(CalculationOptions {
+            now_serial: Some(45_001.5),
+        });
+        let hydration = worker.peer_hydration_json().unwrap();
+        let transferred: PeerHydration = serde_json::from_str(&hydration).unwrap();
+        assert!(!transferred.delta);
+        assert_eq!(transferred.calculations_since_open, 2);
+        assert!(transferred.deleted_cells.iter().all(Vec::is_empty));
+        for (cells, sheet) in transferred.cells.iter().zip(&worker.model.sheets) {
+            assert_eq!(cells.len(), sheet.iter_cells().count());
+        }
+        assert!(
+            transferred.cells[0]
+                .iter()
+                .any(|(at, _, _, _)| *at == CellRef::new(0, 0))
+        );
+        assert!(
+            !worker
+                .last_calculation
+                .changed
+                .iter()
+                .any(|address| address.cell == CellRef::new(0, 1))
+        );
+        let peer = Workbook::open_with_peer_hydration_json(&bytes, &hydration).unwrap();
+        assert_hydrated_opening_equal(&peer, &worker);
     }
 
     #[test]
@@ -4792,3 +5695,6 @@ mod tests {
         assert!(!contains_lowercased("ΟΔΟΣ", "ο\u{3c3}"));
     }
 }
+
+#[cfg(test)]
+mod geometry_tests;

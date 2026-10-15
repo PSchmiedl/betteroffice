@@ -54,6 +54,7 @@ use yrs::{Any, Map, MapRef, OffsetKind, Out, ReadTxn, Text, Transact};
 
 use super::{COMMENTS, DEL, EditError, EditingDoc, INS, decode_anchor, is_pilcrow, story_ref};
 use crate::list_marker::{ListState, compute_list_marker};
+use crate::seed::synthesized_cell_width;
 
 pub(crate) mod local;
 pub(crate) mod preview;
@@ -384,16 +385,17 @@ fn yrs_doc_to_mapped_layout_blocks_inner(
     };
     let source = doc.source_metadata();
     local.source = source.as_ref().map(Arc::downgrade).unwrap_or_default();
-    local.blocked |= source.as_ref().is_some_and(|source| {
+    local.block(source.as_ref().is_some_and(|source| {
         source
             .run_revision_stories()
             .any(|story| story == "body" || story.starts_with("body:"))
-    });
+    }));
     let mut list_state = ListState::new(source.map(|source| source.numbering()));
     let txn = doc.yrs_doc().transact();
-    local.blocked |= txn
-        .get_map(COMMENTS)
-        .is_some_and(|comments| comments.len(&txn) != 0);
+    local.block(
+        txn.get_map(COMMENTS)
+            .is_some_and(|comments| comments.len(&txn) != 0),
+    );
     let mut active_stories = BTreeSet::new();
     let mut map = preview::LoweringOutput::default();
     let session = txn.get_map(crate::identity::SESSION);
@@ -407,10 +409,18 @@ fn yrs_doc_to_mapped_layout_blocks_inner(
                 .collect()
         })
         .unwrap_or_default();
-    local.blocked |= has_sequence_metadata;
-    let mut recording =
-        (story_id == "body" && preview_units.is_some()).then(preview::UnitRecorder::new);
-    let _reads = recording.as_ref().map(|_| preview::ReadGuard::new());
+    local.preview_blocked |= has_sequence_metadata;
+    if local.legacy {
+        local.block(has_sequence_metadata);
+    }
+    let mut recording = if story_id == "body" {
+        preview_units
+            .take()
+            .map(|units| preview::UnitRecorder::new(units, local.enabled && !local.legacy))
+    } else {
+        None
+    };
+    let _reads = recording.as_ref().map(preview::UnitRecorder::read_guard);
     let (mut blocks, _) = lower_story_with_preview(
         &txn,
         story_id,
@@ -497,6 +507,21 @@ fn lower_story_with_preview<T: ReadTxn>(
         let story = story_ref(txn, story_id)?;
         let comments = std::rc::Rc::new(resolve_comment_intervals(txn, story_id, env)?);
         let chunks = story.diff(txn, YChange::identity);
+        let share_chunks = !local.blocked && !local.legacy;
+        let (owned_chunks, shared_chunks) = if story_id == "body" && share_chunks {
+            (
+                Vec::new(),
+                Some(std::rc::Rc::new(local::SeedChunks::new(chunks))),
+            )
+        } else {
+            (chunks, None)
+        };
+        if story_id == "body" {
+            local.chunks.clone_from(&shared_chunks);
+        }
+        let chunks = shared_chunks
+            .as_ref()
+            .map_or(owned_chunks.as_slice(), |chunks| chunks.diffs.as_slice());
         let initial = preview::WalkPosition::new(story_slot, pm_base, map);
         let (blocks, after, _) = walk_story_chunks(
             txn,
@@ -511,16 +536,19 @@ fn lower_story_with_preview<T: ReadTxn>(
             local,
             &story,
             &comments,
-            &chunks,
+            chunks,
             initial,
             BTreeSet::new(),
             recording.as_deref_mut(),
         )?;
         if let Some(recording) = recording {
-            recording.save_chunks(&chunks, comments);
+            recording.save_chunks(chunks, comments);
         }
         Ok((blocks, after.pm_cursor - pm_base))
     })();
+    if story_id == "body" {
+        local.chunks = None;
+    }
     active_stories.remove(story_id);
     result
 }
@@ -592,7 +620,20 @@ fn walk_story_chunks<T: ReadTxn>(
     }
     let mut plain = local::ParagraphSeed::default();
     for (chunk_index, diff) in chunks.iter().enumerate() {
-        if let Some(recording) = recording.as_deref_mut() {
+        let local_safe = !local.legacy
+            && !local.blocked
+            && pending_hidden_field_blocks.is_empty()
+            && pending_code_join.is_none()
+            && field_join.is_none()
+            && story_id == "body"
+            && active_stories.len() == 1
+            && active_stories.contains("body");
+        if !local.legacy && !local.blocked && at_block_boundary && paragraph_start == story_index {
+            plain.start(local_safe && paragraph_runs.is_empty() && paragraph_drawings.is_empty());
+        }
+        if let Some(recording) = recording.as_deref_mut()
+            && recording.wants_chunk(story_index)
+        {
             recording.before_chunk(
                 chunk_index,
                 diff,
@@ -607,7 +648,11 @@ fn walk_story_chunks<T: ReadTxn>(
             );
         }
         let attributes = diff.attributes.as_deref();
-        local.observe(&mut plain, diff, txn, story_id);
+        let width = match &diff.insert {
+            Out::Any(Any::String(text)) => utf16_len(text),
+            _ => 0,
+        };
+        local.observe(&mut plain, diff, txn, story_id, chunk_index, width);
         match &diff.insert {
             Out::Any(Any::String(text)) => {
                 let text = text.as_ref();
@@ -620,7 +665,6 @@ fn walk_story_chunks<T: ReadTxn>(
                     env,
                     paragraph_pm_units,
                 );
-                let width = utf16_len(text);
                 story_index += width;
                 paragraph_pm_units += width;
                 at_block_boundary = false;
@@ -640,6 +684,9 @@ fn walk_story_chunks<T: ReadTxn>(
                         map.paragraph_count(),
                     ),
                     story_index + 1 == story.len(txn),
+                    local_safe
+                        && !value_string(values.get("paraId"))
+                            .is_some_and(|id| hidden_field_blocks.contains(&id)),
                 );
                 let para_id = value_string(values.get("paraId")).unwrap_or_default();
                 let code_join = pending_code_join.take();
@@ -1184,7 +1231,7 @@ fn walk_story_chunks<T: ReadTxn>(
                         })
                         .and_then(|value| any_json(&value))
                         .and_then(|value| {
-                            serde_json::from_value::<docx_parse::vml::HorizontalRule>(value).ok()
+                            serde_json::to_string(&value).ok().and_then(|s| serde_json::from_str::<docx_parse::vml::HorizontalRule>(&s).ok())
                         })
                     else {
                         return Err(BridgeError::UnsupportedEmbed {
@@ -1343,6 +1390,29 @@ fn walk_story_chunks<T: ReadTxn>(
                         anchored: shapes::anchored_shape(&block),
                         block: LayoutBlock::Shape(block),
                         hidden: mark_bool(attributes, "hidden") == Some(true),
+                        revision_hidden: env.revision_hidden(attributes),
+                    });
+                }
+                story_index += 1;
+                paragraph_pm_units += 1;
+                at_block_boundary = false;
+            }
+            Out::YMap(opaque)
+                if shared_map_string(opaque, txn, "_kind").as_deref() == Some("opaqueDrawing") =>
+            {
+                let values = shared_values(opaque, txn);
+                if let Some(preview) = values.get("preview").and_then(any_map) {
+                    let formatting = lower_run_formatting(attributes, env);
+                    paragraph_runs.push(RawRun {
+                        kind: RawRunKind::Image(lower_image_values(preview, &formatting, env)),
+                        formatting,
+                        story_start: story_index,
+                        story_end: story_index + 1,
+                        pm_start: paragraph_pm_units,
+                        pm_end: paragraph_pm_units + 1,
+                        inherited_hyperlink: inherited_hyperlink_style(attributes),
+                        inline_sdt_widget: None,
+                        atom: true,
                         revision_hidden: env.revision_hidden(attributes),
                     });
                 }
@@ -1690,11 +1760,15 @@ fn lower_table<T: ReadTxn>(
         })
         .filter_map(any_map)
         .find_map(|cell| map_string(cell, "story"));
-    local.blocked |= table_identity.is_none();
+    local.block(table_identity.is_none());
     let table_identity = table_identity.unwrap_or_else(|| story_index.to_string());
     let table_id = format!("{parent_story}:table:{table_identity}");
 
+    let original = tbl_pr.get("_originalFormatting").and_then(any_map);
     let table_margins = tbl_pr.get("cellMargins").and_then(any_map);
+    let grid_widths: Vec<Option<f64>> = grid.iter().map(any_number).collect();
+    let total_grid_width: f64 = grid_widths.iter().flatten().sum();
+    let mut column_row_ends = vec![0usize; grid_widths.len()];
     let mut rows = Vec::with_capacity(row_values.len());
     let mut row_pm_start = pm_start + 1;
 
@@ -1726,6 +1800,7 @@ fn lower_table<T: ReadTxn>(
 
         let mut cells = Vec::with_capacity(cell_values.len());
         let mut cell_pm_start = row_pm_start + 1;
+        let mut column = 0usize;
         for (cell_index, cell_value) in cell_values.iter().enumerate() {
             let cell = any_map(cell_value).ok_or_else(|| {
                 malformed_table(
@@ -1774,12 +1849,33 @@ fn lower_table<T: ReadTxn>(
                     }
                 }
             }
-            let width_value = map_number(tc_pr, "width");
+            while column_row_ends
+                .get(column)
+                .is_some_and(|end| *end > row_index)
+            {
+                column += 1;
+            }
+            let col_span = map_number(tc_pr, "colspan");
+            let row_span = map_number(tc_pr, "rowspan");
+            let colspan = col_span.unwrap_or(1.0) as usize;
             let width_type = map_string(tc_pr, "widthType");
+            let width_value = map_number(tc_pr, "width");
+            let authored_width = tc_pr
+                .get("_originalFormatting")
+                .and_then(any_map)
+                .and_then(|value| value.get("width"));
+            let synthesized_width = original.is_some()
+                && authored_width.is_none()
+                && width_type.as_deref() == Some("pct")
+                && width_value.is_some()
+                && width_value
+                    == synthesized_cell_width(&grid_widths, total_grid_width, column, colspan);
+            let width_value =
+                width_value.filter(|_| width_type.as_deref() != Some("auto") && !synthesized_width);
             let width =
                 width_value.filter(|value| *value != 0.0).and_then(|value| {
                     match width_type.as_deref() {
-                        None | Some("dxa") | Some("auto") => Some(twips_to_pixels(value)),
+                        None | Some("dxa") => Some(twips_to_pixels(value)),
                         _ => None,
                     }
                 });
@@ -1803,12 +1899,15 @@ fn lower_table<T: ReadTxn>(
                 text_direction: map_string(tc_pr, "textDirection"),
                 id: BlockId::Str(cell_story),
                 blocks,
-                col_span: map_number(tc_pr, "colspan"),
-                row_span: map_number(tc_pr, "rowspan"),
+                col_span,
+                row_span,
                 width,
                 width_value,
+                preferred_width: width_value.map(|value| docx_layout::types::PreferredWidth {
+                    value: Some(value),
+                    r#type: width_type.clone(),
+                }),
                 width_type,
-                preferred_width: None,
                 grid_start: None,
                 min_content_width: None,
                 max_content_width: None,
@@ -1819,6 +1918,10 @@ fn lower_table<T: ReadTxn>(
                 no_wrap: (map_bool(tc_pr, "noWrap") == Some(true)).then_some(true),
                 tracked_marker: tc_pr.get("cellMarker").and_then(any_json),
             });
+            for end in column_row_ends.iter_mut().skip(column).take(colspan) {
+                *end = row_index.saturating_add(row_span.unwrap_or(1.0) as usize);
+            }
+            column = column.saturating_add(colspan);
             cell_pm_start += content_size + 2;
         }
 
@@ -1850,12 +1953,11 @@ fn lower_table<T: ReadTxn>(
     }
 
     let node_size = row_pm_start + 1 - pm_start;
-    let column_widths: Vec<f64> = grid
+    let column_widths: Vec<f64> = grid_widths
         .iter()
-        .filter_map(any_number)
-        .map(twips_to_pixels)
+        .flatten()
+        .map(|width| twips_to_pixels(*width))
         .collect();
-    let original = tbl_pr.get("_originalFormatting").and_then(any_map);
     let indent = original
         .and_then(|value| value.get("indent"))
         .and_then(any_map)
@@ -1872,10 +1974,12 @@ fn lower_table<T: ReadTxn>(
     });
     let layout_mode = map_string(tbl_pr, "tableLayout")
         .filter(|value| matches!(value.as_str(), "fixed" | "autofit"));
-    let cell_margin_left = table_margins
-        .and_then(|margins| map_number(margins, "left"))
-        .map(twips_to_pixels)
-        .filter(|value| value.is_finite() && *value > 0.0);
+    let table_margin = |side: &str| {
+        table_margins
+            .and_then(|margins| map_number(margins, side))
+            .map(twips_to_pixels)
+            .filter(|value| value.is_finite() && *value > 0.0)
+    };
 
     Ok((
         TableBlock {
@@ -1887,8 +1991,9 @@ fn lower_table<T: ReadTxn>(
             width: map_number(tbl_pr, "width"),
             width_type: map_string(tbl_pr, "widthType"),
             preferred_width: None,
-            width_algorithm: layout_mode.is_some().then(|| "legacy".to_owned()),
-            layout_mode,
+            layout_mode: None,
+            table_layout: Some(layout_mode.unwrap_or_else(|| "autofit".to_owned())),
+            width_algorithm: None,
             style_cascade: None,
             background: None,
             justification: map_string(tbl_pr, "justification"),
@@ -1896,7 +2001,8 @@ fn lower_table<T: ReadTxn>(
             indent,
             floating,
             compatibility_mode,
-            cell_margin_left,
+            cell_margin_left: table_margin("left"),
+            cell_margin_right: table_margin("right"),
             pm_start: Some(pm_start as f64),
             pm_end: Some((pm_start + node_size) as f64),
         },
@@ -1919,7 +2025,9 @@ fn dark_cell_background(color: &str) -> bool {
 }
 
 fn any_json(value: &Any) -> Option<Value> {
-    let value = serde_json::to_value(value).ok()?;
+    let value: Value = serde_json::to_string(value)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
     (!value.is_null()).then_some(value)
 }
 
@@ -2059,7 +2167,9 @@ fn lower_image_values(
                     serde_json::json!(height as u64),
                 );
             }
-            serde_json::from_value::<ImageRunPosition>(value).ok()
+            serde_json::to_string(&value)
+                .ok()
+                .and_then(|s| serde_json::from_str::<ImageRunPosition>(&s).ok())
         });
 
     ImageRun {
@@ -2457,6 +2567,35 @@ fn inherit_inline_revision(runs: &mut [RawRun], attrs: Option<&Attrs>, env: &Ren
     }
 }
 
+/// Display units of an inline control whose payload holds `content`: its content and its two
+/// boundaries.
+pub(crate) fn inline_sdt_size(content: Option<&Any>) -> u32 {
+    match content {
+        Some(Any::Array(content)) => {
+            content
+                .iter()
+                .filter_map(any_map)
+                .map(inline_sdt_child_size)
+                .sum::<u32>()
+                + 2
+        }
+        _ => 2,
+    }
+}
+
+/// Display units of one content item of an inline control. A shape or chart nested in it
+/// produces no run, and every other leaf still occupies one position even without one.
+fn inline_sdt_child_size(child: &std::collections::HashMap<String, Any>) -> u32 {
+    match child.get("kind").and_then(any_str) {
+        Some("text") => utf16_len(child.get("text").and_then(any_str).unwrap_or_default()),
+        Some("sdt") => child
+            .get("payload")
+            .and_then(any_map)
+            .map_or(2, |payload| inline_sdt_size(payload.get("content"))),
+        _ => 1,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_inline_sdt<T: ReadTxn>(
     sdt: &MapRef,
@@ -2468,15 +2607,17 @@ fn lower_inline_sdt<T: ReadTxn>(
     inherited_widget: Option<Value>,
     runs: &mut Vec<RawRun>,
 ) -> u32 {
+    let values = shared_values(sdt, txn);
     lower_inline_sdt_values(
-        &shared_values(sdt, txn),
+        &values,
         env,
         story_index,
         paragraph_pm_start,
         node_pm_start,
         inherited_widget,
         runs,
-    )
+    );
+    inline_sdt_size(values.get("content"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2488,13 +2629,12 @@ fn lower_inline_sdt_values(
     node_pm_start: u32,
     inherited_widget: Option<Value>,
     runs: &mut Vec<RawRun>,
-) -> u32 {
+) {
     let absolute_pos = paragraph_pm_start + 1 + u64::from(node_pm_start);
     let widget = inline_checkbox_widget(values, absolute_pos as i64).or(inherited_widget);
     let mut content_size = 0_u32;
-    let content = match values.get("content") {
-        Some(Any::Array(content)) => content,
-        _ => return 2,
+    let Some(Any::Array(content)) = values.get("content") else {
+        return;
     };
 
     for child in content.iter() {
@@ -2506,25 +2646,24 @@ fn lower_inline_sdt_values(
         let formatting = lower_run_formatting(Some(&attrs), env);
         let child_pm_start = node_pm_start + 1 + content_size;
         let payload = child.get("payload").and_then(any_map);
-        let child_size = match kind.as_str() {
+        let child_size = inline_sdt_child_size(child);
+        match kind.as_str() {
             "text" => {
                 let text = map_string(child, "text").unwrap_or_default();
-                let width = utf16_len(&text);
-                if width > 0 {
+                if child_size > 0 {
                     runs.push(RawRun {
                         kind: RawRunKind::Text(text),
                         formatting,
                         story_start: story_index,
                         story_end: story_index + 1,
                         pm_start: child_pm_start,
-                        pm_end: child_pm_start + width,
+                        pm_end: child_pm_start + child_size,
                         inherited_hyperlink: inherited_hyperlink_style(Some(&attrs)),
                         inline_sdt_widget: widget.clone(),
                         atom: true,
                         revision_hidden: env.revision_hidden(Some(&attrs)),
                     });
                 }
-                width
             }
             "tab" => {
                 runs.push(RawRun {
@@ -2539,7 +2678,6 @@ fn lower_inline_sdt_values(
                     atom: true,
                     revision_hidden: env.revision_hidden(Some(&attrs)),
                 });
-                1
             }
             "break" => {
                 runs.push(RawRun {
@@ -2554,10 +2692,16 @@ fn lower_inline_sdt_values(
                     atom: true,
                     revision_hidden: env.revision_hidden(Some(&attrs)),
                 });
-                1
             }
-            "image" => {
-                if let Some(payload) = payload {
+            "image" | "opaqueDrawing" => {
+                let image = if kind == "opaqueDrawing" {
+                    payload
+                        .and_then(|payload| payload.get("preview"))
+                        .and_then(any_map)
+                } else {
+                    payload
+                };
+                if let Some(payload) = image {
                     runs.push(RawRun {
                         kind: RawRunKind::Image(lower_image_values(payload, &formatting, env)),
                         formatting,
@@ -2571,7 +2715,6 @@ fn lower_inline_sdt_values(
                         revision_hidden: env.revision_hidden(Some(&attrs)),
                     });
                 }
-                1
             }
             "field" => {
                 let field_type = payload
@@ -2614,7 +2757,6 @@ fn lower_inline_sdt_values(
                     atom: true,
                     revision_hidden: env.revision_hidden(Some(&attrs)),
                 });
-                1
             }
             "math" => {
                 let text = payload
@@ -2643,7 +2785,6 @@ fn lower_inline_sdt_values(
                     atom: true,
                     revision_hidden: env.revision_hidden(Some(&attrs)),
                 });
-                1
             }
             "noteRef" => {
                 let footnote_id = payload
@@ -2673,32 +2814,29 @@ fn lower_inline_sdt_values(
                         revision_hidden: env.revision_hidden(Some(&attrs)),
                     });
                 }
-                1
             }
-            "sdt" => payload.map_or(2, |payload| {
-                let first = runs.len();
-                let size = lower_inline_sdt_values(
-                    payload,
-                    env,
-                    story_index,
-                    paragraph_pm_start,
-                    child_pm_start,
-                    widget.clone(),
-                    runs,
-                );
-                inherit_inline_revision(&mut runs[first..], Some(&attrs), env);
-                if env.revision_hidden(Some(&attrs)) {
-                    hide_runs(&mut runs[first..]);
+            "sdt" => {
+                if let Some(payload) = payload {
+                    let first = runs.len();
+                    lower_inline_sdt_values(
+                        payload,
+                        env,
+                        story_index,
+                        paragraph_pm_start,
+                        child_pm_start,
+                        widget.clone(),
+                        runs,
+                    );
+                    inherit_inline_revision(&mut runs[first..], Some(&attrs), env);
+                    if env.revision_hidden(Some(&attrs)) {
+                        hide_runs(&mut runs[first..]);
+                    }
                 }
-                size
-            }),
-            // A shape or chart nested in an inline SDT produces no run; every
-            // other leaf still occupies one position even without one.
-            _ => 1,
-        };
+            }
+            _ => {}
+        }
         content_size += child_size;
     }
-    content_size + 2
 }
 
 fn lower_floating_table(value: &std::collections::HashMap<String, Any>) -> FloatingTablePosition {
@@ -3274,6 +3412,11 @@ fn flush_paragraph_parts<T: ReadTxn>(
     blocks
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PARAGRAPHS_FLUSHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn flush_paragraph<T: ReadTxn>(
     mut raw_runs: Vec<RawRun>,
@@ -3288,6 +3431,8 @@ fn flush_paragraph<T: ReadTxn>(
     (map, source): (&mut preview::LoweringOutput, u32),
     carried: Vec<(u32, Vec<RawRun>)>,
 ) -> ParagraphBlock {
+    #[cfg(test)]
+    PARAGRAPHS_FLUSHED.with(|flushed| flushed.set(flushed.get() + 1));
     let values = pilcrow_values(pilcrow, txn);
     let para_id = value_string(values.get("paraId")).unwrap_or_default();
     let generated_prefix = format!("{story_id}:p");
@@ -3541,8 +3686,12 @@ fn formatting_equal(left: &RunFormatting, right: &RunFormatting) -> bool {
     left == right
         || (has_nonfinite(left)
             && has_nonfinite(right)
-            && serde_json::to_value(left).expect("RunFormatting serializes")
-                == serde_json::to_value(right).expect("RunFormatting serializes"))
+            && serde_json::to_string(left)
+                .and_then(|s| serde_json::from_str::<Value>(&s))
+                .expect("RunFormatting serializes")
+                == serde_json::to_string(right)
+                    .and_then(|s| serde_json::from_str::<Value>(&s))
+                    .expect("RunFormatting serializes"))
 }
 
 fn has_nonfinite(formatting: &RunFormatting) -> bool {
@@ -3736,7 +3885,9 @@ fn lower_run_formatting(attributes: Option<&Attrs>, env: &RenderEnv) -> RunForma
             _ => value,
         };
         if !is_nullish(effects) {
-            result.modern_effects = serde_json::to_value(effects).ok();
+            result.modern_effects = serde_json::to_string(effects)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
         }
     }
 
@@ -5211,6 +5362,7 @@ mod tests {
         let mut expected = json!([{
             "kind": "table",
             "id": "placeholder",
+            "tableLayout": "autofit",
             "rows": [
                 {
                     "id": "placeholder", "isHeader": false,
@@ -5262,6 +5414,166 @@ mod tests {
             shifted.pointer("/1/rows/0/id"),
             Some(&Value::from(format!("{stable_table_id}:r0")))
         );
+    }
+
+    #[test]
+    fn native_table_widths_honor_fixed_percent_and_automatic_preferences() {
+        for (layout, table_width, width_type, cell_widths, expected) in [
+            ("fixed", Some(9000), "dxa", [1500, 7500], [100.0, 500.0]),
+            ("autofit", None, "pct", [2500, 2500], [36.0, 36.0]),
+            ("autofit", None, "auto", [4500, 4500], [36.0, 36.0]),
+        ] {
+            let doc = EditingDoc::new(41);
+            for (story, para) in [("body:t0:r0c0", "c00p"), ("body:t0:r0c1", "c01p")] {
+                replace_story_with_paragraph(&doc, story, para, "Hello");
+            }
+            doc.create_story("body", "", "Normal", "left").unwrap();
+            let tbl_pr = json!({
+                "tableLayout": layout,
+                "width": table_width,
+                "widthType": if table_width.is_some() { "dxa" } else { "auto" }
+            });
+            let rows = json!([{"trPr": {}, "cells": [
+                {"tcPr": {"width": cell_widths[0], "widthType": width_type},
+                 "story": "body:t0:r0c0"},
+                {"tcPr": {"width": cell_widths[1], "widthType": width_type},
+                 "story": "body:t0:r0c1"}
+            ]}]);
+            doc.apply_raw_ops(
+                "body",
+                vec![
+                    RawOp::Delete { index: 0, len: 1 },
+                    RawOp::InsertEmbed {
+                        index: 0,
+                        kind: "table".to_owned(),
+                        payload: vec![
+                            (
+                                "tblPr".to_owned(),
+                                Any::from_json(&tbl_pr.to_string()).unwrap(),
+                            ),
+                            ("grid".to_owned(), Any::from_json("[4500,4500]").unwrap()),
+                            (
+                                "rows".to_owned(),
+                                Any::from_json(&rows.to_string()).unwrap(),
+                            ),
+                        ],
+                        attrs: Attrs::new(),
+                    },
+                ],
+                &EditCtx::local("", DATE),
+            )
+            .unwrap();
+            let mut blocks = yrs_doc_to_layout_blocks(&doc, "body", &RenderEnv::default()).unwrap();
+            let LayoutBlock::Table(table) = &mut blocks[0] else {
+                panic!()
+            };
+            assert_eq!(table.layout_mode, None);
+            assert_eq!(table.table_layout.as_deref(), Some(layout));
+            assert_eq!(table.column_widths, Some(vec![300.0, 300.0]));
+            for cell in &mut table.rows[0].cells {
+                if width_type == "auto" {
+                    assert_eq!(cell.width, None);
+                    assert_eq!(cell.width_value, None);
+                    assert_eq!(cell.preferred_width, None);
+                    assert_eq!(cell.width_type.as_deref(), Some("auto"));
+                } else if width_type == "pct" {
+                    assert_eq!(cell.width, None);
+                    assert_eq!(cell.width_value, Some(2500.0));
+                }
+                cell.min_content_width = Some(36.0);
+                cell.max_content_width = Some(36.0);
+            }
+            let widths = docx_layout::table_grid::resolve_table_column_widths(table, 601.333_333);
+            for (actual, expected) in widths.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-6, "{width_type}: {widths:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn docx_table_with_unmeasured_image_keeps_main_grid_through_lowering_and_measurement() {
+        for layout in [None, Some("autofit"), Some("fixed")] {
+            let doc = EditingDoc::new(41);
+            let story = "body:t0:r0c0";
+            replace_story_with_paragraph(&doc, story, "cell-p", "x");
+            doc.apply_raw_ops(
+                story,
+                vec![RawOp::InsertEmbed {
+                    index: 0,
+                    kind: "image".to_owned(),
+                    payload: vec![
+                        ("src".to_owned(), Any::from("image")),
+                        ("width".to_owned(), Any::Number(200.0)),
+                        ("height".to_owned(), Any::Number(40.0)),
+                    ],
+                    attrs: Attrs::new(),
+                }],
+                &EditCtx::local("", DATE),
+            )
+            .unwrap();
+            doc.create_story("body", "", "Normal", "left").unwrap();
+            let tbl_pr = json!({"tableLayout": layout});
+            let rows = json!([{"trPr": {}, "cells": [
+                {"tcPr": {"width": 1500, "widthType": "dxa"}, "story": story}
+            ]}]);
+            doc.apply_raw_ops(
+                "body",
+                vec![
+                    RawOp::Delete { index: 0, len: 1 },
+                    RawOp::InsertEmbed {
+                        index: 0,
+                        kind: "table".to_owned(),
+                        payload: vec![
+                            (
+                                "tblPr".to_owned(),
+                                Any::from_json(&tbl_pr.to_string()).unwrap(),
+                            ),
+                            ("grid".to_owned(), Any::from_json("[4500]").unwrap()),
+                            (
+                                "rows".to_owned(),
+                                Any::from_json(&rows.to_string()).unwrap(),
+                            ),
+                        ],
+                        attrs: Attrs::new(),
+                    },
+                ],
+                &EditCtx::local("", DATE),
+            )
+            .unwrap();
+            let mut blocks = yrs_doc_to_layout_blocks(&doc, "body", &RenderEnv::default()).unwrap();
+            let LayoutBlock::Table(table) = &blocks[0] else {
+                panic!()
+            };
+            assert_eq!(table.layout_mode, None);
+            assert_eq!(
+                table.table_layout.as_deref(),
+                Some(layout.unwrap_or("autofit"))
+            );
+            assert_eq!(table.rows[0].cells[0].width, Some(100.0));
+            assert_eq!(
+                docx_layout::table_grid::resolve_table_column_widths(table, 600.0),
+                vec![300.0]
+            );
+            let LayoutBlock::Paragraph(paragraph) = &table.rows[0].cells[0].blocks[0] else {
+                panic!()
+            };
+            let Run::Image(image) = &paragraph.runs[0] else {
+                panic!()
+            };
+            assert_eq!(image.width, 200.0);
+            let config = docx_layout::measure_blocks::MeasurementConfig {
+                defaults: json!({"fontFamily": "Arial", "fontSize": 12}),
+                ..Default::default()
+            };
+            let docx_layout::types::BlockExtent::Table(measured) =
+                docx_layout::measure_blocks::measure_block(&mut blocks[0], 600.0, &config).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(measured.column_widths, vec![300.0]);
+            assert_eq!(measured.total_width, 300.0);
+            assert_eq!(measured.rows[0].cells[0].width, 300.0);
+        }
     }
 
     #[test]
@@ -6387,6 +6699,14 @@ mod tests {
             comment_ids: Some(vec![f64::NAN]),
             ..RunFormatting::default()
         };
+        let positive_zero = RunFormatting {
+            letter_spacing: Some(0.0),
+            ..nan_size.clone()
+        };
+        let negative_zero = RunFormatting {
+            letter_spacing: Some(-0.0),
+            ..nan_size.clone()
+        };
 
         for (a, b) in [
             (&finite, &nan_size),
@@ -6397,6 +6717,7 @@ mod tests {
             (&nan_comments, &nan_comments2),
             (&nan_comments, &nan_in_field),
             (&nan_size, &nan_in_field),
+            (&positive_zero, &negative_zero),
         ] {
             assert_eq!(
                 formatting_equal(a, b),

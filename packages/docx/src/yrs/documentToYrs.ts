@@ -36,8 +36,8 @@ import type {
   TrackedChangeInfo,
 } from '../types/document';
 import { ensureHexPrefix, resolveColorToHex } from '../utils/colorResolver';
-import { mergeTextFormatting } from '../utils/textFormattingMerge';
-import { tableCellParagraphFormatting, tableColumnCount } from './tableParagraphFormatting';
+import { mergeStyleRunFormatting, mergeTextFormatting } from '../utils/textFormattingMerge';
+import { tableCellParagraphFormatting, tableCellRunFormatting, tableColumnCount } from './tableParagraphFormatting';
 import type { Style } from '../types/styles';
 import type { YrsOpeningOptions, YrsRawOp, YrsSession } from './index';
 import { noteYrsStoriesDirty } from './yrsToDocument';
@@ -58,6 +58,64 @@ import {
 } from './storyAttributes';
 
 type Attrs = Record<string, unknown>;
+
+/**
+ * Aggregate cap, in xml bytes, for opaque drawing payloads copied into yrs
+ * state while seeding. Opaque markup replays verbatim through raw ops and
+ * yrs map values, so uncapped documents multiply memory once per layer.
+ * Both seeders enforce this constant and refuse over-budget documents
+ * instead of silently dropping content.
+ */
+export const OPAQUE_SEED_BUDGET_BYTES = 8 * 1024 * 1024;
+
+const OPAQUE_SEED_BUDGET_MESSAGE = 'opaque drawing seed budget exceeded';
+
+export class OpaqueSeedBudgetError extends Error {
+  readonly total: number;
+  readonly budget = OPAQUE_SEED_BUDGET_BYTES;
+  constructor(total: number) {
+    super(`${OPAQUE_SEED_BUDGET_MESSAGE} (${total} bytes of opaque xml, budget ${OPAQUE_SEED_BUDGET_BYTES} bytes)`);
+    this.name = 'OpaqueSeedBudgetError';
+    this.total = total;
+  }
+}
+
+export function normalizeSeedError(error: unknown): unknown {
+  if (error instanceof OpaqueSeedBudgetError) return error;
+  const message =
+    typeof error === 'string' ? error : error instanceof Error ? error.message : undefined;
+  if (message?.startsWith(OPAQUE_SEED_BUDGET_MESSAGE)) {
+    const total = /(\d+) bytes of opaque xml/.exec(message)?.[1];
+    return new OpaqueSeedBudgetError(total === undefined ? 0 : Number(total));
+  }
+  return error;
+}
+
+const textEncoder = new TextEncoder();
+
+function opaqueXmlBytes(value: unknown): number {
+  if (typeof value === 'string') return 0;
+  if (Array.isArray(value)) return value.reduce<number>((sum, entry) => sum + opaqueXmlBytes(entry), 0);
+  if (value instanceof Map) {
+    let sum = 0;
+    for (const entry of value.values()) sum += opaqueXmlBytes(entry);
+    return sum;
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const own =
+      record.type === 'opaqueDrawing' && typeof record.xml === 'string'
+        ? textEncoder.encode(record.xml).length
+        : 0;
+    return own + Object.values(record).reduce<number>((sum, entry) => sum + opaqueXmlBytes(entry), 0);
+  }
+  return 0;
+}
+
+export function assertOpaqueSeedBudget(document: Document): void {
+  const total = opaqueXmlBytes(document);
+  if (total > OPAQUE_SEED_BUDGET_BYTES) throw new OpaqueSeedBudgetError(total);
+}
 
 interface MarkDescriptor {
   name: string;
@@ -338,7 +396,7 @@ function runMarks(
     ? styleResolver?.getRunStyleOwnProperties(run.formatting.styleId)
     : undefined;
   const marks = formattingToMarks(
-    mergeTextFormatting(mergeTextFormatting(styleFormatting, runStyleFormatting), run.formatting)
+    mergeTextFormatting(mergeStyleRunFormatting(styleFormatting, runStyleFormatting), run.formatting)
   );
   const styleId = run.formatting?.styleId;
   const styleName = styleId ? styleResolver?.getStyle(styleId)?.name : undefined;
@@ -699,7 +757,13 @@ function noteRefUnit(
 
 /** The tracked insertion or deletion a drawing keeps from its run. */
 function trackedMarks(marks: readonly MarkDescriptor[]): MarkDescriptor[] {
-  return marks.filter((mark) => mark.name === 'insertion' || mark.name === 'deletion');
+  return marks.filter((mark) => mark.name === 'insertion' || mark.name === 'deletion' || mark.name === 'hyperlink');
+}
+
+function drawingMarks(marks: readonly MarkDescriptor[]): MarkDescriptor[] {
+  return marks.filter((mark) =>
+    mark.name === 'hidden' || mark.name === 'insertion' || mark.name === 'deletion' || mark.name === 'hyperlink'
+  );
 }
 
 function runContentToUnits(
@@ -769,6 +833,12 @@ function runContentToUnits(
       return [embedUnit('shape', shapePayload(content.shape), trackedMarks(marks))];
     case 'chart':
       return [embedUnit('chart', chartPayload(content.chart), trackedMarks(marks))];
+    case 'opaqueDrawing':
+      return [embedUnit('opaqueDrawing', {
+        kind: content.kind,
+        xml: content.xml,
+        ...(content.preview ? { preview: imagePayload(content.preview) } : {}),
+      }, drawingMarks(marks))];
     case 'footnoteRef':
       return [noteRefUnit(content.id, 'footnote', marks)];
     case 'endnoteRef':
@@ -958,9 +1028,9 @@ function paragraphStyleFormatting(
   extraRunFormatting?: TextFormatting
 ): TextFormatting | undefined {
   const styleFormatting = styleResolver
-    ? styleResolver.resolveParagraphStyle(paragraph.formatting?.styleId).runFormatting
+    ? styleResolver.resolveParagraphStyle(paragraph.formatting?.styleId, undefined, extraRunFormatting).runFormatting
     : undefined;
-  return mergeTextFormatting(styleFormatting, extraRunFormatting);
+  return styleResolver ? styleFormatting : extraRunFormatting;
 }
 
 /**
@@ -1041,7 +1111,8 @@ function paragraphAttrs(
   styleResolver: StyleResolver | null,
   units: readonly InlineUnit[],
   runBoundaries: Attrs[] | undefined,
-  tableParagraphFormatting?: ParagraphFormatting
+  tableParagraphFormatting?: ParagraphFormatting,
+  tableRunFormatting?: TextFormatting
 ): Attrs {
   const formatting = paragraph.formatting;
   const styleId = formatting?.styleId;
@@ -1073,7 +1144,7 @@ function paragraphAttrs(
   };
 
   if (styleResolver) {
-    const resolved = styleResolver.resolveParagraphStyle(styleId, tableParagraphFormatting);
+    const resolved = styleResolver.resolveParagraphStyle(styleId, tableParagraphFormatting, tableRunFormatting);
     const stylePpr = resolved.paragraphFormatting;
     attrs.alignment = formatting?.alignment ?? stylePpr?.alignment ?? null;
     attrs.spaceBefore = formatting?.spaceBefore ?? stylePpr?.spaceBefore ?? null;
@@ -1118,7 +1189,7 @@ function paragraphAttrs(
 
     const defaultChar = styleResolver.getDefaultCharacterStyle()?.rPr;
     const styleRpr = defaultChar
-      ? mergeTextFormatting(resolved.runFormatting, defaultChar)
+      ? mergeStyleRunFormatting(resolved.runFormatting, defaultChar)
       : resolved.runFormatting;
     attrs.defaultTextFormatting =
       mergeTextFormatting(
@@ -1277,7 +1348,7 @@ function paragraphUnits(
     }
     paragraphContentUnitCounts.set(content as object, units.length - start);
   }
-  const attrs = paragraphAttrs(paragraph, styleResolver, units, boundaries, tableParagraphFormatting);
+  const attrs = paragraphAttrs(paragraph, styleResolver, units, boundaries, tableParagraphFormatting, extraRunFormatting);
   return { units, commentMarks, ppr: paraAttrsToPpr(attrs), opaqueSequences };
 }
 
@@ -1533,6 +1604,7 @@ function projectRow(
     column += colspan;
     if (rowSpan?.skip) return;
     cells.push({
+      extraRunFormatting: tableCellRunFormatting(table, tableStyle, rowIndex, startColumn, column, styleColumns),
       paragraphFormatting: tableCellParagraphFormatting(
         table,
         tableStyle,
@@ -1558,6 +1630,7 @@ function projectRow(
   });
   if (cells.length === 0) {
     cells.push({
+      extraRunFormatting: tableCellRunFormatting(table, tableStyle, rowIndex, 0, totalColumns, styleColumns),
       paragraphFormatting: tableCellParagraphFormatting(
         table,
         tableStyle,
@@ -2045,6 +2118,7 @@ export function documentToYrs(
   options: YrsOpeningOptions = {}
 ): void {
   noteYrsStoriesDirty(session, 'all');
+  assertOpaqueSeedBudget(document);
   const context: LoweringContext = {
     styleResolver: document.package.styles ? createStyleResolver(document.package.styles) : null,
     theme: document.package.theme ?? null,

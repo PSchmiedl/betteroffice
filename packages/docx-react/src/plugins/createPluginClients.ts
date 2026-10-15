@@ -17,7 +17,7 @@ import {
 import type { EditorMode } from '../components/DocxEditor/internals/editing-modes';
 import { isLayoutQueued, sourceVersionOf } from '../components/DocxEditor/internals/layoutProvenance';
 import {
-  requestWorkerOpenReplica,
+  awaitWorkerOpenReplica,
   workerOpenDocumentHeld,
   workerOpenSourceVersion,
 } from '../components/DocxEditor/internals/workerOpenReplica';
@@ -50,6 +50,10 @@ export interface DocxPluginEditorAccess {
   subscribeLayout(listener: () => void): () => void;
   /** Whether the document is open for viewing only, with no copy on this thread. */
   viewer?(): boolean;
+  workerOpen?(): boolean;
+  workerRead?: Pick<DocxPluginReadClient, 'version' | 'readParagraphs' | 'listStories' | 'readStories' | 'findText'> & Partial<Pick<DocxPluginReadClient, 'validateEdits'>>;
+  workerEdits?: { applyEdits(request: Parameters<DocxPluginEditClient['applyEdits']>[0], authorize: () => DocxPluginRefusal | null): ReturnType<DocxPluginEditClient['applyEdits']> };
+  workerNavigation?: DocxPluginNavigation;
 }
 
 const LAYOUT_WAIT_MS = 30_000;
@@ -129,6 +133,53 @@ export function createPluginClients(
   grant: () => DocxPluginGrant,
   store: DocxCommandStore
 ): DocxPluginClients {
+  if (access.workerRead) {
+    const read = access.workerRead;
+    const guarded = async <T>(operation: () => Promise<T>) => {
+      const before = refusalOf(invocation);
+      if (before) return before;
+      try {
+        const result = await operation();
+        return refusalOf(invocation) ?? result;
+      } catch (error) {
+        const refused = refusalOf(invocation);
+        if (refused) return refused;
+        throw error;
+      }
+    };
+    return {
+      read: {
+        version: () => guarded(() => read.version()),
+        readParagraphs: (request) => guarded(() => read.readParagraphs(request)),
+        listStories: () => guarded(() => read.listStories()),
+        readStories: (request) => guarded(() => read.readStories(request)),
+        findText: (request) => guarded(() => read.findText(request)),
+        validateEdits: (request) => guarded(() => read.validateEdits?.(request) ?? Promise.resolve(pluginRefusal('unsupported-policy'))),
+      },
+      commands: {
+        getDescriptor: (id: never) => store.getDescriptor(id),
+        getState: (id: never, args?: never) => store.getState(id, args),
+        subscribe: store.subscribe,
+        execute: async (id: never, args: never) => refusalOf(invocation) ?? store.execute(id, args),
+      } as unknown as DocxPluginCommandClient,
+      edits: grantsEditBatch(grant(), 'separate') ? {
+        applyEdits: async (request) => {
+          const authorize = () => refusalOf(invocation) ?? (grantsEditBatch(grant(), request.history) ? null : pluginRefusal('permission-denied'));
+          const denied = authorize();
+          if (denied) return denied;
+          try {
+            const result = await (access.workerEdits?.applyEdits(request, authorize) ?? Promise.resolve(pluginRefusal('unsupported-policy')));
+            return authorize() ?? result;
+          } catch (error) {
+            return refusalOf(invocation) ?? pluginRefusal('input-failed', error instanceof Error ? error.message : String(error));
+          }
+        },
+      } : null,
+      navigation: {
+        scrollToParagraph: (target, options) => guarded(() => access.workerNavigation?.scrollToParagraph(target, options) ?? Promise.resolve(pluginRefusal('unsupported-policy'))),
+      },
+    };
+  }
   /** Why `session` may not be touched now; call in the continuation that touches it. */
   const invalid = (session: YrsSession): DocxPluginRefusal | null => {
     const refused = refusalOf(invocation);
@@ -143,7 +194,7 @@ export function createPluginClients(
   ): Promise<T | DocxPluginRefusal> => {
     const before = refusalOf(invocation);
     if (before) return before;
-    const flush = await flushEditorInput(access.pagedEditorRef);
+    const flush = await flushEditorInput(access.pagedEditorRef, access.workerOpen?.() === true);
     const refused = refusalOf(invocation);
     if (refused) return refused;
     if (!flush.ok) {
@@ -156,11 +207,44 @@ export function createPluginClients(
     const before = invalid(session);
     if (before) return before;
     try {
-      await requestWorkerOpenReplica(session);
+      await awaitWorkerOpenReplica(session);
     } catch {
       return invalid(session) ?? pluginRefusal('input-failed');
     }
     return invalid(session);
+  };
+
+  /** Reads through the worker that owns the document, else from `session` once input is flushed. */
+  const ownerRead = async <T extends { version: string }>(
+    worker: (authority: WorkerProposalAuthority, main: () => Promise<T>) => Promise<T>,
+    local: (session: YrsSession) => T
+  ): Promise<T | DocxPluginRefusal> => {
+    const session = access.pagedEditorRef.current?.getYrsSession();
+    const authority = session ? workerProposalAuthority(session) : null;
+    const held = session ? workerOpenDocumentHeld(session) : false;
+    if (!session || (!authority && !held)) return whenFlushed(local);
+    const before = invalid(session);
+    if (before) return before;
+    if (!authority) return pluginRefusal('input-failed');
+    let fallbackRefusal: DocxPluginRefusal | null = null;
+    try {
+      const result = await worker(authority, async () => {
+        if (held) {
+          fallbackRefusal = pluginRefusal('input-failed');
+          throw fallbackRefusal;
+        }
+        const result = await whenFlushed(local);
+        if ('version' in result) return result;
+        fallbackRefusal = result;
+        throw result;
+      });
+      return invalid(session) ?? result;
+    } catch (error) {
+      const refused = invalid(session);
+      if (refused) return refused;
+      if (fallbackRefusal && error === fallbackRefusal) return fallbackRefusal;
+      throw error;
+    }
   };
 
   const read: DocxPluginReadClient = {
@@ -171,30 +255,26 @@ export function createPluginClients(
       }
       return whenFlushed((session) => ({ ok: true as const, version: session.version() }));
     },
-    readParagraphs: async (request) => {
-      const session = access.pagedEditorRef.current?.getYrsSession();
-      const authority = session ? workerProposalAuthority(session) : null;
-      if (session && authority) {
-        const before = invalid(session);
-        if (before) return before;
-        let fallbackRefusal: DocxPluginRefusal | null = null;
-        try {
-          const result = await authority.readParagraphs(request, async (request) => {
-            const result = await whenFlushed((session) => session.readParagraphs(request));
-            if ('version' in result) return result;
-            fallbackRefusal = result;
-            throw result;
-          });
-          return invalid(session) ?? result;
-        } catch (error) {
-          const refused = invalid(session);
-          if (refused) return refused;
-          if (fallbackRefusal && error === fallbackRefusal) return fallbackRefusal;
-          throw error;
-        }
-      }
-      return whenFlushed((session) => session.readParagraphs(request));
-    },
+    readParagraphs: (request) =>
+      ownerRead(
+        (authority, main) => authority.readParagraphs(request, main),
+        (session) => session.readParagraphs(request)
+      ),
+    listStories: () =>
+      ownerRead(
+        (authority, main) => authority.listStories(main),
+        (session) => session.listStories()
+      ),
+    readStories: (request) =>
+      ownerRead(
+        (authority, main) => authority.readStories(request, main),
+        (session) =>
+          session.readStories(
+            request.expectVersion === undefined
+              ? request
+              : handedOverRequest(session, { ...request, expectVersion: request.expectVersion })
+          )
+      ),
     findText: async (request) => {
       const session = access.pagedEditorRef.current?.getYrsSession();
       if (session && workerOpenDocumentHeld(session)) {
@@ -240,7 +320,8 @@ export function createPluginClients(
             access.writeMode,
             request,
             () => batchDenial(request.history),
-            (write) => invocation.commit(write)
+            (write) => invocation.commit(write),
+            access.workerOpen?.() === true
           );
           if (!('flush' in outcome)) return outcome.result;
           return (
@@ -384,7 +465,7 @@ export function createPluginClients(
       if (invocation.signal.aborted || invocation.lifetimeSignal.aborted) abort();
       try {
         const current = access.pagedEditorRef.current?.getYrsSession();
-        const authority = current ? workerProposalAuthority(current) : null;
+        const authority = current ? workerProposalAuthority(current, true) : null;
         const first = current && authority
           ? {
               session: current,

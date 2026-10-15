@@ -1,5 +1,5 @@
 import { GlobalRegistrator } from '@happy-dom/global-registrator';
-import { afterAll, afterEach, beforeAll, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, expect, spyOn, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createRef } from 'react';
@@ -9,9 +9,15 @@ if (ownsDom) GlobalRegistrator.register();
 
 import { preloadEditWasm } from '@betteroffice/docx/wasm/edit';
 import { unzipContainer } from '@betteroffice/docx/docx/wasm';
+import * as wasm from '@betteroffice/docx/yrs/wasm/index';
+import { takePreloadedResidentEngineWorker } from '@betteroffice/docx/yrs';
+import { residentWorkerFactory, type InProcessResidentWorker } from '@betteroffice/docx/yrs/__fixtures__/residentWorker';
 import { DocxEditor, type DocxEditorRef } from '../../index';
+import { resetEngineChoiceForTests, setMissingWorkerCapabilitiesForTests } from './internals/engineChoice';
+import { testScope } from './__fixtures__/testScope';
 
-const { act, cleanup, render } = await import('@testing-library/react');
+const { act: rtlAct, cleanup, fireEvent, render } = await import('@testing-library/react');
+const { act, until } = testScope(rtlAct);
 const quiet = { error: console.error, warn: console.warn };
 
 beforeAll(async () => {
@@ -41,15 +47,6 @@ const FIXTURE = resolve(
   '../../../../docx/src/yrs/__fixtures__/comment-ranges/structure.docx'
 );
 
-async function until(done: () => boolean) {
-  for (let attempt = 0; attempt < 300 && !done(); attempt += 1) {
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    });
-  }
-  expect(done()).toBe(true);
-}
-
 const documentXml = (buffer: ArrayBuffer) =>
   new TextDecoder().decode(unzipContainer(new Uint8Array(buffer))['word/document.xml']);
 const paragraphs = (xml: string) => xml.match(/<w:p[ >/]/g)?.length ?? 0;
@@ -69,20 +66,23 @@ for (const typing of [false, true]) {
     const source = paragraphs(documentXml(buffer));
     for (let cycle = 0; cycle < 3; cycle += 1) {
       const ref = createRef<DocxEditorRef>();
-      const view = render(<DocxEditor ref={ref} documentBuffer={buffer} />);
-      await until(() => ref.current?.commands.getState('save').enabled === true);
-      if (typing) {
-        const session = ref.current!.getEditorRef()!.getYrsSession()!;
-        const [title] = session.paragraphs('body');
-        await act(async () => {
-          session.insertText({ story: 'body', paraId: title!.paraId, offset: 0 }, `QA${cycle} `);
-        });
-      }
+      const view = render(<DocxEditor ref={ref} experimentalWorkerOpen={false} documentBuffer={buffer} />);
       let saved: ArrayBuffer | null = null;
-      await act(async () => {
-        saved = await ref.current!.save();
-      });
-      view.unmount();
+      try {
+        await until(() => ref.current?.commands.getState('save').enabled === true);
+        if (typing) {
+          const session = ref.current!.getEditorRef()!.getYrsSession()!;
+          const [title] = session.paragraphs('body');
+          await act(async () => {
+            session.insertText({ story: 'body', paraId: title!.paraId, offset: 0 }, `QA${cycle} `);
+          });
+        }
+        await act(async () => {
+          saved = await ref.current!.save();
+        });
+      } finally {
+        view.unmount();
+      }
       expect(saved).not.toBeNull();
       buffer = saved!;
       const xml = documentXml(buffer);
@@ -100,4 +100,89 @@ for (const typing of [false, true]) {
       }
     }
   });
+}
+
+for (const typing of [false, true]) {
+  test(`three editor saves ${typing ? 'with' : 'without'} typing keep imported comment ranges and paragraphs on the default worker`, async () => {
+    const originalWorker = globalThis.Worker;
+    const startWorker = await residentWorkerFactory();
+    const workers: InProcessResidentWorker[] = [];
+    const compileModule = spyOn(wasm, 'editWasmModule').mockResolvedValue(new WebAssembly.Module(
+      new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])
+    ));
+    setMissingWorkerCapabilitiesForTests([]);
+    globalThis.Worker = class {
+      constructor() {
+        const worker = startWorker();
+        workers.push(worker);
+        return worker;
+      }
+    } as unknown as typeof Worker;
+    try {
+      let buffer = new Uint8Array(readFileSync(FIXTURE)).buffer;
+      const source = paragraphs(documentXml(buffer));
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        const opens = workers.flatMap((worker) => worker.requests).filter((type) => type === 'open').length;
+        const ref = createRef<DocxEditorRef>();
+        const view = render(<DocxEditor ref={ref} documentBuffer={buffer} />);
+        let saved: ArrayBuffer | null = null;
+        try {
+          await until(() => ref.current?.commands.getState('save').enabled === true);
+          await act(async () => { await ref.current!.flushPendingInput(); });
+          expect(workers.length).toBeGreaterThan(0);
+          expect(workers.flatMap((worker) => worker.requests).filter((type) => type === 'open').length).toBeGreaterThan(opens);
+          if (typing) {
+            await act(async () => {
+              await ref.current!.whenLayoutComplete({ timeoutMs: 3_000 });
+              const read = await ref.current!.readParagraphs({ view: 'accepted' });
+              expect(read.ok).toBe(true);
+              if (!read.ok) throw new Error(read.failure.message);
+              expect(await ref.current!.scrollToParagraph(read.paragraphs[0]!.paraId)).toBe(true);
+              const input = view.getByTestId('yrs-input') as HTMLTextAreaElement;
+              input.focus();
+              await ref.current!.flushPendingInput();
+              fireEvent.input(input, { target: { value: `QA${cycle} ` } });
+              await ref.current!.flushPendingInput();
+            });
+          }
+          await act(async () => {
+            saved = await ref.current!.save();
+          });
+        } finally {
+          view.unmount();
+        }
+        expect(saved).not.toBeNull();
+        buffer = saved!;
+        const xml = documentXml(buffer);
+        expect([cycle, paragraphs(xml)]).toEqual([cycle, source]);
+        if (typing) {
+          expect(xml.replace(/<[^>]+>/g, '')).toContain(
+            Array.from({ length: cycle + 1 }, (_, index) => `QA${cycle - index} `).join('')
+          );
+        }
+        for (const [id, text] of [
+          [0, 'Achado QA preservado. '],
+          [1, 'Preservar comentário na célula'],
+        ] as const) {
+          expect([cycle, id, markers(xml, id), covered(xml, id)]).toEqual([
+            cycle,
+            id,
+            ['RangeStart', 'RangeEnd', 'Reference'],
+            text,
+          ]);
+        }
+      }
+    } finally {
+      cleanup();
+      takePreloadedResidentEngineWorker()?.destroy();
+      try {
+        await act(async () => {});
+      } finally {
+        for (const worker of workers) worker.terminate();
+        compileModule.mockRestore();
+        resetEngineChoiceForTests();
+        globalThis.Worker = originalWorker;
+      }
+    }
+  }, 20_000);
 }

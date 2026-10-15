@@ -1,4 +1,4 @@
-import { openPresentationSession } from '@betteroffice/pptx';
+import { openPresentationSession } from '@betteroffice/pptx/editor';
 import type { PresentationFrame, PresentationSession } from '@betteroffice/pptx';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PptxWorkerViewerApi, PptxWorkerViewerProps } from '../PptxEditor';
@@ -6,6 +6,12 @@ import type { PptxCommandStore } from '../commands/types';
 import { frameImages, installFonts, useStableFonts } from './sessionPaint';
 
 export const presentationSessionOpener = { open: openPresentationSession };
+
+export function currentPresentationFrame(
+  frame: PresentationFrame | undefined, active: number, expected: PresentationFrame | undefined
+): boolean {
+  return !!frame && frame === expected && frame.slideIndex === active;
+}
 
 export class ViewerSession {
   alive = true;
@@ -95,7 +101,7 @@ export class ViewerSession {
   }
 
   didPaint(frame: PresentationFrame): void {
-    if (!this.current || frame !== this.frame(this.active)) return;
+    if (!this.current || !currentPresentationFrame(frame, this.active, this.frame(this.active))) return;
     this.painted = frame;
     this.finish(true);
     if (!this.ready) {

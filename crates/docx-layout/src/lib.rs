@@ -97,6 +97,8 @@ pub mod table_grid;
 pub mod table_row_break;
 
 mod typed_measure;
+#[cfg(any(test, feature = "test-support"))]
+pub mod work_counters;
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -107,6 +109,17 @@ use wasm_bindgen::prelude::*;
 extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = error)]
     fn console_error(message: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = warn)]
+    fn console_warn(message: &str);
+}
+
+/// Reports content the engine left out rather than failing the document on:
+/// a console warning in wasm, stderr natively.
+pub(crate) fn warn_degraded(message: &str) {
+    #[cfg(target_arch = "wasm32")]
+    console_warn(&format!("[docx-wasm] {message}"));
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("[docx-layout] {message}");
 }
 
 /// wasm panics abort, so a trap reaches JS as a bare `RuntimeError:
@@ -523,6 +536,22 @@ pub fn range_rects_json(display_list: &str, from: f64, to: f64) -> Result<String
     hit::range_rects_json(display_list, from as i64, to as i64).map_err(|e| JsValue::from_str(&e))
 }
 
+/// @internal
+#[wasm_bindgen]
+pub fn range_rects_on_pages_json(
+    display_list: &str,
+    from: f64,
+    to: f64,
+    first_page: f64,
+    last_page: f64,
+) -> Result<String, JsValue> {
+    let Some((first_page, last_page)) = hit::page_window(first_page, last_page) else {
+        return Ok("[]".to_string());
+    };
+    hit::range_rects_on_pages_json(display_list, from as i64, to as i64, first_page, last_page)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
 /// wasm wrapper over [`hit::range_rects_region_json`]: region-aware range rects.
 /// `region` is `"body" | "header" | "footer" | "footnote" | "endnote"`;
 /// `part_id` scopes a header/footer to one HF part (empty for body / match-any)
@@ -622,6 +651,22 @@ pub fn vertical_move_by_handle(
 #[wasm_bindgen]
 pub fn range_rects_by_handle(handle: u32, from: f64, to: f64) -> Result<String, JsValue> {
     session::range_rects_by_handle(handle, from as i64, to as i64)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+/// @internal
+#[wasm_bindgen]
+pub fn range_rects_on_pages_by_handle(
+    handle: u32,
+    from: f64,
+    to: f64,
+    first_page: f64,
+    last_page: f64,
+) -> Result<String, JsValue> {
+    let Some((first_page, last_page)) = hit::page_window(first_page, last_page) else {
+        return Ok("[]".to_string());
+    };
+    session::range_rects_on_pages_by_handle(handle, from as i64, to as i64, first_page, last_page)
         .map_err(|e| JsValue::from_str(&e))
 }
 
@@ -896,6 +941,31 @@ pub fn outline_glyph_json(font_id: u32, glyph_id: u32) -> Result<String, JsValue
     .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// [`ooxml_text::echo_glyph_set`] against the resident font store, as JSON.
+pub fn echo_glyph_set_json(
+    font_id: u32,
+    size: f32,
+    kern: bool,
+    alphabet: &str,
+) -> Result<String, String> {
+    module_fonts_usable()?;
+    if !size.is_finite() || size <= 0.0 {
+        return Err(format!("echo glyph size {size} is not positive"));
+    }
+    let alphabet: Vec<char> = alphabet.chars().collect();
+    let set = with_measure_fonts(|store| {
+        ooxml_text::echo_glyph_set(
+            &store.borrow(),
+            ooxml_text::FontId::from_u32(font_id),
+            size,
+            kern,
+            &alphabet,
+        )
+    })
+    .map_err(|error| error.to_string())?;
+    serde_json::to_string(&set).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,6 +991,19 @@ mod tests {
         assert!(cmds[0]["x"].is_number() && cmds[0]["y"].is_number());
         assert_eq!(cmds.last().unwrap()["t"], "Z");
 
+        clear_measure_fonts();
+    }
+
+    #[test]
+    fn echo_glyph_set_json_reads_the_resident_font_store() {
+        clear_measure_fonts();
+        let font_id = register_measure_font_bytes(LIBERATION_SANS).expect("register fixture font");
+        let json = echo_glyph_set_json(font_id, 16.0, false, "Ax").expect("echo json");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(v["glyphIds"][0], 36);
+        assert_eq!(v["advances"].as_array().map(Vec::len), Some(2));
+        assert!(v["horizontal"].as_f64().is_some_and(|value| value > 0.0));
+        assert!(echo_glyph_set_json(font_id, 0.0, false, "A").is_err());
         clear_measure_fonts();
     }
 

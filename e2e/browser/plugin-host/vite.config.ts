@@ -10,12 +10,24 @@ const autoprefixer = fromReact('autoprefixer');
 /** Serves the plugin-host harnesses against the package sources. */
 export default defineConfig({
   root: import.meta.dirname,
+  optimizeDeps: { entries: ['*.html'] },
+  define: { 'globalThis.__DOCX_PEERLESS_HARNESS__': JSON.stringify(process.env.DOCX_PEERLESS_HARNESS === '1') },
   plugins: [
     {
       name: 'main-document-load-probe',
       enforce: 'pre',
       transform(source, id) {
         const file = id.split('?')[0];
+        if (file.endsWith('/pptx/src/wasm/loader.ts')) {
+          const construction = 'renderer = construct(() => new PptxRenderer());';
+          if (!source.includes(construction)) this.error('Update the main-thread presentation engine capture');
+          return source.replace(construction, `${construction} globalThis.__pptxMainEngineProbe?.capture();`);
+        }
+        if (file.endsWith('/xlsx/src/wasm/loader.ts')) {
+          const wrapping = /(function wrapWorkbookDocument\([\s\S]*?\): WorkbookHandle \{)/;
+          if (!wrapping.test(source)) this.error('Update the main-thread workbook capture for loader.ts');
+          return source.replace(wrapping, '$1 globalThis.__xlsxMainEngineProbe?.capture();');
+        }
         if (file.endsWith('/DocxEditor/hooks/useYrsCoreSession.ts')) {
           const creation = /const (\w+) = await yrs\.createYrsSession\([^;]+\);/g;
           if (!creation.test(source)) {

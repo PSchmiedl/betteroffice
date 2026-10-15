@@ -26,6 +26,10 @@ interface ScrollPageInfo {
 }
 
 interface HorizontalRulerProps {
+  showFirstLineIndent?: boolean;
+  onDragStart?: () => void;
+  onDragEnd?: () => void;
+  onTabStopsChange?: (tabs: TabStop[]) => void;
   sectionProps: SectionProperties | undefined;
   zoom: number;
   unit: 'inch' | 'cm';
@@ -44,6 +48,8 @@ interface HorizontalRulerProps {
 }
 
 interface VerticalRulerProps {
+  onDragStart?: () => void;
+  onDragEnd?: () => void;
   sectionProps: SectionProperties | undefined;
   zoom: number;
   unit: 'inch' | 'cm';
@@ -131,6 +137,7 @@ export function DocxEditorShell({
   overlays,
   dialogs,
   fileInputs,
+  scrollContainerProps,
 }: {
   i18n: React.ComponentProps<typeof LocaleProvider>['i18n'];
   isDark?: boolean;
@@ -171,6 +178,7 @@ export function DocxEditorShell({
   overlays: ReactNode;
   dialogs: ReactNode;
   fileInputs: ReactNode;
+  scrollContainerProps?: Pick<React.HTMLAttributes<HTMLDivElement>, 'tabIndex' | 'onKeyDown'>;
 }) {
   const [dockAreaRef, dockArea] = useDockArea();
   return (
@@ -221,6 +229,7 @@ export function DocxEditorShell({
                       }}
                     >
                       <div
+                        {...scrollContainerProps}
                         ref={scrollContainerRef}
                         className="docx-editor__scroll-container"
                         style={editorContainerStyle}

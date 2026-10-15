@@ -64,6 +64,7 @@ export function DocxEditorPagedArea({
   // Document + section
   document,
   yrsCore,
+  pluginHostOpen,
   collaboration,
   theme,
   initialSectionProperties,
@@ -82,6 +83,9 @@ export function DocxEditorPagedArea({
   // Editor
   zoom,
   readOnly,
+  holdInput,
+  inputScope,
+  inputQueries,
   viewerDocumentRead,
   showHiddenText = false,
   onYrsContentChange,
@@ -153,6 +157,7 @@ export function DocxEditorPagedArea({
   editorContentRef: React.RefObject<HTMLDivElement | null>;
   document: Document | null;
   yrsCore: YrsCoreSession;
+  pluginHostOpen?: boolean;
   collaboration?: DocxEditorCollaborationOptions;
   theme: Theme | null | undefined;
   initialSectionProperties: SectionProperties | undefined;
@@ -169,12 +174,15 @@ export function DocxEditorPagedArea({
   onBodyClick: () => void;
   zoom: number;
   readOnly: boolean;
+  holdInput?: boolean;
+  inputScope?: number;
+  inputQueries?: DisplayListQueries | null;
   /** A viewer session's document reads; see {@link PagedEditorProps.viewerDocumentRead}. */
   viewerDocumentRead?: PagedEditorProps['viewerDocumentRead'];
   showHiddenText?: boolean;
   onYrsContentChange: () => void;
   onYrsHistoryChange?: (canUndo: boolean, canRedo: boolean) => void;
-  onPagedSelectionChange: () => void;
+  onPagedSelectionChange: NonNullable<PagedEditorProps['onSelectionChange']>;
   onYrsSelectionChange: (selection: YrsToolbarSelection) => void;
   onViewerSelectionChange?: (selection: ViewerSelectionChange) => void;
   onRenderedDomContextReady:
@@ -315,7 +323,7 @@ export function DocxEditorPagedArea({
 
   // Live Yrs selection inside that part, captured on every selection change.
   const [partSelection, setPartSelection] = useState<{ from: number; to: number } | null>(null);
-  const partStory = partEditStory(partEdit);
+  const partStory = partEditStory(partEdit, yrsCore.session);
   // Cleared during render, not in an effect: the click that opens a note
   // publishes its caret from a child effect, which React flushes first, and an
   // effect here would then wipe the very selection that click asked for.
@@ -447,6 +455,7 @@ export function DocxEditorPagedArea({
         commandBridgeRef={commandBridgeRef}
         document={document}
         yrsCore={yrsCore}
+        pluginHostOpen={pluginHostOpen}
         collaboration={collaboration}
         styles={document?.package.styles}
         theme={document?.package.theme || theme}
@@ -466,6 +475,9 @@ export function DocxEditorPagedArea({
         rustFontChainsProviderRef={rustFontChainsProviderRef}
         zoom={zoom}
         readOnly={readOnly}
+        holdInput={holdInput}
+        inputScope={inputScope}
+        inputQueries={inputQueries}
         viewerDocumentRead={viewerDocumentRead}
         showHiddenText={showHiddenText}
         onYrsContentChange={onYrsContentChange}
@@ -474,7 +486,7 @@ export function DocxEditorPagedArea({
         onYrsSelectionChange={onYrsSelectionChange}
         onViewerSelectionChange={onViewerSelectionChange}
         onYrsPartSelectionChange={(part, selection) => {
-          if (partEditStory(part) === partStory) setPartSelection(selection);
+          if (partEditStory(part, yrsCore.session) === partStory) setPartSelection(selection);
         }}
         onRenderedDomContextReady={onRenderedDomContextReady}
         pluginOverlays={pluginOverlays}

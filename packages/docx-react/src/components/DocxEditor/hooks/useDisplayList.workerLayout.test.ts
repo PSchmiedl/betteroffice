@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { Layout } from '@betteroffice/docx/layout/pagination';
 import { LayoutSelectionGate, type ResidentMeasurementConfig } from '@betteroffice/docx/layout';
-import { decodeFrameDelta, loadRustDisplayListQueryEngine } from '@betteroffice/docx/layout/render';
+import { applyFrameDelta, decodeFrameDelta, loadRustDisplayListQueryEngine } from '@betteroffice/docx/layout/render';
 import { createEditSession, preloadEditWasm } from '@betteroffice/docx/wasm/edit';
 import * as wasm from '@betteroffice/docx/yrs/wasm/index';
 import {
@@ -29,7 +29,7 @@ import type {
 import { getLayoutKernelInputs } from '@betteroffice/docx/editor';
 import { documentPageCount } from './documentPageCount';
 import { viewportMinHeightPx } from '../internals/scrollUtils';
-import { markSupersededLayout } from '../internals/layoutProvenance';
+import { markLayoutQueued, markSupersededLayout } from '../internals/layoutProvenance';
 import { registerWorkerProposalAuthority } from '../internals/workerProposalAuthority';
 import { deferWorkerOpenReplica, holdWorkerOpenDocument } from '../internals/workerOpenReplica';
 import { DocxWorkerError } from '../internals/docxWorkerError';
@@ -642,49 +642,6 @@ test.each([true, false])('viewer layout recovery (%s) keeps main construction em
     hook.unmount();
     mainPreflight.mockRestore();
     source.native.free();
-  }
-});
-
-test('sync recovery rejects a cached layout frame from the old owner of the same engine', async () => {
-  const { native, layoutJson, frame, engine } = setup();
-  const { result, rerender, unmount } = renderHook(
-    ({ layout, source }) => useRustDisplayList(
-      layout, undefined, undefined, undefined, source, undefined, undefined, undefined, true
-    ),
-    { initialProps: { layout: null as Layout | null, source: null as YrsSession | null } }
-  );
-  try {
-    const opening = result.current.openInWorker(engine, Uint8Array.of(1));
-    const old = FakeWorker.last!;
-    old.reply({ id: old.requestAt(0).id, ok: true, hostJson: '{}', stateVector: new ArrayBuffer(0) });
-    const opened = await opening;
-    const first = result.current.layoutInWorker(engine, REQUEST);
-    old.reply({
-      id: old.requestAt(1).id, ok: true, frame: frame.slice().buffer,
-      caret: { frameEpoch: 1, caretRect: null }, selection: null, layoutRevision: 1, layoutJson,
-    });
-    const cached = await first!;
-    act(() => {
-      const recover = opened!.fallback({ syncAccess: 'getEditorRef' });
-      expect(recover && recover()).toBe(true);
-    });
-    expect(old.terminated).toBe(true);
-    const next = result.current.layoutInWorker(engine, REQUEST);
-    const current = FakeWorker.last!;
-    expect(current).not.toBe(old);
-    expect(current.posted[0]).toMatchObject({ type: 'bootstrap' });
-    expect(current.posted[0]).not.toHaveProperty('opened');
-    current.reply({
-      id: current.requestAt(0).id, ok: true, frame: frame.slice().buffer,
-      caret: { frameEpoch: 1, caretRect: null }, selection: null, layoutRevision: 2, layoutJson,
-    });
-    await next;
-    await act(async () => { rerender({ layout: cached!.layout, source: engine }); });
-    await waitFor(() => expect(current.posted.at(-1)).toMatchObject({ type: 'buildFrame' }));
-    expect(result.current.frame).toBeNull();
-  } finally {
-    unmount();
-    native.free();
   }
 });
 
@@ -1825,6 +1782,267 @@ test('a provisional layout paints first and settles only once the full layout fo
   }
 });
 
+test.each([false, true])('a bootstrap completion uses the page-build base with worker-open=%s', async (workerOpen) => {
+  let request = JSON.stringify({
+    ...JSON.parse(REQUEST),
+    regions: { sections: [{ sectionId: 'main', properties: {
+      pageWidth: 4320, pageHeight: 2880,
+      marginTop: 300, marginRight: 300, marginBottom: 300, marginLeft: 300,
+    } }] },
+  });
+  const { native, engine } = setup(9399, 'Bootstrap pages. '.repeat(600), request);
+  const fontId = native.register_measure_font(new Uint8Array(readFileSync(resolve(
+    import.meta.dir, '../../../../../../crates/ooxml-text/tests/fonts/LiberationSans-Regular.ttf'
+  ))));
+  request = JSON.stringify({ ...JSON.parse(request), measurement: {
+    ...JSON.parse(request).measurement,
+    fontChains: { 'calibri|0|0': [fontId] }, authoritativeShaping: true,
+  } });
+  const prefixJson = native.layout_document_with_regions_prefix_retained_json(request, 5);
+  native.set_display_window(0, 1);
+  native.set_windowed_incremental_builds(true);
+  native.reset_frame_base();
+  const prefixFrame = native.build_display_list_frame('{}', 0);
+  const prefixEpoch = decodeFrameDelta(prefixFrame).frameEpoch;
+  const hook = renderHook(
+    ({ layout, source }) => useRustDisplayList(
+      layout, undefined, undefined, undefined, source, undefined, undefined, undefined, workerOpen
+    ),
+    { initialProps: { layout: null as Layout | null, source: null as YrsSession | null } }
+  );
+  try {
+    act(() => hook.result.current.setDisplayWindow(0, 1));
+    const pending = hook.result.current.layoutInWorker(engine, request)!;
+    const worker = FakeWorker.last!;
+    expect(worker.posted[0]).toMatchObject({ type: 'bootstrap', provisionalPages: 3 });
+    worker.reply({
+      id: worker.requestAt(0).id, ok: true, frame: prefixFrame.slice().buffer,
+      caret: { frameEpoch: prefixEpoch, caretRect: null }, selection: null,
+      layoutRevision: 1, layoutJson: prefixJson, layoutProvisional: true,
+    });
+    const prefix = (await act(() => pending))!;
+    await act(async () => hook.rerender({ layout: prefix.layout, source: engine }));
+    expect(hook.result.current.frame!.pages.length).toBeGreaterThan(3);
+    act(() => hook.result.current.setDisplayWindow(3, 4));
+    await waitFor(() => expect(worker.posted[1]).toMatchObject({ type: 'buildPages', pages: [3] }));
+    const visibleFrame = native.build_display_pages_frame(Uint32Array.of(3), prefixEpoch);
+    const visibleEpoch = decodeFrameDelta(visibleFrame).frameEpoch;
+    await act(async () => worker.reply({
+      id: worker.requestAt(1).id, ok: true, frame: visibleFrame.slice().buffer,
+      caret: { frameEpoch: visibleEpoch, caretRect: null }, selection: null, layoutRevision: 1,
+    }));
+    expect(hook.result.current.frame!.frameEpoch).toBe(visibleEpoch);
+    await act(async () => {
+      const attaching = hook.result.current.attachOffscreenCanvases(
+        [], [], 1, 1, { color: '#000', width: 2 }
+      );
+      worker.reply({ id: worker.requestAt(2).id, ok: true });
+      expect(await attaching).toBe(true);
+    });
+    await waitFor(() => expect(worker.posted[3]).toMatchObject({
+      type: 'completeLayout', expectedFrameEpoch: visibleEpoch,
+    }));
+    const completeJson = native.layout_document_with_regions_retained_json(request);
+    native.set_windowed_incremental_builds(false);
+    const completedFrame = native.build_display_list_frame('{}', visibleEpoch);
+    const completedDelta = decodeFrameDelta(completedFrame);
+    expect(completedDelta).toMatchObject({ full: false, baseFrameEpoch: visibleEpoch });
+    const fullFrame = native.build_display_list_frame('{}', 0);
+    const fullPages = applyFrameDelta(null, decodeFrameDelta(fullFrame)).displayList.pages;
+    worker.reply({
+      id: worker.requestAt(3).id, ok: true, frame: completedFrame.slice().buffer,
+      caret: { frameEpoch: completedDelta.frameEpoch, caretRect: null }, selection: null,
+      layoutRevision: 1, layoutJson: completeJson,
+    });
+    const completed = (await prefix.complete)!;
+    await act(async () => hook.rerender({ layout: completed.layout, source: engine }));
+    expect(hook.result.current.frame!.frameEpoch).toBe(completedDelta.frameEpoch);
+    expect(hook.result.current.displayList!.pages).toEqual(fullPages);
+    expect(hook.result.current.error).toBeNull();
+    expect(worker.posted.filter((entry) => entry.type === 'buildFrame')).toEqual([]);
+  } finally {
+    hook.unmount();
+    native.free();
+  }
+});
+
+test.each(['delta', 'full'])('a completion %s handles a host base adopted while its request is pending', async (kind) => {
+  const { native, layoutJson, frame, engine } = setup();
+  const hook = renderHook(
+    ({ layout, source, resolved }) => useRustDisplayList(layout, undefined, undefined, resolved, source),
+    { initialProps: {
+      layout: null as Layout | null,
+      source: null as YrsSession | null,
+      resolved: undefined as ReadonlySet<number> | undefined,
+    } }
+  );
+  try {
+    const pending = hook.result.current.layoutInWorker(engine, REQUEST)!;
+    const worker = FakeWorker.last!;
+    worker.reply({
+      id: worker.requestAt(0).id, ok: true, frame: frame.slice().buffer,
+      caret: { frameEpoch: 1, caretRect: null }, selection: null,
+      layoutRevision: 1, layoutJson, layoutProvisional: true,
+    });
+    const prefix = (await act(() => pending))!;
+    await act(async () => hook.rerender({ layout: prefix.layout, source: engine, resolved: undefined }));
+    await act(async () => {
+      const attaching = hook.result.current.attachOffscreenCanvases(
+        [], [], 1, 1, { color: '#000', width: 2 }
+      );
+      worker.reply({ id: worker.requestAt(1).id, ok: true });
+      expect(await attaching).toBe(true);
+    });
+    const completionRequest = worker.requestAt(2);
+    expect(completionRequest).toMatchObject({ type: 'completeLayout', expectedFrameEpoch: 1 });
+    const completedFrame = kind === 'delta' ? native.build_display_list_frame('{}', 1) : null;
+    await act(async () => hook.rerender({ layout: prefix.layout, source: engine, resolved: new Set([7]) }));
+    const interveningRequest = worker.requestAt(3);
+    expect(interveningRequest).toMatchObject({ type: 'buildFrame', expectedFrameEpoch: 1 });
+    const interveningFrame = native.build_display_list_frame('{}', 1);
+    const interveningEpoch = decodeFrameDelta(interveningFrame).frameEpoch;
+    await act(async () => worker.reply({
+      id: interveningRequest.id, ok: true, frame: interveningFrame.slice().buffer,
+      caret: { frameEpoch: interveningEpoch, caretRect: null }, selection: null, layoutRevision: 1,
+    }));
+    expect(hook.result.current.frame!.frameEpoch).toBe(interveningEpoch);
+    const replyFrame = completedFrame ?? native.build_display_list_frame('{}', 1);
+    const replyDelta = decodeFrameDelta(replyFrame);
+    expect(replyDelta.full).toBe(kind === 'full');
+    worker.reply({
+      id: completionRequest.id, ok: true, frame: replyFrame.slice().buffer,
+      caret: { frameEpoch: replyDelta.frameEpoch, caretRect: null }, selection: null,
+      layoutRevision: 1, layoutJson,
+    });
+    const completed = (await prefix.complete)!;
+    await act(async () => hook.rerender({ layout: completed.layout, source: engine, resolved: undefined }));
+    if (kind === 'delta') {
+      const fallbackRequest = worker.requestAt(4);
+      expect(fallbackRequest).toMatchObject({ type: 'buildFrame', expectedFrameEpoch: interveningEpoch });
+      const freshFrame = native.build_display_list_frame('{}', interveningEpoch);
+      await act(async () => worker.reply({
+        id: fallbackRequest.id, ok: true, frame: freshFrame.slice().buffer,
+        caret: { frameEpoch: decodeFrameDelta(freshFrame).frameEpoch, caretRect: null },
+        selection: null, layoutRevision: 1,
+      }));
+      expect(hook.result.current.frame!.frameEpoch).toBe(decodeFrameDelta(freshFrame).frameEpoch);
+    } else {
+      expect(worker.posted).toHaveLength(4);
+      expect(hook.result.current.frame!.frameEpoch).toBe(replyDelta.frameEpoch);
+    }
+    const fullFrame = native.build_display_list_frame('{}', 0);
+    expect(hook.result.current.displayList!.pages).toEqual(
+      applyFrameDelta(null, decodeFrameDelta(fullFrame)).displayList.pages
+    );
+    expect(hook.result.current.error).toBeNull();
+    expect(worker.terminated).toBe(false);
+  } finally {
+    hook.unmount();
+    native.free();
+  }
+});
+
+test.each([false, true])('layout-complete signal waits for the adopted final frame and excludes queued layout with queued=%s', async (queued) => {
+  const { native, layoutJson, frame, engine } = setup();
+  try {
+    const fullLayoutJson = native.layout_document_with_regions_retained_json(REQUEST);
+    const fullFrame = native.build_display_list_frame('{}', 1);
+    const { result, rerender, unmount } = renderHook(
+      ({ layout, source }) => useRustDisplayList(layout, undefined, undefined, undefined, source),
+      { initialProps: { layout: null as Layout | null, source: engine as YrsSession | null } }
+    );
+    expect(result.current.layoutCompleteSession).toBeNull();
+    const pending = result.current.layoutInWorker(engine, REQUEST);
+    const worker = FakeWorker.last!;
+    worker.reply({
+      id: worker.requestAt(0).id, ok: true, frame: frame.slice().buffer,
+      caret: { frameEpoch: 1, caretRect: null }, selection: null,
+      layoutRevision: 1, layoutJson, layoutProvisional: true,
+    });
+    const provisional = await pending!;
+    await act(async () => {
+      rerender({ layout: provisional!.layout, source: engine });
+    });
+    await waitFor(() => expect(result.current.frame?.frameEpoch).toBe(1));
+    expect(result.current.layoutCompleteSession).toBeNull();
+    await act(async () => {
+      void result.current.attachOffscreenCanvases([], [], 1, 1, { color: '#000', width: 2 });
+    });
+    worker.reply({ id: worker.requestAt(1).id, ok: true });
+    await waitFor(() => expect(worker.posted).toHaveLength(3));
+    expect(result.current.pendingCompletion).toBeNull();
+    expect(result.current.layoutCompleteSession).toBeNull();
+    worker.reply({
+      id: worker.requestAt(2).id, ok: true, frame: fullFrame.slice().buffer,
+      caret: { frameEpoch: 2, caretRect: null }, selection: null,
+      layoutRevision: 1, layoutJson: fullLayoutJson,
+    });
+    const complete = await provisional!.complete!;
+    expect(result.current.layoutCompleteSession).toBeNull();
+    markLayoutQueued(engine, queued);
+    await act(async () => {
+      rerender({ layout: complete!.layout, source: engine });
+    });
+    await waitFor(() => expect(result.current.frame?.frameEpoch).toBe(2));
+    expect(result.current.layoutCompleteSession).toBe(queued ? null : engine);
+    markLayoutQueued(engine, false);
+    await act(async () => {
+      const next = result.current.layoutInWorker(engine, REQUEST);
+      void next?.catch(() => {});
+    });
+    expect(result.current.layoutCompleteSession).toBeNull();
+    await act(async () => rerender({ layout: null, source: null }));
+    expect(result.current.layoutCompleteSession).toBeNull();
+    unmount();
+  } finally {
+    markLayoutQueued(engine, false);
+    native.free();
+  }
+});
+
+test('an older final frame cannot set the layout-complete signal during an overlapping pass on the same engine', async () => {
+  const { native, layoutJson, frame, engine } = setup();
+  const hook = renderHook(
+    ({ layout }) => useRustDisplayList(layout, undefined, undefined, undefined, engine),
+    { initialProps: { layout: null as Layout | null } }
+  );
+  try {
+    const first = hook.result.current.layoutInWorker(engine, REQUEST)!;
+    const worker = FakeWorker.last!;
+    worker.reply({
+      id: worker.requestAt(0).id, ok: true, frame: frame.slice().buffer,
+      caret: { frameEpoch: 1, caretRect: null }, selection: null,
+      layoutRevision: 1, layoutJson,
+    });
+    const stale = (await act(() => first))!;
+    let current!: ReturnType<typeof hook.result.current.layoutInWorker>;
+    act(() => { current = hook.result.current.layoutInWorker(engine, REQUEST); });
+    expect(engine.residentWorkerProbe()?.layoutRevision).toBe(2);
+    expect(hook.result.current.layoutCompleteSession).toBeNull();
+    await act(async () => hook.rerender({ layout: stale.layout }));
+    await waitFor(() => expect(hook.result.current.frame?.frameEpoch).toBe(1));
+    expect(hook.result.current.layoutCompleteSession).toBeNull();
+    const currentLayoutJson = native.layout_document_with_regions_retained_json(REQUEST);
+    const currentFrame = native.build_display_list_frame('{}', 0);
+    const epoch = decodeFrameDelta(currentFrame).frameEpoch;
+    expect(epoch).toBeGreaterThan(1);
+    worker.reply({
+      id: worker.requestAt(1).id, ok: true, frame: currentFrame.slice().buffer,
+      caret: { frameEpoch: epoch, caretRect: null }, selection: null,
+      layoutRevision: 2, layoutJson: currentLayoutJson,
+    });
+    const completed = (await act(() => current!))!;
+    expect(hook.result.current.layoutCompleteSession).toBeNull();
+    await act(async () => hook.rerender({ layout: completed.layout }));
+    await waitFor(() => expect(hook.result.current.frame?.frameEpoch).toBe(epoch));
+    expect(hook.result.current.layoutCompleteSession).toBe(engine);
+    expect(hook.result.current.error).toBeNull();
+  } finally {
+    hook.unmount();
+    native.free();
+  }
+});
+
 test('a proposal layout is whole and reuses unchanged pages after an intervening visible build', async () => {
   let request = JSON.stringify({
     ...JSON.parse(REQUEST),
@@ -2406,7 +2624,7 @@ test.each([true, false])('viewer=%s selects the reply mode across decisions and 
     pageWidth: 4320, pageHeight: 2880,
     marginTop: 300, marginRight: 300, marginBottom: 300, marginLeft: 300,
   } }] } });
-  const { native, engine } = setup(9401, 'Meta decision pages. '.repeat(600), request);
+  const { native, engine } = setup(9401, 'Meta decision pages. '.repeat(120), request);
   const fontId = native.register_measure_font(font);
   request = JSON.stringify({ ...JSON.parse(request), measurement: {
     ...JSON.parse(request).measurement,

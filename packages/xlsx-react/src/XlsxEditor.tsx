@@ -79,6 +79,7 @@ import {
 import { inPluginChrome, pluginEventStore } from './commands/pluginEvents';
 import type { XlsxCommandStore } from './commands/types';
 import { useCommandShortcuts } from './commands/useCommandShortcuts';
+import { useSaveRequest } from './commands/useSaveRequest';
 import { useXlsxCommandBinding, type XlsxEditorBridge } from './commands/useXlsxCommands';
 import { XlsxCommandContext } from './commands/XlsxCommandProvider';
 import { EditorToolbar } from './components/EditorToolbar';
@@ -94,8 +95,11 @@ import {
   RemoteSelections,
 } from './presence/Presence';
 import { ProposalsPanel } from './proposals/ProposalsPanel';
-import { deriveLimits, scaledRect } from './viewer/sessionGeometry';
+import { deriveLimits, positionAtPoint, scaledRect } from './viewer/sessionGeometry';
 import { XlsxSessionViewer } from './viewer/XlsxSessionViewer';
+import { XlsxWorkerEditor } from './worker/XlsxWorkerEditor';
+import type { XlsxAsyncEditorApi } from './worker/createAsyncEditorApi';
+import type { XlsxWorkerEditorApi } from './worker/createWorkerEditorApi';
 import type {
   XlsxAdmission,
   XlsxPluginEditorAccess,
@@ -106,6 +110,18 @@ import { PluginOverlays } from './plugins/PluginOverlays';
 import { PluginDock, useDockArea, type DockPlacement } from './plugins/PluginPanels';
 import type { XlsxEditorPluginProps, XlsxPluginSelection } from './plugins/types';
 import { useXlsxPluginHost } from './plugins/useXlsxPluginHost';
+
+import { LEGACY_SYNC_API } from './runtimeOptions';
+import { warnXlsxEngine, type XlsxEngineWarning } from './engineWarnings';
+import { createInThreadAsyncEditorApi } from './createInThreadAsyncEditorApi';
+
+export const PEERLESS_FLAG = 'asyncApi' as const;
+
+export interface XlsxPointPosition {
+  sheet: number;
+  row: number;
+  col: number;
+}
 
 /**
  * The imperative surface handed to {@link XlsxEditorProps.onReady}: the open
@@ -118,8 +134,12 @@ import { useXlsxPluginHost } from './plugins/useXlsxPluginHost';
  * with {@link XlsxCommandAdmissionError}: `input-failed` while a refused entry
  * waits for correction or earlier input failed, `gesture-active` during a chart
  * drag, and `document-replaced` when the workbook is replaced meanwhile.
+ * @deprecated Removed in 0.6.0. Use XlsxAsyncEditorApi.
  */
 export interface XlsxEditorApi {
+  flushPendingInput: () => Promise<void>;
+  /** Client coordinates; sheet, row and column are zero-based. */
+  getPositionAtPoint: (clientX: number, clientY: number) => XlsxPointPosition | null;
   /**
    * Closes the open cell entry and clears the selection. The entry is written
    * at once, or queued behind input still waiting to be written. An entry the
@@ -166,7 +186,7 @@ export interface XlsxEditorApi {
   applyEdits: (request: XlsxEditRequest) => Promise<XlsxEditResult>;
 }
 
-/** @experimental */
+/** @deprecated Removed in 0.6.0. Use XlsxAsyncEditorApi. */
 export interface XlsxWorkerViewerApi extends Omit<
   XlsxEditorApi, 'handle' | 'save' | 'selectCells' | 'version' | 'readCells' |
   'findText' | 'validateEdits' | 'applyEdits'
@@ -217,13 +237,18 @@ export interface XlsxEditorCollaborationOptions {
 /**
  * Props for {@link XlsxEditor}.
  */
-export interface XlsxEditorProps extends XlsxEditorPluginProps {
+export interface XlsxInThreadEditorProps extends XlsxEditorPluginProps {
+  /** @deprecated False selects the in-thread engine. */
+  experimentalWorkerOpen?: false;
+  onError?: (error: Error) => void;
   /** Raw .xlsx bytes to open. When omitted the shell paints a demo frame. */
   file?: Uint8Array;
   /** Download name for the save button; falls back to `workbook.xlsx`. */
   fileName?: string;
   /** Receive saved bytes instead of triggering a browser download. */
   onSave?: (bytes: Uint8Array) => void;
+  /** Return true for built-in saving; false or void handles/cancels the request. */
+  onSaveRequest?: () => boolean | void | Promise<boolean | void>;
   /** Called after a user edit changes the workbook. */
   onChange?: () => void;
   /** Open a network-ready Yrs replica and repaint when peer updates arrive. */
@@ -250,13 +275,48 @@ export interface XlsxEditorProps extends XlsxEditorPluginProps {
   showToolbar?: boolean;
 }
 
-/** @experimental */
-export type XlsxWorkerViewerProps = Omit<XlsxEditorProps, 'onReady' | 'readOnly' | 'collaboration'> & {
+/** @deprecated Removed in 0.6.0. Use XlsxAsyncEditorProps. */
+export type XlsxWorkerViewerProps = Omit<XlsxInThreadEditorProps, 'onReady' | 'readOnly' | 'collaboration' | 'experimentalWorkerOpen'> & {
+  /** @deprecated Removed in 0.6.0. Omit for the async editor. */
+  [LEGACY_SYNC_API]: true;
   readOnly: true;
-  experimentalWorkerOpen: true;
-  onError?: (error: Error) => void;
+  collaboration?: undefined;
+  experimentalWorkerOpen?: true;
   onReady?: (api: XlsxWorkerViewerApi) => void | (() => void);
 };
+
+/** @deprecated Removed in 0.6.0. Use XlsxAsyncEditorProps. */
+export type XlsxWorkerEditorProps = Omit<XlsxWorkerViewerProps, 'onReady' | 'readOnly'> & {
+  readOnly?: false;
+  onReady?: (api: XlsxWorkerEditorApi) => void | (() => void);
+};
+
+export type XlsxAsyncEditorProps = Omit<XlsxInThreadEditorProps, 'onReady' | 'experimentalWorkerOpen'> & {
+  /** @internal */
+  [PEERLESS_FLAG]?: true;
+  /** @deprecated Removed in 0.6.0. Omit for the async editor. */
+  [LEGACY_SYNC_API]?: false;
+  /** @deprecated False selects the in-thread engine. */
+  experimentalWorkerOpen?: boolean;
+  onReady?: (api: XlsxAsyncEditorApi) => void | (() => void);
+};
+
+/** @deprecated Removed in 0.6.0. Use XlsxAsyncEditorProps. */
+export type XlsxLegacyEditorProps = XlsxInThreadEditorProps & {
+  /** @deprecated Removed in 0.6.0. Omit for the async editor. */
+  [LEGACY_SYNC_API]: true;
+};
+
+type WorkerSessionProps = Omit<XlsxWorkerEditorProps, 'readOnly' | 'onReady'> & {
+  readOnly?: boolean;
+  onReady?: (api: XlsxWorkerEditorApi | XlsxWorkerViewerApi) => void | (() => void);
+};
+type GeneralEditorSessionProps = Omit<XlsxLegacyEditorProps, 'experimentalWorkerOpen' | 'onReady'> & {
+  experimentalWorkerOpen?: boolean;
+  onReady?: (api: XlsxEditorApi | XlsxWorkerEditorApi | XlsxWorkerViewerApi) => void | (() => void);
+};
+
+export type XlsxEditorProps = XlsxAsyncEditorProps | GeneralEditorSessionProps;
 
 /** the open in-cell editor: which cell it targets and its current draft text. */
 interface EditState {
@@ -554,28 +614,70 @@ function useSyncedState<T>(initial: T) {
   return [value, set, ref] as const;
 }
 
-/**
- * The xlsx editor React component.
- */
+function XlsxAsyncEditorSession(props: XlsxAsyncEditorProps) {
+  const inThread = props.experimentalWorkerOpen === false;
+  const identity = useMemo(() => ({}), [props.file, props.collaboration, inThread]);
+  const start = () => ({ identity, reason: inThread ? 'deprecated' as const
+    : typeof Worker !== 'function' ? 'no-worker' as const
+    : typeof OffscreenCanvas !== 'function' ? 'no-offscreen-canvas' as const : undefined });
+  const [choice, setChoice] = useState(start);
+  const engine = choice.identity === identity ? choice : start();
+  if (choice !== engine) setChoice(engine);
+  useEffect(() => { if (engine.reason) warnXlsxEngine(engine.reason); }, [engine.reason]);
+  return engine.reason ? <XlsxAsyncInThreadSession {...props} /> : <XlsxWorkerEditor {...props} backend="peerless" />;
+}
+
+function XlsxAsyncInThreadSession(props: XlsxAsyncEditorProps) {
+  const current = useRef<XlsxEditorApi | null>(null);
+  const ready = useCallback((api: XlsxEditorApi) => {
+    current.current = api;
+    const cleanup = props.onReady?.(createInThreadAsyncEditorApi(api, props.collaboration !== undefined, () => {
+      if (current.current !== api) throw new XlsxCommandAdmissionError('document-replaced');
+    }));
+    return () => {
+      if (current.current === api) current.current = null;
+      cleanup?.();
+    };
+  }, [props.onReady, props.collaboration]);
+  return <XlsxEditorContent {...props} experimentalWorkerOpen={false} onReady={ready} />;
+}
+
+export function XlsxEditor(props: XlsxAsyncEditorProps): React.JSX.Element;
+export function XlsxEditor(props: XlsxLegacyEditorProps & { experimentalWorkerOpen: false }): React.JSX.Element;
 export function XlsxEditor(props: XlsxWorkerViewerProps): React.JSX.Element;
+export function XlsxEditor(props: XlsxWorkerEditorProps): React.JSX.Element;
+export function XlsxEditor(props: WorkerSessionProps): React.JSX.Element;
 export function XlsxEditor(props: XlsxEditorProps): React.JSX.Element;
-export function XlsxEditor(props: XlsxWorkerViewerProps | XlsxEditorProps): React.JSX.Element {
-  return (
-    <LocaleProvider i18n={props.i18n}>
-      {'experimentalWorkerOpen' in props && props.experimentalWorkerOpen && props.readOnly ? (
-        <XlsxSessionViewer {...props as XlsxWorkerViewerProps} />
-      ) : (
-        <XlsxEditorContent {...props as XlsxEditorProps} />
-      )}
-    </LocaleProvider>
-  );
+export function XlsxEditor(props: XlsxEditorProps | XlsxLegacyEditorProps | XlsxWorkerViewerProps | XlsxWorkerEditorProps | WorkerSessionProps): React.JSX.Element {
+  return <LocaleProvider i18n={props.i18n}>
+    {props[LEGACY_SYNC_API] === true ? <LegacyXlsxEditor {...props} /> : <XlsxAsyncEditorSession {...props} />}
+  </LocaleProvider>;
+}
+
+function LegacyXlsxEditor(props: GeneralEditorSessionProps | XlsxLegacyEditorProps | XlsxWorkerViewerProps | XlsxWorkerEditorProps | WorkerSessionProps): React.JSX.Element {
+  useEffect(() => { warnXlsxEngine('legacy-sync-api'); }, []);
+  const inThread = props.experimentalWorkerOpen === false;
+  const collaboration = props.collaboration;
+  const identity = useMemo(() => ({}), [props.file, collaboration, inThread]);
+  const start = () => ({ identity, reason: inThread ? 'deprecated' as XlsxEngineWarning
+    : typeof Worker !== 'function' ? 'no-worker' as XlsxEngineWarning : undefined, editor: !props.readOnly });
+  const [choice, setChoice] = useState(start);
+  const session = choice.identity === identity ? choice : start();
+  const editor = session.editor || !props.readOnly;
+  if (choice !== session || choice.editor !== editor) setChoice({ ...session, editor });
+  useEffect(() => { if (session.reason) warnXlsxEngine(session.reason); }, [session.reason]);
+  return session.reason ? <XlsxEditorContent {...props as XlsxInThreadEditorProps} />
+    : editor ? <XlsxWorkerEditor {...props as XlsxWorkerEditorProps} />
+    : <XlsxSessionViewer {...props as XlsxWorkerViewerProps} />;
 }
 
 function XlsxEditorContent({
   file,
   fileName,
   onSave,
+  onSaveRequest,
   onChange,
+  onError,
   collaboration,
   onReady,
   className,
@@ -586,7 +688,7 @@ function XlsxEditorContent({
   plugins,
   pluginGrants,
   onPluginError,
-}: XlsxEditorProps) {
+}: XlsxInThreadEditorProps) {
   const { t } = useTranslation();
   const collaborationEnabled = collaboration !== undefined;
   const collaborationClientId = collaboration?.clientId;
@@ -598,11 +700,12 @@ function XlsxEditorContent({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const handleRef = useRef<WorkbookHandle | null>(null);
   const frameRef = useRef<DisplayList | null>(null);
+  const hostPointRef = useRef<(x: number, y: number) => XlsxPointPosition | null>(() => null);
   // the exact frame on screen, stored with the zoom it was painted at. scroll
   // repaints are rAF-coalesced and a mutation republishes the frame, so hit
   // testing reads this snapshot rather than the live scroll offset or the
   // current model — either would answer for pixels that are not on screen.
-  const paintedRef = useRef<{ frame: DisplayList; zoom: number } | null>(null);
+  const paintedRef = useRef<{ frame: DisplayList; zoom: number; sheet: number; handle: WorkbookHandle | null } | null>(null);
   const rafRef = useRef<number | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const editorInputRef = useRef<HTMLInputElement>(null);
@@ -647,6 +750,8 @@ function XlsxEditorContent({
   // callback identity never reopens the workbook.
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
   const readOnlyRef = useRef(readOnly);
@@ -1009,6 +1114,7 @@ function XlsxEditorContent({
     setRenderError(null);
     paintSourceRef.current = null;
     pendingSheetViewRef.current = false;
+    paintedRef.current = null;
     if (!file) {
       handleRef.current = null;
       setSheetInfo(null);
@@ -1068,9 +1174,19 @@ function XlsxEditorContent({
             handle,
             refreshProposals,
             focus: () => scrollRef.current?.focus(),
+            flushPendingInput: async () => {
+              if (handleRef.current !== opened) throw new XlsxCommandAdmissionError('document-replaced');
+              if (draggingRef.current) throw new XlsxCommandAdmissionError('gesture-active');
+              await afterInput(opened, () => {});
+              if (handleRef.current !== opened) throw new XlsxCommandAdmissionError('document-replaced');
+            },
+            getPositionAtPoint: (x, y) => handleRef.current === opened ? hostPointRef.current(x, y) : null,
             save: () => {
+              if (handleRef.current !== opened) throw new XlsxCommandAdmissionError('document-replaced');
               if (hasRejectedRef.current()) throw new XlsxSaveRefusedError('input-failed');
-              if (coordinator.pending) throw new XlsxSaveRefusedError('input-pending');
+              if (coordinator.pending || compositionRef.current || chartDragRef.current || draggingRef.current) {
+                throw new XlsxSaveRefusedError('input-pending');
+              }
               if (!settlePendingEditsRef.current()) throw new XlsxSaveRefusedError('input-failed');
               return opened.save();
             },
@@ -1105,6 +1221,7 @@ function XlsxEditorContent({
           setSheetInfo(null);
           setSelection(null);
           setError(e instanceof Error ? e.message : String(e));
+          try { onErrorRef.current?.(e instanceof Error ? e : new Error(String(e))); } catch {}
         }
       },
       (e: unknown) => {
@@ -1113,10 +1230,13 @@ function XlsxEditorContent({
         setSheetInfo(null);
         setSelection(null);
         setError(e instanceof Error ? e.message : String(e));
+        try { onErrorRef.current?.(e instanceof Error ? e : new Error(String(e))); } catch {}
       }
     );
     return () => {
       disposed = true;
+      compositionRef.current?.settle(false);
+      compositionRef.current = null;
       runReadyCleanup();
       unsubscribeUpdates();
       handle?.dispose();
@@ -1236,7 +1356,7 @@ function XlsxEditorContent({
     }
     paintDisplayList(ctx, dl, dpr * zoom);
     frameRef.current = dl;
-    paintedRef.current = { frame: dl, zoom };
+    paintedRef.current = { frame: dl, zoom, sheet: activeSheet, handle };
     let version: string | null = null;
     try {
       version = handle ? handle.version() : null;
@@ -1818,6 +1938,11 @@ function XlsxEditorContent({
     },
     [onSave, fileName]
   );
+  hostPointRef.current = (clientX, clientY) => {
+    const painted = paintedRef.current;
+    if (!painted?.handle || painted.handle !== handleRef.current) return null;
+    return positionAtPoint(painted.frame, painted.sheet, canvasRef.current, clientX, clientY);
+  };
 
   // render the current scroll window to png via the raster backend and download
   // it — the same display list the canvas paints, rasterized in the core.
@@ -2225,7 +2350,13 @@ function XlsxEditorContent({
     },
   };
 
+  const requestSave = useSaveRequest({
+    document: () => handleRef.current,
+    onSaveRequest,
+    fail: (error) => setError(error instanceof Error ? error.message : String(error)),
+  });
   const bridge: XlsxEditorBridge = {
+    requestSave,
     handle: () => handleRef.current,
     status: () => (handleRef.current ? 'ready' : file && !error ? 'loading' : 'empty'),
     readOnly: () => readOnlyRef.current,

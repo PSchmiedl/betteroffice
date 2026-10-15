@@ -3,9 +3,11 @@
 
 mod axis;
 mod chart;
+mod facts_codec;
 mod formula;
 mod inventory;
 mod package;
+mod package_facts;
 mod patch;
 mod read;
 mod reference;
@@ -20,10 +22,13 @@ pub use axis::SheetAxes;
 pub use chart::{ChartRefresh, ChartRefreshPlan, chart_space, preserved_chart_space};
 #[cfg(feature = "test-counters")]
 pub use chart::{chart_counters, reset_chart_counters};
+pub use facts_codec::{PackageFactsBuilder, PackageFactsEncoder, SNAPSHOT_RECORD_MAX_BYTES};
 pub use inventory::{
     DrawingObject, DrawingObjectKind, InspectionBudget, SheetInventory, SourceObject,
 };
 pub use package::{PreservedPackage, SheetVisibility, SourceSheetKind};
+pub use package_facts::{PackageFacts, PackageFactsView};
+pub use patch::keeps_source;
 pub use read::{LegacySheetDimensions, SharedStringCells, SourceCellFacts, parse_workbook};
 pub use reference::UnpatchableReference;
 #[cfg(any(test, feature = "test-oracle"))]
@@ -100,6 +105,8 @@ pub const MAX_HYPERLINKS: usize = 65_536;
 /// upper bound on `<col>` runs naming a style in one worksheet.
 pub const MAX_COL_STYLES: usize = 65_536;
 
+pub const MAX_ROW_STYLES: usize = xlsx_model::workbook::MAX_ROW_STYLES;
+
 /// upper bound on table parts read from one package.
 pub const MAX_TABLES: usize = 65_536;
 
@@ -152,6 +159,7 @@ pub enum ParseError {
     TooManyHyperlinks,
     /// a worksheet exceeded [`MAX_COL_STYLES`].
     TooManyColumnStyles,
+    TooManyRowStyles,
     /// a style pool exceeded [`MAX_STYLE_ENTRIES`].
     TooManyStyles,
     /// a part exceeded [`MAX_TREE_BYTES`], [`MAX_TREE_NODES`] or
@@ -179,6 +187,7 @@ impl core::fmt::Display for ParseError {
             ParseError::TooManyColumnStyles => {
                 write!(f, "worksheet column style count exceeded cap")
             }
+            ParseError::TooManyRowStyles => write!(f, "worksheet row style count exceeded cap"),
             ParseError::TooManyStyles => write!(f, "style pool count exceeded cap"),
             ParseError::TreeTooLarge => write!(f, "part exceeded the element tree cap"),
             ParseError::TooManyCharts => write!(f, "chart reference or anchor count exceeded cap"),

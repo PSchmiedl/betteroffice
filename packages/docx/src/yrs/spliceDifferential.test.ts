@@ -126,6 +126,86 @@ function withoutIds(paragraph: string): string {
   );
 }
 
+function paragraphSources(kept: string[], from: string[]): (number | undefined)[] {
+  const sourceOf = new Array<number | undefined>(kept.length).fill(undefined);
+  const saved = kept.map(withoutIds);
+  const source = from.map(withoutIds);
+  if (saved.length === source.length) {
+    return saved.map((paragraph, index) => (paragraph === source[index] ? index : undefined));
+  }
+  let start = 0;
+  while (start < saved.length && start < source.length && saved[start] === source[start]) {
+    sourceOf[start] = start;
+    start += 1;
+  }
+  let keptEnd = saved.length;
+  let sourceEnd = source.length;
+  while (keptEnd > start && sourceEnd > start && saved[keptEnd - 1] === source[sourceEnd - 1]) {
+    keptEnd -= 1;
+    sourceEnd -= 1;
+    sourceOf[keptEnd] = sourceEnd;
+  }
+  const rows = keptEnd - start;
+  const columns = sourceEnd - start;
+  const lengths = Array.from({ length: rows + 1 }, () => new Array<number>(columns + 1).fill(0));
+  for (let i = rows - 1; i >= 0; i -= 1) {
+    for (let j = columns - 1; j >= 0; j -= 1) {
+      lengths[i]![j] =
+        saved[start + i] === source[start + j]
+          ? 1 + lengths[i + 1]![j + 1]!
+          : Math.max(lengths[i + 1]![j]!, lengths[i]![j + 1]!);
+    }
+  }
+  let i = 0;
+  let j = 0;
+  while (i < rows && j < columns) {
+    if (saved[start + i] === source[start + j]) {
+      sourceOf[start + i] = start + j;
+      i += 1;
+      j += 1;
+    } else if (lengths[i + 1]![j]! >= lengths[i]![j + 1]!) {
+      i += 1;
+    } else {
+      j += 1;
+    }
+  }
+  return sourceOf;
+}
+
+const W14 = 'http://schemas.microsoft.com/office/word/2010/wordml';
+const MC = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+const ROOT_TAG = /<[A-Za-z_][^\s/>]*(?:[^>"']|"[^"]*"|'[^']*')*>/;
+
+/**
+ * `saved` without the declarations a splice adds to a source root that lacks them so a new
+ * paragraph can carry w14:paraId (xmlns:w14, xmlns:mc, mc:Ignorable or its w14 token). Any
+ * other root change survives.
+ */
+function withoutRootPatch(saved: string, source: string): string {
+  const before = ROOT_TAG.exec(source)?.[0];
+  const after = ROOT_TAG.exec(saved);
+  if (!before || !after) return saved;
+  const declares = (name: string) => new RegExp(`\\s${name}=`).test(before);
+  let root = after[0];
+  if (!declares('xmlns:w14')) {
+    root = root.replace(` xmlns:w14="${W14}"`, '');
+    if (!declares('xmlns:mc')) root = root.replace(` xmlns:mc="${MC}"`, '');
+    const ignorable = /\smc:Ignorable="([^"]*)"/.exec(before)?.[1];
+    if (ignorable === undefined) root = root.replace(' mc:Ignorable="w14"', '');
+    else {
+      const token = `${ignorable}${ignorable ? ' ' : ''}w14`;
+      root = root.replace(`mc:Ignorable="${token}"`, `mc:Ignorable="${ignorable}"`);
+    }
+  }
+  return saved.slice(0, after.index) + root + saved.slice(after.index + after[0].length);
+}
+
+/** The offsets in `gaps` joined at which the paragraphs between them sit. */
+function cuts(gaps: string[]): number[] {
+  let at = 0;
+  return gaps.slice(0, -1).map((gap) => (at += gap.length));
+}
+
 function decode(text: string): string {
   return text.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);/g, (_, entity: string) => {
     if (entity.startsWith('#x')) return String.fromCodePoint(Number.parseInt(entity.slice(2), 16));
@@ -307,6 +387,32 @@ afterEach(() => {
   for (const session of sessions.splice(0)) session.destroy();
 });
 
+describe('the splice root patch allowance', () => {
+  const W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const ids = `xmlns:w14="${W14}"`;
+  const plain = `<?xml version="1.0"?>\n<w:document ${W} w:conformance="strict"><w:body>`;
+  const marked = `<?xml version="1.0"?>\n<w:document ${W} xmlns:mc="${MC}" mc:Ignorable="w15"><w:body>`;
+
+  it('strips only the paragraph id declarations the source root lacks', () => {
+    const patched = plain.replace('strict">', `strict" ${ids} xmlns:mc="${MC}" mc:Ignorable="w14">`);
+    expect(withoutRootPatch(patched, plain)).toBe(plain);
+    expect(withoutRootPatch(marked.replace('"w15">', `"w15 w14" ${ids}>`), marked)).toBe(marked);
+  });
+
+  it('keeps every other root change visible', () => {
+    const patched = ` ${ids} xmlns:mc="${MC}" mc:Ignorable="w14">`;
+    for (const changed of [
+      plain.replace('strict">', `transitional"${patched}`),
+      plain.replace('strict">', `strict" xmlns:w15="urn:other"${patched}`),
+      plain.replace('strict">', `strict" ${ids} xmlns:mc="${MC}" mc:Ignorable="w14 w15">`),
+      plain.replace('<w:body>', '<w:body w:extra="1">').replace('strict">', `strict"${patched}`),
+    ]) expect(withoutRootPatch(changed, plain)).not.toBe(plain);
+    const declared = plain.replace('strict">', `strict" ${ids}>`);
+    expect(withoutRootPatch(declared.replace(ids, `${ids} xmlns:mc="${MC}"`), declared)).not.toBe(declared);
+    expect(withoutRootPatch(marked.replace('"w15">', `"w14 w15" ${ids}>`), marked)).not.toBe(marked);
+  });
+});
+
 describe('a spliced session save', () => {
   for (const file of documents()) {
     const name = relative(process.env.SPLICE_DIFF_DOCS ?? ROOT, file);
@@ -321,6 +427,7 @@ describe('a spliced session save', () => {
           const session = await open(source);
           const edits = edit(session, next);
           if (edits.length === 0) continue;
+          const structural = edits.some((applied) => /^(split|merge)@/.test(applied));
           const base = session.materializeDocx()!;
           const capture = captureSessionSave(session);
           const document = yrsToDocument(session, base);
@@ -359,15 +466,60 @@ describe('a spliced session save', () => {
             const kept = paragraphs(xml);
             const written = paragraphs(whole[part]!);
             if (strayAmpersands(xml) > 0) fail(`${part} holds an ampersand the loader repairs`);
-            if (kept.spans.length !== from.spans.length || written.spans.length !== from.spans.length) {
+            if (
+              kept.spans.length !== written.spans.length ||
+              (!structural && kept.spans.length !== from.spans.length)
+            ) {
               fail(
                 `${part} paragraphs: source ${from.spans.length}, spliced ${kept.spans.length}, whole ${written.spans.length}`
               );
               continue;
             }
-            kept.gaps.forEach((gap, index) => {
-              if (gap !== from.gaps[index]) fail(`${part} XML before paragraph ${index} changed`);
+            const declaresIds = /\sxmlns:w14=/.test(ROOT_TAG.exec(xml)?.[0] ?? '');
+            if (/[\s<]w14:/.test(xml) && !declaresIds) {
+              fail(`${part} uses w14 without declaring it on its root`);
+            }
+            const keptGaps = [withoutRootPatch(kept.gaps[0]!, from.gaps[0] ?? ''), ...kept.gaps.slice(1)];
+            const sourceOf = paragraphSources(kept.spans, from.spans);
+            const keptOf = new Array<number | undefined>(from.spans.length).fill(undefined);
+            sourceOf.forEach((source, index) => {
+              if (source !== undefined) keptOf[source] = index;
             });
+            if (kept.spans.length === from.spans.length) {
+              keptGaps.forEach((gap, index) => {
+                if (gap !== from.gaps[index]) fail(`${part} XML before paragraph ${index} changed`);
+              });
+            } else {
+              let ka = -1;
+              let ja = -1;
+              const anchors: [number, number][] = [];
+              sourceOf.forEach((source, index) => {
+                if (source !== undefined) anchors.push([index, source]);
+              });
+              anchors.push([kept.spans.length, from.spans.length]);
+              for (const [kb, jb] of anchors) {
+                const saved = keptGaps.slice(ka + 1, kb + 1);
+                const source = from.gaps.slice(ja + 1, jb + 1);
+                if (saved.length === source.length) {
+                  saved.forEach((gap, offset) => {
+                    if (gap !== source[offset]) {
+                      fail(`${part} XML before paragraph ${ka + 1 + offset} changed`);
+                    }
+                  });
+                } else if (saved.join('') !== source.join('')) {
+                  fail(`${part} XML around paragraphs ${ka + 1}..${kb - 1} changed`);
+                } else {
+                  const between = new Set([0, saved.join('').length, ...cuts(source)]);
+                  if (cuts(saved).some((at) => !between.has(at))) {
+                    fail(
+                      `${part} paragraphs ${ka + 1}..${kb - 1} sit inside the XML between source paragraphs`
+                    );
+                  }
+                }
+                ka = kb;
+                ja = jb;
+              }
+            }
             const links = { spliced: relationships(spliced, part), whole: relationships(whole, part) };
             const groups = fieldGroups(from.spans);
             const grouped = new Map<number, number[]>();
@@ -376,25 +528,29 @@ describe('a spliced session save', () => {
               grouped.get(first)!.push(index);
             });
             const members = (first: number) => grouped.get(first)!;
-            const source = kept.spans.map(
-              (paragraph, index) => withoutIds(paragraph) === withoutIds(from.spans[index]!)
-            );
+            keptOf.forEach((index, source) => {
+              if (
+                index === undefined &&
+                members(groups[source]!).some((member) => keptOf[member] !== undefined)
+              ) {
+                fail(`${part} field group of paragraph ${source} is partly kept`);
+              }
+            });
             kept.spans.forEach((paragraph, index) => {
-              if (!source[index] && paragraph === written.spans[index]) {
+              const source = sourceOf[index];
+              if (source === undefined && paragraph === written.spans[index]) {
                 tally.rewritten += 1;
-                if (members(groups[index]!).some((member) => source[member])) {
-                  fail(`${part} field group of paragraph ${index} is partly kept`);
-                }
                 return;
               }
-              if (!source[index]) {
+              if (source === undefined) {
                 fail(`${part} paragraph ${index} is neither its source nor the written XML`);
                 return;
               }
               tally.kept += 1;
-              if (groups[index] !== index || kept.continued[index]) return;
-              const group = members(index);
-              const join = (spans: string[]) => group.map((member) => spans[member]!).join('');
+              if (groups[source] !== source || kept.continued[index]) return;
+              const group = members(source).map((member) => keptOf[member]);
+              if (group.some((member) => member === undefined)) return;
+              const join = (spans: string[]) => group.map((member) => spans[member!]!).join('');
               if (text(join(kept.spans)) !== text(join(written.spans))) {
                 fail(`${part} kept paragraph ${index} text differs from the model`);
               }

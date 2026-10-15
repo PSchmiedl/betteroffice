@@ -640,7 +640,9 @@ fn apply_document_regions_with(
                     number as i64,
                     numbering.format.as_deref().unwrap_or("decimal"),
                 ));
-                page.page_numbering = serde_json::to_value(numbering).ok();
+                page.page_numbering = serde_json::to_string(&numbering)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok());
             } else if number != u64::from(page.number) {
                 page.section_page_number = Some(number);
                 page.page_label = Some(number.to_string());
@@ -677,48 +679,13 @@ pub fn effective_header_footer_refs(
     regions: &DocumentRegions,
     section_index: usize,
 ) -> Option<HeaderFooterRefs> {
-    let mut effective = HeaderFooterRefs {
-        header_default: None,
-        header_first: None,
-        header_even: None,
-        footer_default: None,
-        footer_first: None,
-        footer_even: None,
-    };
+    let mut effective = HeaderFooterRefs::default();
     for section in regions.sections.iter().take(section_index + 1) {
-        let Some(authored) = &section.header_footer_refs else {
-            continue;
-        };
-        if authored.header_default.is_some() {
-            effective
-                .header_default
-                .clone_from(&authored.header_default);
-        }
-        if authored.header_first.is_some() {
-            effective.header_first.clone_from(&authored.header_first);
-        }
-        if authored.header_even.is_some() {
-            effective.header_even.clone_from(&authored.header_even);
-        }
-        if authored.footer_default.is_some() {
-            effective
-                .footer_default
-                .clone_from(&authored.footer_default);
-        }
-        if authored.footer_first.is_some() {
-            effective.footer_first.clone_from(&authored.footer_first);
-        }
-        if authored.footer_even.is_some() {
-            effective.footer_even.clone_from(&authored.footer_even);
+        if let Some(authored) = &section.header_footer_refs {
+            effective.inherit(authored);
         }
     }
-    (effective.header_default.is_some()
-        || effective.header_first.is_some()
-        || effective.header_even.is_some()
-        || effective.footer_default.is_some()
-        || effective.footer_first.is_some()
-        || effective.footer_even.is_some())
-    .then_some(effective)
+    (effective != HeaderFooterRefs::default()).then_some(effective)
 }
 
 /// Resolved PAGE field text for one page.
@@ -875,6 +842,7 @@ mod tests {
             footnote_ids: None,
             footnote_reserved_height: None,
             float_bands: Vec::new(),
+            opening_fragment_geometry: None,
             footnote_columns: None,
             columns: None,
             section_id: None,

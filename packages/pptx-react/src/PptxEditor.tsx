@@ -2,13 +2,13 @@ import {
   initWasm,
   openPresentation,
   paintSlide,
-  decodePresentationImage,
   presentationImageBlob,
   PRESENCE_LABEL_DURATION_MS,
   sizeCanvasForSlide,
   slideToPng,
   StaleProposalError,
-} from '@betteroffice/pptx';
+  PptxPeerNotReadyError,
+} from '@betteroffice/pptx/editor';
 import type {
   CanvasImageResolver,
   CollaborationReplica,
@@ -27,6 +27,7 @@ import type {
   PptxReadRequest,
   PptxReadResult,
   PptxValidationResult,
+  PptxWorkerEditorRecovery,
   PresentationHandle,
   Proposal,
   ProposalDiffSlide,
@@ -40,9 +41,13 @@ import { LocaleProvider, useTranslation } from './i18n';
 import { ProposalsPanel } from './components/ProposalsPanel';
 import { ProposalCanvasOverlay, ProposalCanvasToolbar, ProposalNotesDiff, useProposalCanvas } from './components/ProposalCanvas';
 import {
+  Component,
   memo,
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -89,7 +94,7 @@ import type {
 } from './plugins/createPluginClients';
 import { PluginOverlays } from './plugins/PluginOverlays';
 import { PluginDock, useDockArea, type DockPlacement } from './plugins/PluginPanels';
-import type { PptxEditorPluginProps, PptxPluginSelection } from './plugins/types';
+import type { PptxEditorPluginProps, PptxPlugin, PptxPluginSelection } from './plugins/types';
 import { usePptxPluginHost } from './plugins/usePptxPluginHost';
 import {
   RESIZE_HANDLES,
@@ -135,8 +140,58 @@ import {
 } from './textSelection';
 import type { CaretLine, TextSelectionGranularity } from './textSelection';
 import { PptxSessionViewer } from './viewer/PptxSessionViewer';
+import { PptxWorkerEditor, type PptxWorkerEditorProps } from './worker/PptxWorkerEditor';
+import { createWorkerEditorApi, type PptxWorkerEditorApi } from './worker/createWorkerEditorApi';
+import type { EditablePresentation } from './worker/useEditableSessionPresentation';
+import { createWorkerInputCoordinator, type WorkerInputCoordinator } from './commands/workerInputCoordinator';
+import { currentContext, frameImages } from './viewer/sessionPaint';
+import type { PptxAsyncEditorApi } from './worker/createPeerlessEditorApi';
+import { LEGACY_SYNC_API } from './runtimeOptions';
+import { warnPptxEngine, type PptxEngineWarning } from './engineWarnings';
+import { PeerlessPptxEditorLoader } from './PeerlessPptxEditorLoader';
 
 const THUMBNAIL_SLICE_MS = 12;
+export const PEERLESS_FLAG = 'asyncApi' as const;
+export const pptxPeerlessEditorLoader = { load: () => import('./worker/PeerlessPptxSurface') };
+
+export class PptxWorkerEditorChunkLoadError extends Error {
+  readonly code = 'chunk-load-failed';
+  constructor(readonly cause: unknown) {
+    super('Failed to load the worker editor. Remount the editor to retry.');
+    this.name = 'PptxWorkerEditorChunkLoadError';
+  }
+}
+
+type PeerlessEditorBoundaryProps = Pick<PptxAsyncEditorProps, 'onError' | 'className'> & {
+  children: ReactNode;
+};
+
+function PeerlessEditorError({ error, className }: { error: Error; className?: string }) {
+  return <div data-testid="pptx-error" role="alert" className={className}>
+    {error.message}
+  </div>;
+}
+
+class PeerlessEditorBoundary extends Component<PeerlessEditorBoundaryProps, { error: Error | null }> {
+  state = { error: null as Error | null };
+  private reported: Error | null = null;
+
+  static getDerivedStateFromError(error: unknown) {
+    return { error: error instanceof Error ? error : new Error(String(error)) };
+  }
+
+  componentDidCatch() {
+    const error = this.state.error;
+    if (!error || this.reported === error) return;
+    this.reported = error;
+    try { this.props.onError?.(error); } catch {}
+  }
+
+  render() {
+    return this.state.error ? <PeerlessEditorError error={this.state.error} className={this.props.className} />
+      : this.props.children;
+  }
+}
 
 export interface PptxTextSelection {
   shapeId: string;
@@ -213,6 +268,12 @@ export interface PptxWorkerViewerApi extends Omit<
   goToSlideAsync: (slide: number) => Promise<boolean>;
 }
 
+export interface PptxAsyncCollaborationOptions extends Omit<PptxEditorCollaborationOptions, 'onReplica'> {
+  /** Change to open a different collaboration room. */
+  roomId?: string;
+  onReplica?: (replica: import('@betteroffice/pptx').AsyncCollaborationReplica | null) => void;
+}
+
 export interface PptxEditorCollaborationOptions {
   clientId: number;
   initialUpdate?: Uint8Array;
@@ -220,12 +281,15 @@ export interface PptxEditorCollaborationOptions {
   presence?: PptxPresence;
 }
 
-export interface PptxEditorProps extends PptxEditorPluginProps {
+export interface PptxInThreadEditorProps extends PptxEditorPluginProps {
   file?: Uint8Array;
   /** Font faces; equivalent inline arrays do not reopen the presentation. */
   fonts: ReadonlyArray<PptxFontFace>;
   clientId?: number;
+  /** Uses the deprecated in-thread engine when set. */
   collaboration?: PptxEditorCollaborationOptions;
+  /** @deprecated Omit this prop to use the default worker-owned editor. */
+  experimentalWorkerOpen?: false;
   i18n?: Translations;
   className?: string;
   /** Download name for the save button; falls back to `presentation.pptx`. */
@@ -252,14 +316,38 @@ export interface PptxEditorProps extends PptxEditorPluginProps {
   showToolbar?: boolean;
 }
 
-/** @experimental */
+/** @deprecated Removed in 0.6.0. Use PptxAsyncEditorProps. */
 export type PptxWorkerViewerProps = Omit<
-  PptxEditorProps, 'onReady' | 'readOnly'
+  PptxInThreadEditorProps, 'onReady' | 'readOnly' | 'experimentalWorkerOpen' | 'collaboration' | 'plugins' | 'onChange'
 > & {
+  /** @deprecated Removed in 0.6.0. Omit for the async editor. */
+  [LEGACY_SYNC_API]: true;
+  collaboration?: undefined;
+  plugins?: readonly [];
+  onChange?: undefined;
   readOnly: true;
-  /** @experimental Opt-in worker opening currently applies to read-only editors. */
-  experimentalWorkerOpen: true;
+  /** Keeps worker opening enabled in the legacy runtime. */
+  experimentalWorkerOpen?: true;
+  /** Without `Worker`, falls back to the in-thread engine and passes `PptxEditorApi`. */
   onReady?: (api: PptxWorkerViewerApi) => void;
+};
+
+export type PptxAsyncEditorProps = Omit<PptxInThreadEditorProps,
+  'onReady' | 'collaboration' | 'experimentalWorkerOpen'> & {
+  /** @internal */
+  [PEERLESS_FLAG]?: true;
+  /** @deprecated Removed in 0.6.0. Omit for the async editor. */
+  [LEGACY_SYNC_API]?: false;
+  /** @deprecated False selects the in-thread engine. */
+  experimentalWorkerOpen?: boolean;
+  collaboration?: PptxAsyncCollaborationOptions;
+  onReady?: (api: PptxAsyncEditorApi) => void | (() => void);
+};
+
+/** @deprecated Removed in 0.6.0. Use PptxAsyncEditorProps. */
+export type PptxLegacyEditorProps = PptxInThreadEditorProps & {
+  /** @deprecated Removed in 0.6.0. Omit for the async editor. */
+  [LEGACY_SYNC_API]: true;
 };
 
 interface PictureOrigin {
@@ -478,28 +566,110 @@ const initialStyle: EffectiveTextStyle = {
   fontFamily: 'Arial',
 };
 
+type WorkerSessionProps = Omit<PptxWorkerEditorProps, 'readOnly' | 'onReady' | 'experimentalWorkerOpen'> & {
+  experimentalWorkerOpen?: true;
+  readOnly?: boolean;
+  onReady?: (api: PptxWorkerEditorApi | PptxWorkerViewerApi) => void;
+};
+
+type WorkerEditorSessionProps = Omit<PptxWorkerEditorProps, 'readOnly'> & { readOnly?: boolean };
+type CollaborationSessionProps = Omit<PptxLegacyEditorProps, 'experimentalWorkerOpen'> & {
+  collaboration: PptxEditorCollaborationOptions;
+  experimentalWorkerOpen?: boolean;
+};
+type GeneralEditorSessionProps = Omit<PptxLegacyEditorProps, 'experimentalWorkerOpen' | 'onReady'> & {
+  experimentalWorkerOpen?: boolean;
+  onReady?: (api: PptxEditorApi | PptxWorkerEditorApi | PptxWorkerViewerApi) => void;
+};
+
+export type PptxEditorProps = PptxAsyncEditorProps | GeneralEditorSessionProps;
+
+export function PptxEditor(props: PptxAsyncEditorProps): JSX.Element;
+export function PptxEditor(props: PptxLegacyEditorProps & { experimentalWorkerOpen: false }): JSX.Element;
+export function PptxEditor(props: CollaborationSessionProps): JSX.Element;
+export function PptxEditor(props: PptxWorkerEditorProps): JSX.Element;
+export function PptxEditor(props: WorkerEditorSessionProps & { onChange: NonNullable<PptxInThreadEditorProps['onChange']> }): JSX.Element;
+export function PptxEditor(props: WorkerEditorSessionProps & { plugins: readonly [PptxPlugin, ...PptxPlugin[]] }): JSX.Element;
 export function PptxEditor(props: PptxWorkerViewerProps): JSX.Element;
+export function PptxEditor(props: WorkerSessionProps): JSX.Element;
 export function PptxEditor(props: PptxEditorProps): JSX.Element;
-export function PptxEditor({
-  i18n,
-  ...props
-}: PptxWorkerViewerProps | PptxEditorProps): JSX.Element {
+export function PptxEditor({ i18n, ...props }:
+  PptxAsyncEditorProps | WorkerEditorSessionProps | PptxWorkerViewerProps | WorkerSessionProps |
+  CollaborationSessionProps | PptxLegacyEditorProps | GeneralEditorSessionProps): JSX.Element {
+  const legacy = props[LEGACY_SYNC_API] === true;
   return (
     <LocaleProvider i18n={i18n}>
-      {'experimentalWorkerOpen' in props && props.experimentalWorkerOpen && props.readOnly ? (
-        <PptxSessionViewer {...props} i18n={i18n} />
+      {legacy ? (
+        <PptxEditorSession {...props as GeneralEditorSessionProps} i18n={i18n} />
       ) : (
-        <PptxEditorContent {...props as PptxEditorProps} i18n={i18n} />
+        <PptxAsyncEditorSession {...props as PptxAsyncEditorProps} i18n={i18n} />
       )}
     </LocaleProvider>
   );
 }
 
-function PptxEditorContent({
+function PptxAsyncEditorSession(props: PptxAsyncEditorProps) {
+  const { t } = useTranslation();
+  const [PptxAsyncInThreadSession] = useState(() => lazy(() => import('./PptxAsyncInThreadSession')
+    .then((module) => ({ default: module.PptxAsyncInThreadSession }))));
+  const inThread = props.experimentalWorkerOpen === false;
+  const identity = useMemo(() => ({}), [props.file, inThread]);
+  const start = () => ({ identity, reason: inThread ? 'deprecated' as const
+    : typeof Worker !== 'function' ? 'no-worker' as const
+    : typeof OffscreenCanvas !== 'function' ? 'no-offscreen-canvas' as const : undefined });
+  const [choice, setChoice] = useState(start);
+  const engine = choice.identity === identity ? choice : start();
+  if (choice !== engine) setChoice(engine);
+  useEffect(() => { if (engine.reason) warnPptxEngine(engine.reason); }, [engine.reason]);
+  const fallback = <div className={props.className} role="status">{t('worker.preparing')}</div>;
+  return <PeerlessEditorBoundary onError={props.onError} className={props.className}>
+    {engine.reason ? <Suspense fallback={fallback}><PptxAsyncInThreadSession {...props} /></Suspense>
+      : <PeerlessPptxEditorLoader load={pptxPeerlessEditorLoader.load} identity={identity}
+        ErrorType={PptxWorkerEditorChunkLoadError} fallback={fallback} editorProps={props} />}
+  </PeerlessEditorBoundary>;
+}
+
+function choosePptxEngine(inThread: boolean, collaboration: PptxEditorCollaborationOptions | undefined,
+  workerAvailable: boolean): PptxEngineWarning | undefined {
+  if (inThread) return 'deprecated';
+  if (collaboration != null) return 'collaboration';
+  if (!workerAvailable) return 'no-worker';
+}
+
+function PptxEditorSession(props: WorkerEditorSessionProps | PptxWorkerViewerProps | WorkerSessionProps | CollaborationSessionProps | PptxLegacyEditorProps | GeneralEditorSessionProps) {
+  useEffect(() => { warnPptxEngine('legacy-sync-api'); }, []);
+  const fonts = useStableFontFaces(props.fonts);
+  const inThread = props.experimentalWorkerOpen === false;
+  const identity = useMemo(() => ({}), [props.file, fonts, props.clientId, props.collaboration, inThread]);
+  const engineIdentity = useMemo(() => ({}), [props.file, props.collaboration, inThread]);
+  const startEngine = () => ({ identity: engineIdentity,
+    reason: choosePptxEngine(inThread, props.collaboration, typeof Worker === 'function') });
+  const [engineChoice, setEngineChoice] = useState(startEngine);
+  const engine = engineChoice.identity === engineIdentity ? engineChoice : startEngine();
+  if (engineChoice !== engine) setEngineChoice(engine);
+  const needsEditor = !props.readOnly || (props.plugins?.length ?? 0) > 0 || props.onChange !== undefined;
+  const start = () => ({ identity, editable: needsEditor });
+  const [choice, setChoice] = useState(start);
+  const session = choice.identity === identity ? choice : start();
+  const editable = session.editable || needsEditor;
+  if (choice !== session || choice.editable !== editable) setChoice({ ...session, editable });
+  useEffect(() => { if (engine.reason) warnPptxEngine(engine.reason); }, [engine.reason]);
+  const Editor = PptxWorkerEditor as (props: WorkerEditorSessionProps) => JSX.Element;
+  return engine.reason ? (
+    <PptxEditorContent {...props as PptxInThreadEditorProps} />
+  ) : editable ? (
+    <Editor {...props as WorkerEditorSessionProps} />
+  ) : (
+    <PptxSessionViewer {...props as PptxWorkerViewerProps} />
+  );
+}
+
+export function PptxEditorContent({
   file,
   fonts,
   clientId,
   collaboration,
+  collaborationIdentity,
   className,
   fileName,
   initialSlide,
@@ -515,20 +685,38 @@ function PptxEditorContent({
   plugins,
   pluginGrants,
   onPluginError,
-}: PptxEditorProps) {
+  backend,
+  onWorkerReady,
+}: Omit<PptxInThreadEditorProps, 'experimentalWorkerOpen'> & {
+  collaborationIdentity?: object;
+  backend?: (changed: () => void) => EditablePresentation;
+  onWorkerReady?: (api: PptxWorkerEditorApi) => void;
+}) {
   const { t } = useTranslation();
   const decodeImageError = t('errors.decodeSlideImage');
   const collaborationClientId = collaboration?.clientId ?? clientId;
   const collaborationInitialUpdate = collaboration?.initialUpdate;
-  const collaborationOnReplica = collaboration?.onReplica;
-  const collaborationPresence = collaboration?.presence;
+  const collaborationOnReplica = backend ? undefined : collaboration?.onReplica;
+  const collaborationPresence = backend ? undefined : collaboration?.presence;
   const handleRef = useRef<PresentationHandle | null>(null);
   const modelRef = useRef<EditorModel | null>(null);
   const generationRef = useRef(0);
   const [commands] = useState(createPptxCommandController);
   const commandStore = commands.store;
   const typingRef = useRef<TypingTarget | null>(null);
+  const workerRef = useRef<EditablePresentation | null>(null);
+  const workerRefreshRef = useRef<() => void>(() => {});
+  const [backendRevision, setBackendRevision] = useState(0);
+  const workerReadyRef = useRef(onWorkerReady);
+  workerReadyRef.current = onWorkerReady;
+  const readOnlyRef = useRef(readOnly);
   const [coordinator] = useState(() => {
+    if (backend) return createWorkerInputCoordinator({
+      session: () => workerRef.current?.current ? workerRef.current.owner : null,
+      gestureActive: () => Boolean(pointerGestureRef.current || resizeRef.current),
+      readOnly: () => readOnlyRef.current,
+      changed: () => workerRefreshRef.current(),
+    });
     const created = createInputCoordinator(() => {
       if (!created.busy()) typingRef.current = null;
       commands.refresh();
@@ -575,10 +763,11 @@ function PptxEditorContent({
     [admit]
   );
   const flushPendingInput = useCallback(
-    (opened: PresentationHandle): Promise<void> => afterInput(opened, () => {}),
-    [afterInput]
+    (opened: PresentationHandle): Promise<void> => backend
+      ? (coordinator as WorkerInputCoordinator).flush()
+      : afterInput(opened, () => {}),
+    [afterInput, backend, coordinator]
   );
-  const readOnlyRef = useRef(readOnly);
   const readOnlyRefusal = useCallback((opened: PresentationHandle): PptxEditRefusal | null =>
     readOnlyRef.current
       ? { ok: false, version: opened.version(), failure: { code: 'read-only', message: 'The editor is read-only' } }
@@ -611,7 +800,7 @@ function PptxEditorContent({
   const [resizeDelta, setResizeDelta] = useState<SlidePoint | null>(null);
   const pointerGestureRef = useRef<PointerGesture | null>(null);
   const recentClickRef = useRef<RecentCanvasClick | null>(null);
-  const imageCacheRef = useRef(new Map<string, Promise<CanvasImageSource | null>>());
+  const imageCacheRef = useRef(frameImages());
   const stableFonts = useStableFontFaces(fonts);
   const [model, setModel] = useState<EditorModel | null>(null);
   const [thumbnailStore] = useState(() => new SlideThumbnailStore());
@@ -629,22 +818,36 @@ function PptxEditorContent({
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [preparingImages, setPreparingImages] = useState(0);
+  const [backendFailure, setBackendFailure] = useState<Error | null>(null);
+  const [previousPresentation, setPreviousPresentation] = useState<{
+    save: () => Promise<PptxWorkerEditorRecovery>; name: string;
+  } | null>(null);
   const [collaborationReplica, setCollaborationReplica] =
-    useState<CollaborationReplica | null>(null);
+    useState<PresentationHandle | null>(null);
+  const publishedReplicaRef = useRef<{ handle: PresentationHandle } | null>(null);
   const [remotePeers, setRemotePeers] = useState<readonly PptxPresencePeer[]>([]);
   const [presenting, setPresenting] = useState(false);
   const [proposals, setProposals, proposalsRef] = useSyncedState<Proposal[]>([]);
   const [proposalsOpen, setProposalsOpen, proposalsOpenRef] = useSyncedState(false);
   const proposalButtonRef = useRef<HTMLButtonElement>(null);
   const canvasReview = useProposalCanvas(
-    handleRef.current,
-    readOnly ? [] : proposals,
+    backend ? null : handleRef.current,
+    readOnly || backend ? [] : proposals,
     model?.snapshot,
     model?.slideIndex ?? 0
   );
   const [paintedReview, setPaintedReview] = useState<ProposalDiffSlide | null>(null);
-  const resolveSlideImage = useCallback((assetId: string) =>
-    resolveImage(assetId, handleRef, imageCacheRef, decodeImageError), [decodeImageError]);
+  const resolveSlideImage = useMemo<CanvasImageResolver>(() => {
+    if (!backend) return resolveImages(handleRef, imageCacheRef, decodeImageError);
+    return Object.assign((assetId: string) => workerRef.current?.resolveImage(assetId) ?? Promise.resolve(null), {
+      acquire: () => {
+        const worker = workerRef.current;
+        const frame = worker?.frame(worker.active);
+        return worker && frame ? worker.images.resolve(frame) : () => null;
+      },
+    });
+  }, [backend, decodeImageError]);
 
   useEffect(() => {
     if (!canvasReview.reviewing) return;
@@ -681,7 +884,7 @@ function PptxEditorContent({
   const reportError = useCallback((value: unknown) => {
     const next = value instanceof Error ? value : new Error(String(value));
     setError(next.message);
-    onErrorRef.current?.(next);
+    if (next !== workerRef.current?.owner.failure) onErrorRef.current?.(next);
   }, []);
 
   const refreshAt = useCallback(
@@ -703,6 +906,7 @@ function PptxEditorContent({
           requestedIndex ?? modelRef.current?.slideIndex ?? 0,
           snapshot.slides.length
         );
+        if (backend) workerRef.current?.show(index + 1);
         const thumbnails = new Map<string, SlideDisplayList>();
         const slideId = snapshot.slides[index]?.id;
         if (slideId && !refreshAll) layoutKeys[slideId] = cache.key(index);
@@ -711,9 +915,9 @@ function PptxEditorContent({
           ? thumbnailStore.get(slideId)
           : undefined;
         const frame = slideId
-          ? (retained && cachedFrame) || handle.layoutSlide(index)
+          ? (!backend && retained && cachedFrame) || handle.layoutSlide(index)
           : null;
-        if (frame && slideId) thumbnails.set(slideId, frame);
+        if (!backend && frame && slideId) thumbnails.set(slideId, frame);
         for (let slideIndex = 0; slideIndex < snapshot.slides.length; slideIndex += 1) {
           const slide = snapshot.slides[slideIndex];
           if (slideIndex === index) continue;
@@ -756,7 +960,7 @@ function PptxEditorContent({
           setResizeDelta(null);
         }
         modelRef.current = next;
-        thumbnailStore.replace(thumbnails);
+        if (!backend) thumbnailStore.replace(thumbnails);
         setModel(next);
         setProposals(handle.listProposals());
         setError(null);
@@ -767,12 +971,13 @@ function PptxEditorContent({
         return null;
       }
     },
-    [reportError, thumbnailStore]
+    [backend, reportError, thumbnailStore]
   );
 
   const refresh = useCallback(() => {
     refreshAt(undefined, false, true);
   }, [refreshAt]);
+  workerRefreshRef.current = () => refreshAt(undefined, false);
 
   /** The editor's batch path, after pending input: `authorize`, read-only, apply, one refresh. */
   const applyBatch = useCallback(
@@ -794,6 +999,7 @@ function PptxEditorContent({
   );
 
   const clearSelection = useCallback(() => {
+    if (backend) (coordinator as WorkerInputCoordinator).breakTyping();
     typingRef.current = null;
     caretGoalRef.current = null;
     resizeRef.current = null;
@@ -804,21 +1010,23 @@ function PptxEditorContent({
     setShapeSelection(null);
     setDragPreview(null);
     setTextBoxPreview(null);
-  }, []);
+  }, [backend, coordinator]);
 
   /** Shows a slide with nothing selected, moving focus to it only when asked. */
   const showSlide = useCallback(
     (index: number, focus: boolean): EditorModel | null => {
       clearSelection();
+      if (backend) workerRef.current?.show(index + 1);
       const next = refreshAt(index);
       if (next && focus) stageRef.current?.focus();
       return next;
     },
-    [clearSelection, refreshAt]
+    [backend, clearSelection, refreshAt]
   );
 
   const goToSlide = useCallback(
     (slide: number): boolean => {
+      if (backend && !handleRef.current) return workerRef.current?.show(slide) ?? false;
       const current = modelRef.current;
       if (
         !current ||
@@ -830,7 +1038,7 @@ function PptxEditorContent({
       }
       return showSlide(slide - 1, true) !== null;
     },
-    [showSlide]
+    [backend, showSlide]
   );
 
   const selectText = useCallback(
@@ -877,9 +1085,11 @@ function PptxEditorContent({
     const slide = refreshed?.snapshot.slides[refreshed.slideIndex];
     setSelection(null);
     setShapeSelection(shapeId && slide && findShape(slide.shapes, shapeId) ? { slideId, shapeId } : null);
-    if (proposalId) canvasReview.select(proposalId);
-    canvasReview.setEnabled(true);
-  }, [refreshAt, canvasReview.select, canvasReview.setEnabled]);
+    if (!backend) {
+      if (proposalId) canvasReview.select(proposalId);
+      canvasReview.setEnabled(true);
+    }
+  }, [backend, refreshAt, canvasReview.select, canvasReview.setEnabled]);
 
   const refreshProposals = useCallback(() => {
     try {
@@ -983,11 +1193,43 @@ function PptxEditorContent({
     reviewing: canvasReview.reviewing,
     selection: pluginSelection,
     pointAt: (frame, clientX, clientY) =>
-      modelRef.current?.frame === frame ? hostPointRef.current(clientX, clientY) : null,
+      (backend ? workerRef.current?.frame(workerRef.current.active)?.displayList === frame :
+        modelRef.current?.frame === frame) ? hostPointRef.current(clientX, clientY) : null,
     t,
   });
   const beginPluginLoad = pluginHost.beginLoad;
   const presentFrame = pluginHost.presentFrame;
+
+  useEffect(() => {
+    const worker = workerRef.current;
+    if (!backend || !worker?.current) return;
+    if (worker.owner.failure) {
+      setError(worker.owner.failure.message);
+      setOpenedHandle(null);
+      handleRef.current = null;
+      return;
+    }
+    if (worker.access && handleRef.current) {
+      if (modelRef.current?.version !== worker.owner.state.version || modelRef.current?.slideIndex !== worker.active)
+        refreshAt(worker.active);
+    } else {
+      const snapshot = worker.snapshot();
+      const frame = worker.frame(worker.active)?.displayList ?? null;
+      if (snapshot && (modelRef.current?.version !== worker.owner.state.version ||
+          modelRef.current?.slideIndex !== worker.active || modelRef.current?.frame !== frame)) {
+        const next = { snapshot, frame, slideIndex: worker.active,
+          version: worker.owner.state.version ?? '', layoutKeys: {} };
+        modelRef.current = next;
+        setModel(next);
+      }
+    }
+    const thumbnails = new Map<string, SlideDisplayList>();
+    worker.owner.state.projection?.slides.forEach((slide, index) => {
+      const frame = worker.frame(index);
+      if (frame) thumbnails.set(slide.id, frame.displayList);
+    });
+    thumbnailStore.replace(thumbnails);
+  }, [backend, backendRevision, refreshAt, thumbnailStore]);
 
   useEffect(() => {
     let disposed = false;
@@ -996,7 +1238,7 @@ function PptxEditorContent({
     let unsubscribeUpdates = () => {};
     beginPluginLoad();
     setOpenedHandle(null);
-    handleRef.current?.dispose();
+    if (!backend) handleRef.current?.dispose();
     handleRef.current = null;
     generationRef.current += 1;
     coordinator.reset();
@@ -1019,11 +1261,28 @@ function PptxEditorContent({
     caretGoalRef.current = null;
     recentClickRef.current = null;
     setError(null);
+    setBackendFailure(null);
     pendingSaveRef.current = null;
     imageCacheRef.current.clear();
     if (!file) return;
     setLoading(true);
-    void Promise.all([initWasm(), installBrowserFonts(stableFonts)]).then(
+    let worker: EditablePresentation | null = null;
+    if (backend) {
+      try {
+        worker = backend(() => { if (!disposed) setBackendRevision((value) => value + 1); });
+        workerRef.current = worker;
+        setBackendRevision((value) => value + 1);
+        void worker.request();
+      } catch (value) {
+        setLoading(false);
+        setBackendFailure(value instanceof Error ? value : new Error(String(value)));
+        reportError(value);
+        return;
+      }
+    }
+    void (worker
+      ? worker.open(coordinator as WorkerInputCoordinator).then(() => [undefined, [] as FontFace[]] as const)
+      : Promise.all([initWasm(), installBrowserFonts(stableFonts)])).then(
       ([, installed]) => {
         browserFaces = installed;
         if (disposed) {
@@ -1031,7 +1290,7 @@ function PptxEditorContent({
           return;
         }
         try {
-          handle = openPresentation(file, {
+          handle = worker ? worker.access as unknown as PresentationHandle : openPresentation(file, {
             clientId: collaborationClientId,
             fonts: stableFonts,
             initialUpdate: collaborationInitialUpdate,
@@ -1042,17 +1301,17 @@ function PptxEditorContent({
           });
           const requestedSlide = initialSlideRef.current;
           refreshAt(
-            typeof requestedSlide === 'number' && Number.isInteger(requestedSlide)
+            worker ? worker.active : typeof requestedSlide === 'number' && Number.isInteger(requestedSlide)
               ? requestedSlide - 1
               : 0,
             false,
             true
           );
           setLoading(false);
-          setCollaborationReplica(handle);
+          if (!worker) setCollaborationReplica(handle);
           setOpenedHandle(handle);
           const opened = handle;
-          onReadyRef.current?.({
+          const api: PptxEditorApi = {
             clearSelection,
             commands: commandStore,
             goToSlide,
@@ -1080,7 +1339,18 @@ function PptxEditorContent({
               if (early) return early;
               return afterInput(opened, () => applyBatch(opened, request));
             },
-          });
+          };
+          if (worker) {
+            const owner = worker;
+            const workerApi = createWorkerEditorApi(owner.owner, api, () => owner.access, async (slide) => {
+              if (!owner.show(slide)) return false;
+              showSlide(slide - 1, false);
+              return owner.showAsync(slide);
+            }, () => Boolean(pointerGestureRef.current || resizeRef.current), () => owner.current,
+            () => readOnlyRef.current);
+            owner.onFirstPaint = () => workerReadyRef.current?.(workerApi);
+            setBackendRevision((value) => value + 1);
+          } else onReadyRef.current?.(api);
         } catch (value) {
           setLoading(false);
           reportError(value);
@@ -1089,21 +1359,32 @@ function PptxEditorContent({
       (value: unknown) => {
         if (disposed) return;
         setLoading(false);
-        reportError(value);
+        if (!worker?.owner.failure) reportError(value);
       }
     );
     return () => {
       disposed = true;
       unsubscribeUpdates();
-      handle?.dispose();
+      if (worker) {
+        const retired = worker;
+        if (retired.owner.state.sequence > 0) setPreviousPresentation({
+          save: () => retired.owner.recoverySave(), name: `previous-${fileName ?? 'presentation.pptx'}`,
+        });
+        worker.dispose();
+      }
+      else if (publishedReplicaRef.current?.handle !== handle) handle?.dispose();
+      if (workerRef.current === worker) workerRef.current = null;
       if (handleRef.current === handle) handleRef.current = null;
+      imageCacheRef.current.clear();
       removeBrowserFonts(browserFaces);
     };
   }, [
+    backend,
     afterInput,
     applyBatch,
     beginPluginLoad,
     collaborationClientId,
+    collaborationIdentity,
     collaborationInitialUpdate,
     clearSelection,
     commandStore,
@@ -1123,10 +1404,18 @@ function PptxEditorContent({
     thumbnailStore,
   ]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!collaborationOnReplica || !collaborationReplica) return;
+    const publication = { handle: collaborationReplica };
+    publishedReplicaRef.current = publication;
     collaborationOnReplica(collaborationReplica);
-    return () => collaborationOnReplica(null);
+    return () => {
+      collaborationOnReplica(null);
+      queueMicrotask(() => {
+        if (handleRef.current !== collaborationReplica) collaborationReplica.dispose();
+        if (publishedReplicaRef.current === publication) publishedReplicaRef.current = null;
+      });
+    };
   }, [collaborationOnReplica, collaborationReplica]);
 
   // hover goes untracked under a non-select tool, so drop it rather than let a
@@ -1161,37 +1450,48 @@ function PptxEditorContent({
     );
   }, [model?.frame, viewport]);
   const scale = zoom === 'fit' ? fitScale : zoom;
+  const worker = backend ? workerRef.current : null;
+  const workerFrame = worker?.frame(worker.active);
+  const workerNavigation = worker?.navigation;
+  const workerSequence = worker?.owner.state.sequence;
+  const overlaysVisible = !backend || worker?.overlays;
 
   useEffect(() => {
     const canvas = canvasRef.current;
     const painted = model;
-    const frame = painted?.frame;
+    const frame = backend ? workerFrame?.displayList : painted?.frame;
     if (!canvas || !painted || !frame) return;
+    if (backend && (!worker || !workerFrame || !worker.currentPaint(workerFrame, workerNavigation!))) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const dpr = window.devicePixelRatio || 1;
     presentFrame(null);
     sizeCanvasForSlide(canvas, frame, dpr, scale);
     let cancelled = false;
-    activePaintRef.current = paintSlide(currentOnly(ctx, () => !cancelled), frame, dpr, scale, {
-      resolveImage: (assetId) =>
-        resolveImage(assetId, handleRef, imageCacheRef, decodeImageError),
+    const images = worker && workerFrame ? worker.images.resolve(workerFrame) : null;
+    const current = () => !cancelled && (!worker || !!workerFrame && worker.currentPaint(workerFrame, workerNavigation!));
+    const painting = paintSlide(backend ? currentContext(ctx, current) : currentOnly(ctx, current), frame, dpr, scale, {
+      resolveImage: images ?? resolveSlideImage,
     }).then(
       () => {
-        if (cancelled) return;
+        if (!current()) return;
         const { snapshot, slideIndex, version } = painted;
         presentFrame({ frame, snapshot, slideIndex, version, scale, canvas });
+        if (worker && workerFrame) worker.didPaint(workerFrame, workerNavigation!);
       },
       (value: unknown) => {
-        if (!cancelled) reportError(value);
+        if (current()) reportError(value);
       }
     );
+    activePaintRef.current = images ? painting.finally(() => images.release()) : painting;
     return () => {
       cancelled = true;
     };
-  }, [decodeImageError, model?.frame, model?.snapshot, model?.slideIndex, model?.version, presentFrame, reportError, scale]);
+  }, [backend, worker, workerFrame, workerNavigation, workerSequence, decodeImageError, model?.frame,
+    model?.snapshot, model?.slideIndex, model?.version, presentFrame, reportError, resolveSlideImage, scale]);
 
   useEffect(() => {
+    if (backend) return;
     const handle = handleRef.current;
     const pending = model;
     if (!handle || !pending || thumbnailStore.size === pending.snapshot.slides.length) return;
@@ -1236,7 +1536,7 @@ function PptxEditorContent({
       cancelled = true;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [model?.layoutKeys, reportError, thumbnailStore]);
+  }, [backend, model?.layoutKeys, reportError, thumbnailStore]);
 
   const selectedShape = useMemo(() => {
     if (!model?.frame || !shapeSelection) return null;
@@ -1496,11 +1796,17 @@ function PptxEditorContent({
       }
       const natural = await loadImageSize(previewUrl);
       const current = modelRef.current;
-      if (!allowed() || !current?.frame) return;
+      if (!allowed() || !current?.frame) {
+        if (backend) throw new Error('The presentation changed before the image was inserted');
+        return;
+      }
       if (natural.width <= 0 || natural.height <= 0) throw new Error('image dimensions must be positive');
       const slideIndex = current.snapshot.slides.findIndex((slide) => slide.id === origin.slideId);
       const slide = current.snapshot.slides[slideIndex];
-      if (!slide) return;
+      if (!slide) {
+        if (backend) throw new Error('The image target slide no longer exists');
+        return;
+      }
       const maxWidth = current.frame.width * 0.5;
       const maxHeight = current.frame.height * 0.5;
       const scale = Math.min(maxWidth / natural.width, maxHeight / natural.height, 1);
@@ -1534,7 +1840,7 @@ function PptxEditorContent({
         }
       }
     } catch (value) {
-      if (allowed()) reportError(value);
+      if (backend || allowed()) reportError(value);
       throw value;
     }
   };
@@ -1563,12 +1869,20 @@ function PptxEditorContent({
       origin.handle !== handleRef.current ||
       origin.generation !== generationRef.current
     ) {
+      if (backend) reportError(new Error('The presentation changed before the image was inserted'));
       return;
     }
-    void coordinator.input(() => insertPicture(file, origin)).catch(() => {});
+    if (backend) setPreparingImages((value) => value + 1);
+    void coordinator.input(() => insertPicture(file, origin)).catch(() => {}).finally(() => {
+      if (backend) setPreparingImages((value) => value - 1);
+    });
   };
 
   const pointerDown = (event: PointerEvent<HTMLCanvasElement>) => {
+    if (backend) {
+      if (!workerRef.current?.hydrated) { reportError(new PptxPeerNotReadyError()); return; }
+      (coordinator as WorkerInputCoordinator).breakTyping();
+    }
     if (!event.isPrimary || event.button !== 0) return;
     typingRef.current = null;
     const handle = handleRef.current;
@@ -1970,6 +2284,10 @@ function PptxEditorContent({
   };
 
   const keyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (backend && !workerRef.current?.hydrated) {
+      if (isEditingKey(event)) { event.preventDefault(); reportError(new PptxPeerNotReadyError()); }
+      return;
+    }
     if (!handleRef.current) return;
     if (pluginEventStore(event.nativeEvent) || inPluginChrome(event.target)) return;
     if (event.key === 'Escape') {
@@ -2079,6 +2397,7 @@ function PptxEditorContent({
     try {
       const moved = caretDestination(input, selection);
       if (moved !== null) {
+        if (backend) (coordinator as WorkerInputCoordinator).breakTyping();
         const next = {
           ...selection,
           anchor: input.shiftKey ? selection.anchor : moved.position,
@@ -2089,6 +2408,7 @@ function PptxEditorContent({
         return { handled: true, selection: next };
       }
       if (readOnlyRef.current) return unhandled;
+      if (backend) (coordinator as WorkerInputCoordinator).beginTyping(selection.storyId);
       if (input.key === 'Backspace') {
         if (start !== end) {
           handle.deleteText(selection.storyId, start, end);
@@ -2129,6 +2449,8 @@ function PptxEditorContent({
       reportError(value);
       if (strict) throw value;
       return { handled: true, selection };
+    } finally {
+      if (backend) (coordinator as WorkerInputCoordinator).endTyping();
     }
   };
 
@@ -2320,6 +2642,7 @@ function PptxEditorContent({
   };
 
   const changeTool = (tool: PptxEditorTool): boolean => {
+    if (backend) (coordinator as WorkerInputCoordinator).breakTyping();
     const changed = activeToolRef.current !== tool;
     canvasReview.setEnabled(false);
     setActiveTool(tool);
@@ -2339,6 +2662,19 @@ function PptxEditorContent({
    * then serializes after everything accepted by then.
    */
   const save = (): Promise<PptxSaveOutcome> => {
+    if (backend) {
+      const worker = workerRef.current;
+      if (!worker) return Promise.resolve('replaced');
+      return (async () => {
+        if (onSaveRequest && (await onSaveRequest()) !== true) return 'requested' as const;
+        if (pointerGestureRef.current || resizeRef.current) return 'gesture' as const;
+        const bytes = await worker.owner.saveAsync();
+        worker.require();
+        if (onSave) onSave(bytes);
+        else downloadBytes(bytes, fileName ?? 'presentation.pptx', PPTX_MIME);
+        return 'saved' as const;
+      })().catch((value) => { reportError(value); return 'failed' as const; });
+    }
     if (pendingSaveRef.current) return pendingSaveRef.current;
     const handle = handleRef.current;
     if (!handle) return Promise.resolve('replaced');
@@ -2519,11 +2855,11 @@ function PptxEditorContent({
     // than reading whichever deck `handleRef` holds by the time an asset
     // resolves.
     const pinned = { current: handle };
-    const cache = { current: new Map<string, Promise<CanvasImageSource | null>>() };
+    const cache = { current: frameImages() };
     try {
       const blob = await slideToPng(frame, {
         scale: window.devicePixelRatio || 1,
-        resolveImage: (assetId) => resolveImage(assetId, pinned, cache, decodeImageError),
+        resolveImage: resolveImages(pinned, cache, decodeImageError),
       });
       const bytes = new Uint8Array(await blob.arrayBuffer());
       if (handleRef.current !== handle) return 'replaced';
@@ -2533,6 +2869,8 @@ function PptxEditorContent({
       if (handleRef.current !== handle) return 'replaced';
       reportError(value);
       return 'failed';
+    } finally {
+      cache.current.dispose();
     }
   };
   const shapeDragDelta =
@@ -2560,12 +2898,13 @@ function PptxEditorContent({
 
   const status: 'ready' | 'loading' | 'empty' = !file
     ? 'empty'
+    : backend && !worker?.hydrated ? 'loading'
     : model && handleRef.current
       ? 'ready'
       : loading || !error
         ? 'loading'
         : 'empty';
-  const proposalsAvailable = Boolean(handleRef.current?.isProposalsAvailable());
+  const proposalsAvailable = Boolean((!backend || worker?.hydrated) && handleRef.current?.isProposalsAvailable());
   const liveGate = usePptxCommandBinding(commands, {
     handle: handleRef.current,
     handleRef,
@@ -2588,6 +2927,7 @@ function PptxEditorContent({
     baseStyle: initialStyle,
     i18n,
     t,
+    workerMode: backend ? { preparing: !worker?.hydrated, failed: !!worker?.owner.failure || !!backendFailure } : undefined,
     actions: {
       format: applyFormatting,
       align: applyAlignment,
@@ -2710,7 +3050,7 @@ function PptxEditorContent({
         ref={pictureInputRef}
         type="file"
         accept={Object.values(INSERT_IMAGE_TYPES).join(',')}
-        disabled={readOnly || canvasReview.reviewing}
+        disabled={readOnly || canvasReview.reviewing || !!backend && !worker?.hydrated}
         tabIndex={-1}
         aria-hidden="true"
         data-testid="pptx-insert-image-input"
@@ -2721,6 +3061,18 @@ function PptxEditorContent({
           if (chosen) admitPicture(chosen);
         }}
       />
+      {backend && preparingImages > 0 && <div role="status">{t('worker.image')}</div>}
+      {backend && previousPresentation && <button type="button" onClick={() => {
+        void previousPresentation.save().then(({ bytes }) => downloadBytes(bytes, previousPresentation.name, PPTX_MIME))
+          .catch(reportError);
+      }}>{t('worker.previousRecovery')}</button>}
+      {backend && file && !worker?.hydrated && <div role="status" data-testid="pptx-worker-status">
+        {backendFailure?.message ?? (worker?.owner.failure ? t('worker.failed') : t('worker.preparing'))}
+        {worker?.owner.failure && <button type="button" onClick={() => {
+          void worker.owner.recoverySave().then(({ bytes }) => downloadBytes(bytes, fileName ?? 'presentation.pptx', PPTX_MIME))
+            .catch(reportError);
+        }}>{t('worker.recovery')}</button>}
+      </div>}
       <div ref={dockAreaRef} style={styles.workspace}>
         <aside style={styles.slideStrip} aria-label={t('slides.panelLabel')}>
           {model?.snapshot.slides.map((slide, index) => {
@@ -2741,6 +3093,7 @@ function PptxEditorContent({
                     title={slideTitle(slide.shapes) || t('slides.fallbackTitle', { number: index + 1 })}
                     resolveImage={resolveSlideImage}
                     afterPaint={afterActivePaint}
+                    worker={worker}
                   />
                   {slide.id !== currentSlideId &&
                   slidePresence &&
@@ -2779,7 +3132,7 @@ function PptxEditorContent({
             onFocus={() => setStageFocused(true)}
             onBlur={() => setStageFocused(false)}
           >
-            {!readOnly && (
+            {!readOnly && !backend && (
               <ProposalCanvasToolbar review={canvasReview} ready={paintedReview === canvasReview.diff} />
             )}
             <div ref={canvasHostRef} style={styles.canvasHost}>
@@ -2832,7 +3185,7 @@ function PptxEditorContent({
                       layerRef={pluginHost.overlayLayerRef}
                     />
                   )}
-                  {!canvasReview.reviewing && <>
+                  {!canvasReview.reviewing && overlaysVisible && <>
                   <SelectionOverlay
                     frame={model.frame}
                     selection={selection}
@@ -2948,7 +3301,8 @@ function PptxEditorContent({
         {renderDock('right')}
         {!readOnly && proposalsOpen && model && handleRef.current && (
           <ProposalsPanel handle={handleRef.current} proposals={proposals} snapshot={model.snapshot}
-            resolveImage={(assetId) => resolveImage(assetId, handleRef, imageCacheRef, decodeImageError)}
+            visualDisabledReason={backend ? t('worker.disabled') : undefined}
+            resolveImage={resolveSlideImage}
             onNavigate={navigateProposalTarget}
             onClose={() => proposalButtonRef.current?.focus()} />
         )}
@@ -2959,7 +3313,7 @@ function PptxEditorContent({
         <NotesPanel
           key={activeSlide.id}
           value={activeSlide.notes ?? ''}
-          disabled={!model || canvasReview.reviewing || readOnly}
+          disabled={!model || canvasReview.reviewing || readOnly || !!backend && !worker?.hydrated}
           label={t('notes.panelLabel')}
           placeholder={t('notes.placeholder')}
           onCommit={(text) => {
@@ -2979,9 +3333,7 @@ function PptxEditorContent({
           handle={handleRef.current}
           slideCount={slideCount}
           startIndex={currentSlide}
-          resolveImage={(assetId) =>
-            resolveImage(assetId, handleRef, imageCacheRef, decodeImageError)
-          }
+          resolveImage={resolveSlideImage}
           counterLabel={(current, total) => t('presentation.slideCounter', { current, total })}
           label={t('presentation.label')}
           exitLabel={t('presentation.exit')}
@@ -3155,18 +3507,20 @@ const SlideThumbnailSlot = memo(function SlideThumbnailSlot({
   title,
   resolveImage,
   afterPaint,
+  worker,
 }: {
   store: SlideThumbnailStore;
   slideId: string;
   title: string;
   resolveImage: CanvasImageResolver;
   afterPaint: () => Promise<unknown>;
+  worker?: EditablePresentation | null;
 }) {
   const subscribe = useCallback((listener: () => void) => store.subscribe(slideId, listener), [store, slideId]);
   const getFrame = useCallback(() => store.get(slideId), [store, slideId]);
   const frame = useSyncExternalStore(subscribe, getFrame, getFrame);
   return frame
-    ? <SlideThumbnail frame={frame} resolveImage={resolveImage} afterPaint={afterPaint} />
+    ? <SlideThumbnail frame={frame} resolveImage={resolveImage} afterPaint={afterPaint} worker={worker} />
     : <span style={styles.slideTitle}>{title}</span>;
 });
 
@@ -3174,10 +3528,12 @@ const SlideThumbnail = memo(function SlideThumbnail({
   frame,
   resolveImage,
   afterPaint,
+  worker,
 }: {
   frame: SlideDisplayList;
   resolveImage: CanvasImageResolver;
   afterPaint: () => Promise<unknown>;
+  worker?: EditablePresentation | null;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
@@ -3189,12 +3545,18 @@ const SlideThumbnail = memo(function SlideThumbnail({
     const dpr = window.devicePixelRatio || 1;
     sizeCanvasForSlide(canvas, frame, dpr, scale);
     let cancelled = false;
-    void Promise.resolve().then(afterPaint).then(() => {
-      if (!cancelled)
-        return paintSlide(currentOnly(ctx, () => !cancelled), frame, dpr, scale, { resolveImage });
+    void Promise.resolve().then(afterPaint).then(async () => {
+      if (cancelled) return;
+      const images = worker ? worker.thumbnailImages(frame) : null;
+      if (worker && !images) return;
+      try {
+        await paintSlide(worker ? currentContext(ctx, () => !cancelled && worker.isThumbnailCurrent(frame)) :
+          currentOnly(ctx, () => !cancelled),
+          frame, dpr, scale, { resolveImage: images ?? resolveImage });
+      } finally { images?.release(); }
     }).catch(() => undefined);
     return () => { cancelled = true; };
-  }, [afterPaint, frame, resolveImage]);
+  }, [afterPaint, frame, resolveImage, worker]);
   return <canvas ref={canvasRef} style={styles.thumbnailCanvas} aria-hidden="true" />;
 });
 
@@ -3382,25 +3744,12 @@ function removeBrowserFonts(fonts: FontFace[]): void {
   for (const font of fonts) document.fonts.delete(font);
 }
 
-function resolveImage(
-  assetId: string,
+function resolveImages(
   handleRef: { current: PresentationHandle | null },
-  cacheRef: { current: Map<string, Promise<CanvasImageSource | null>> },
+  cacheRef: { current: ReturnType<typeof frameImages> },
   errorMessage: string
-): Promise<CanvasImageSource | null> {
-  const cached = cacheRef.current.get(assetId);
-  if (cached) return cached;
-  const pending = decodeImage(handleRef.current?.mediaBytes(assetId), errorMessage);
-  cacheRef.current.set(assetId, pending);
-  return pending;
-}
-
-function decodeImage(
-  bytes: Uint8Array | undefined,
-  errorMessage: string
-): Promise<CanvasImageSource | null> {
-  if (!bytes) return Promise.resolve(null);
-  return decodePresentationImage(bytes, errorMessage);
+): CanvasImageResolver {
+  return cacheRef.current.resolver((id) => handleRef.current?.mediaBytes(id), errorMessage);
 }
 
 function caretLinesFor(

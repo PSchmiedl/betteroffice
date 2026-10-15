@@ -1061,98 +1061,14 @@ impl<'a> Exporter<'a> {
 
     /// Reads the body's sections and indexes them by the paragraph ending each.
     fn read_sections<T: ReadTxn>(&mut self, views: &mut Views<'_, T>) {
-        self.sections = self.body_sections(views);
+        let capacity = self.capacity();
+        self.sections = body_sections(views, |size| size <= capacity);
         self.section_ends = HashMap::new();
         for (index, section) in self.sections.iter().enumerate() {
             if let Some(end) = &section.end {
                 self.section_ends.entry(end.clone()).or_insert(index);
             }
         }
-    }
-
-    /// The body's sections in order, each with the paragraph ending it, then the final section.
-    fn body_sections<T: ReadTxn>(&mut self, views: &mut Views<'_, T>) -> Vec<Section> {
-        let mut sections = Vec::new();
-        let txn = views.txn();
-        if let Ok(text) = story_ref(txn, "body") {
-            let chunks = views.doc().chunk_snapshot("body", &text, txn);
-            for chunk in chunks.iter() {
-                let ChunkKind::Pilcrow(map) = &chunk.kind else {
-                    continue;
-                };
-                let value = |key: &str| match map.get(txn, key) {
-                    Some(Out::Any(value)) if !matches!(value, Any::Null | Any::Undefined) => {
-                        Some(value)
-                    }
-                    _ => None,
-                };
-                let (section, break_type) = (value("sectPr"), value("sectionBreakType"));
-                if section.is_none() && break_type.is_none() {
-                    continue;
-                }
-                let properties = section
-                    .filter(|value| self.fits(json_len(value)))
-                    .and_then(|value| serde_json::to_value(value).ok())
-                    .and_then(|value| {
-                        serde_json::from_value::<docx_parse::SectionProperties>(value).ok()
-                    });
-                let start = properties
-                    .as_ref()
-                    .and_then(|section| section.section_start.clone())
-                    .or_else(|| any_text(break_type.as_ref()));
-                sections.push(Section {
-                    end: Some(map_string(map, txn, crate::PARA_ID).unwrap_or_default()),
-                    start,
-                    properties,
-                });
-            }
-        }
-        let last = self
-            .read()
-            .and_then(|read| read.final_section.clone())
-            .and_then(|value| serde_json::from_value::<docx_parse::SectionProperties>(value).ok());
-        sections.push(Section {
-            end: None,
-            start: last
-                .as_ref()
-                .and_then(|section| section.section_start.clone()),
-            properties: last,
-        });
-        sections
-    }
-
-    /// The sections referencing each header and footer story, with inherited references.
-    fn story_uses(&self) -> HashMap<String, Vec<StoryUse>> {
-        let mut properties: Vec<docx_parse::SectionProperties> = self
-            .sections
-            .iter()
-            .map(|section| section.properties.clone().unwrap_or_default())
-            .collect();
-        docx_parse::apply_section_inheritance(&mut properties);
-        let mut uses: HashMap<String, Vec<StoryUse>> = HashMap::new();
-        let mut seen: HashSet<(String, u32, u8)> = HashSet::new();
-        for (index, section) in properties.iter().enumerate() {
-            for reference in section
-                .header_references
-                .iter()
-                .chain(section.footer_references.iter())
-                .flatten()
-            {
-                let variant = match reference.reference_type.as_str() {
-                    "first" => HeaderFooterVariant::First,
-                    "even" => HeaderFooterVariant::Even,
-                    _ => HeaderFooterVariant::Default,
-                };
-                let story = format!("hf:{}", reference.relationship_id);
-                if seen.insert((story.clone(), index as u32, variant as u8)) {
-                    uses.entry(story).or_default().push(StoryUse {
-                        section_index: index as u32,
-                        variant,
-                    });
-                }
-            }
-        }
-        uses
     }
 
     /// The stories to export in output order, plus the envelope diagnostics.
@@ -1211,24 +1127,28 @@ impl<'a> Exporter<'a> {
                 });
             }
         }
-        let uses = self.story_uses();
+        let uses = story_uses(views.doc(), &inherited_properties(&self.sections));
         let mut stories: Vec<(StorySelection, ExportStory)> = Vec::new();
-        let mut known: HashSet<&str> = HashSet::new();
+        let mut known: HashSet<String> = HashSet::new();
         let mut unclassified = 0usize;
         if let Some(read) = self.read() {
             let mut by_part: HashMap<String, usize> = HashMap::new();
             for source in &read.stories {
-                if !self.story_ids.contains(&source.story) {
+                let story = source.content_story(views.doc());
+                if !self.story_ids.contains(&story)
+                    || (matches!(source.kind, StoryKind::Header | StoryKind::Footer)
+                        && known.contains(&story))
+                {
                     continue;
                 }
-                known.insert(&source.story);
+                known.insert(story.clone());
                 let category = match source.kind {
                     StoryKind::Header => StorySelection::Headers,
                     StoryKind::Footer => StorySelection::Footers,
                     StoryKind::Footnote => StorySelection::Footnotes,
                     _ => StorySelection::Endnotes,
                 };
-                let story_uses = uses.get(&source.story).cloned().unwrap_or_default();
+                let story_uses = uses.get(&story).cloned().unwrap_or_default();
                 let shared = matches!(source.kind, StoryKind::Header | StoryKind::Footer)
                     .then(|| source.part.clone())
                     .flatten()
@@ -1236,12 +1156,12 @@ impl<'a> Exporter<'a> {
                 if let Some((part, index)) = shared {
                     let first = stories[index].1.story.clone();
                     let capacity = self.capacity();
-                    if same_content(views, &self.story_ids, capacity, &first, &source.story) {
+                    if same_content(views, &self.story_ids, capacity, &first, &story) {
                         self.note(
                             DiagnosticCode::AmbiguousIdentity,
                             Severity::Info,
                             None,
-                            format!("Story {} reads part {part} as story {first} does and holds the same content, so it is exported once as {first}.", source.story),
+                            format!("Story {story} reads part {part} as story {first} does and holds the same content, so it is exported once as {first}."),
                         );
                         let merged = &mut stories[index].1.uses;
                         merged.extend(story_uses);
@@ -1253,7 +1173,7 @@ impl<'a> Exporter<'a> {
                         DiagnosticCode::AmbiguousIdentity,
                         Severity::Warning,
                         None,
-                        format!("Stories {first} and {} both read part {part} but now hold different content, so both are exported.", source.story),
+                        format!("Stories {first} and {story} both read part {part} but now hold different content, so both are exported."),
                     );
                 }
                 if let Some(part) = source
@@ -1266,7 +1186,7 @@ impl<'a> Exporter<'a> {
                 stories.push((
                     category,
                     ExportStory {
-                        story: source.story.clone(),
+                        story,
                         kind: source.kind,
                         part: source.part.clone(),
                         note_id: source.note_id.clone(),
@@ -3425,6 +3345,28 @@ impl<'a> Exporter<'a> {
             }
             "field" => self.field(ctx, payload, &base, depth),
             "image" => self.image(ctx, payload, &anchor),
+            "opaqueDrawing" => {
+                let element =
+                    super::source::element_name(any_str(payload.get("xml")).unwrap_or_default());
+                let preview = any_map(payload.get("preview"));
+                self.note(
+                    DiagnosticCode::UnsupportedContent,
+                    Severity::Warning,
+                    Some(anchor.clone()),
+                    if preview.is_some() {
+                        format!("An inline {element} stays in the package; only its image preview is represented in the export.")
+                    } else {
+                        format!("An inline {element} is not represented in the export; it stays in the package.")
+                    },
+                );
+                match preview {
+                    Some(preview) => self.image(ctx, preview, &anchor),
+                    None => InlineKind::Unsupported {
+                        element,
+                        alt_text: None,
+                    },
+                }
+            }
             "sdt" => {
                 let control_id = control_id.unwrap_or_default();
                 return self.inline_control(ctx, payload, base, control_id, records, depth);
@@ -4410,6 +4352,142 @@ fn set_identities_aside(value: &mut Value, prefix: &str) {
             }
         }
         _ => {}
+    }
+}
+
+/// The body's sections in order, each with the paragraph ending it, then the final section.
+fn body_sections<T: ReadTxn>(
+    views: &mut Views<'_, T>,
+    fits: impl Fn(usize) -> bool,
+) -> Vec<Section> {
+    let mut sections = Vec::new();
+    let txn = views.txn();
+    if let Ok(text) = story_ref(txn, "body") {
+        let chunks = views.doc().chunk_snapshot("body", &text, txn);
+        for chunk in chunks.iter() {
+            let ChunkKind::Pilcrow(map) = &chunk.kind else {
+                continue;
+            };
+            let value = |key: &str| match map.get(txn, key) {
+                Some(Out::Any(value)) if !matches!(value, Any::Null | Any::Undefined) => {
+                    Some(value)
+                }
+                _ => None,
+            };
+            let (section, break_type) = (value("sectPr"), value("sectionBreakType"));
+            if section.is_none() && break_type.is_none() {
+                continue;
+            }
+            let properties = section
+                .filter(|value| fits(json_len(value)))
+                .and_then(|value| serde_json::to_value(value).ok())
+                .and_then(|value| {
+                    serde_json::from_value::<docx_parse::SectionProperties>(value).ok()
+                });
+            let start = properties
+                .as_ref()
+                .and_then(|section| section.section_start.clone())
+                .or_else(|| any_text(break_type.as_ref()));
+            sections.push(Section {
+                end: Some(map_string(map, txn, crate::PARA_ID).unwrap_or_default()),
+                start,
+                properties,
+            });
+        }
+    }
+    let last = views
+        .doc()
+        .final_section_properties()
+        .and_then(|value| serde_json::from_value::<docx_parse::SectionProperties>(value).ok());
+    sections.push(Section {
+        end: None,
+        start: last
+            .as_ref()
+            .and_then(|section| section.section_start.clone()),
+        properties: last,
+    });
+    sections
+}
+
+/// The sections referencing each header and footer story, with inherited references.
+fn story_uses(
+    doc: &EditingDoc,
+    properties: &[docx_parse::SectionProperties],
+) -> HashMap<String, Vec<StoryUse>> {
+    let mut uses: HashMap<String, Vec<StoryUse>> = HashMap::new();
+    let mut seen: HashSet<(String, u32, u8)> = HashSet::new();
+    for (index, section) in properties.iter().enumerate() {
+        for reference in section
+            .header_references
+            .iter()
+            .chain(section.footer_references.iter())
+            .flatten()
+        {
+            let variant = match reference.reference_type.as_str() {
+                "first" => HeaderFooterVariant::First,
+                "even" => HeaderFooterVariant::Even,
+                _ => HeaderFooterVariant::Default,
+            };
+            let story = doc.header_footer_story(&reference.relationship_id);
+            if seen.insert((story.clone(), index as u32, variant as u8)) {
+                uses.entry(story).or_default().push(StoryUse {
+                    section_index: index as u32,
+                    variant,
+                });
+            }
+        }
+    }
+    uses
+}
+
+/// Each section's properties with the header and footer references it inherits.
+fn inherited_properties(sections: &[Section]) -> Vec<docx_parse::SectionProperties> {
+    let mut properties: Vec<docx_parse::SectionProperties> = sections
+        .iter()
+        .map(|section| section.properties.clone().unwrap_or_default())
+        .collect();
+    docx_parse::apply_section_inheritance(&mut properties);
+    properties
+}
+
+/// The session's header and footer stories: each one's role and part, and the sections
+/// referencing it with inheritance applied.
+pub(crate) struct HeaderFooterIndex {
+    pub(crate) roles: HashMap<String, (StoryKind, Option<String>)>,
+    pub(crate) uses: HashMap<String, Vec<StoryUse>>,
+}
+
+/// Reads roles from the retained source, else from the section references naming each story.
+pub(crate) fn header_footer_index<T: ReadTxn>(views: &mut Views<'_, T>) -> HeaderFooterIndex {
+    let source = views.doc().source_metadata();
+    let read = source.as_deref().map(SourceMetadata::read);
+    let sections = body_sections(views, |_| true);
+    let properties = inherited_properties(&sections);
+    let mut roles = HashMap::new();
+    for section in &properties {
+        for (references, kind) in [
+            (&section.header_references, StoryKind::Header),
+            (&section.footer_references, StoryKind::Footer),
+        ] {
+            for reference in references.iter().flatten() {
+                roles
+                    .entry(views.doc().header_footer_story(&reference.relationship_id))
+                    .or_insert((kind, None));
+            }
+        }
+    }
+    let mut sourced = HashSet::new();
+    for story in read.iter().flat_map(|read| &read.stories) {
+        let content = story.content_story(views.doc());
+        if matches!(story.kind, StoryKind::Header | StoryKind::Footer)
+            && sourced.insert(content.clone())
+        {
+            roles.insert(content, (story.kind, story.part.clone()));
+        }
+    }
+    HeaderFooterIndex {
+        roles,
+        uses: story_uses(views.doc(), &properties),
     }
 }
 

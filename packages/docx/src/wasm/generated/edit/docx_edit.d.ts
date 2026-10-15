@@ -173,6 +173,7 @@ export class EditSession {
      * Until the matching `end_shared_reads`, committed reads share story projections of each document state.
      */
     begin_shared_reads(): void;
+    bootstrap_peer(state: Uint8Array, metadata: Uint8Array, source?: Uint8Array | null): void;
     /**
      * Display-only input JSON in, one binary `FrameDelta` v1 out (exposed as
      * a transferable `Uint8Array`). `expected_frame_epoch` is the epoch of the
@@ -207,6 +208,7 @@ export class EditSession {
      * surviving nearby cell. Errors when the table itself no longer resolves.
      */
     cell_selection(): string;
+    clear_cell_selection(): string | undefined;
     /**
      * Removes the authored `value` from the content-control embed carrying
      * `embed_id`, leaving the control and its content in place: it never
@@ -257,6 +259,7 @@ export class EditSession {
      * failures throw.
      */
     compare_docx_json(original: Uint8Array, revised: Uint8Array, options: string): string;
+    content_control_targets_json(): string;
     /**
      * Adds a story holding one paragraph with `initial_text` (which must not
      * contain paragraph breaks), `p_style` and `alignment`. Receipt:
@@ -264,6 +267,7 @@ export class EditSession {
      * the story id already exists.
      */
     create_story(story_id: string, initial_text: string, p_style: string, alignment: string): string;
+    decode_font(bytes: Uint8Array): Uint8Array;
     /**
      * Deletes every column the [`TableRange`] `range_json` covers, along with
      * the stories of the cells removed. Always a plain local edit.
@@ -309,12 +313,22 @@ export class EditSession {
      */
     display_hit_test_regions_json(page_index: number, x: number, y: number): string;
     /**
+     * [`EditSession::display_range_rects_region_json`] for many ranges, given as flat
+     * `[from, to, from, to, ...]` pairs. Per range, in order: its rect count, then
+     * `pageIndex, x, y, width, height` for each rect.
+     */
+    display_range_rects_batch(region: string, part_id: string, ranges: Float64Array): Float64Array;
+    /**
      * Highlight rectangles for a body document range against the resident
      * display list: a JSON array of `{pageIndex,x,y,width,height}` in
      * page-local px, one entry per page the range touches. Body positions
      * only. Errors when no display list is resident.
      */
     display_range_rects_json(from: number, to: number): string;
+    /**
+     * @internal
+     */
+    display_range_rects_on_pages_json(from: number, to: number, first_page: number, last_page: number): string;
     /**
      * Same rectangles as [`EditSession::display_range_rects_json`], scoped to
      * a region. `region` is `"body"`, `"header"`, `"footer"`, `"footnote"` or
@@ -335,6 +349,7 @@ export class EditSession {
      * no display list is resident.
      */
     display_vertical_move_json(position: number, direction: string, goal_x: number): string;
+    document_properties_json(): string;
     /**
      * Pops the oldest queued transaction, in arrival order. Byte 0 is `1`
      * when the transaction had no local origin and `0` otherwise; the rest is
@@ -343,11 +358,30 @@ export class EditSession {
      */
     drain_update_event(): Uint8Array;
     /**
+     * Typing echo model of one font at one shaping size from this session's
+     * resident font store: `{"horizontal","glyphIds","advances","kerning",
+     * "unsafePairs"}`, indexed by the characters of `alphabet`. `kern` is the
+     * run's kerning gate. Errors for an unknown font or a non-positive size.
+     */
+    echo_glyph_set_json(font_id: number, size: number, kern: boolean, alphabet: string): string;
+    /**
+     * A plain local text edit that the resident lowering records, so the next
+     * [`Self::layout_document_with_regions_after_edit`] re-lowers and
+     * re-measures only its paragraph: inserts `text` at the collapsed range,
+     * or deletes `[start, end)` without it. The document changes exactly as
+     * through [`Self::insert_text`] or [`Self::delete_range`] without an
+     * author, and the receipt is theirs. An empty insertion, an edit that
+     * spans paragraphs, or one whose paragraph resident input is not ready
+     * for goes through them instead and records nothing for the relayout.
+     */
+    edit_text_resident(story: string, start_para: string, start_offset: number, end_para: string, end_offset: number, text?: string | null): string;
+    /**
      * The yrs v1 update carrying everything this replica has that the peer
      * described by `remote_state_vector` does not. Errors on a malformed
      * state vector.
      */
     encode_diff(remote_state_vector: Uint8Array): Uint8Array;
+    encode_peer_metadata(): Uint8Array;
     /**
      * The full document state as one yrs v1 update. Hand it to
      * [`EditSession::load`] on a fresh replica to reproduce this document.
@@ -464,6 +498,10 @@ export class EditSession {
      */
     has_story(story: string): boolean;
     /**
+     * Returns active alias-to-canonical relationship ids as a JSON object.
+     */
+    header_footer_aliases_json(): string;
+    /**
      * The headings of `story` in document order, classified as the structured export
      * classifies them: `[{"paraId","heading":{"outlineLevel","source"}}]`.
      */
@@ -528,6 +566,19 @@ export class EditSession {
      */
     layout_document_json(input: string): string;
     /**
+     * [`Self::layout_document_with_regions_retained`] after one edit: the
+     * resident path when that edit was the [`Self::edit_text_resident`] taken
+     * last; see `EngineSession::layout_document_with_regions_after_edit`.
+     */
+    layout_document_with_regions_after_edit(input: string): void;
+    /**
+     * The retained region layout of exactly the first `pages` pages when no
+     * later content can change them, and of the whole document otherwise; see
+     * `EngineSession::layout_document_with_regions_exact_prefix_retained`.
+     * Returns `{ provisional, pages, documentWidth? }` as JSON.
+     */
+    layout_document_with_regions_exact_prefix_retained(input: string, pages: number): string;
+    /**
      * Region-layout input JSON in, a paginated envelope with section and page
      * regions already composed as JSON out — ready for the display builder
      * with no host-side layout mutation. Retains the pass for resident edits.
@@ -580,6 +631,11 @@ export class EditSession {
      * empty for every structural kind, which covers no text.
      */
     list_revisions(): string;
+    /**
+     * Every story: `{"ok":true,"version","stories":[{"story","kind","parent"?,"root","part"?,
+     * "uses"?}]}`, sorted by id.
+     */
+    list_stories_json(): string;
     /**
      * Hydrates from a yrs v1 update. The first load after an unseeded open retains prior
      * comment writes and marks loaded fields differing from seed placeholders as authored.
@@ -730,8 +786,9 @@ export class EditSession {
      * `paragraphIds` request field: `{"assignments":[{"part","ordinal",
      * "paraId"}],"patchedParts":[{"part","paraIds":[[ordinal,"ID"]]}]}`,
      * plus `"splicedParts":[{"part","sha256","paragraphs":[[ordinal,"key"]],
-     * "changed":[ordinal]}]`, whose session keys the caller resolves to the
-     * model paragraphs it marks with their ordinals.
+     * "changed":[ordinal],"inserted":[{"before"|"after":ordinal}],"removed":[ordinal]}]`,
+     * whose session keys the caller resolves to the model paragraphs it marks
+     * with their ordinals.
      */
     paragraph_save_plan(): string;
     /**
@@ -749,6 +806,7 @@ export class EditSession {
      * else has been set on it). Errors on an unknown story.
      */
     paragraphs(story: string): string;
+    part_metadata_json(): string;
     /**
      * Gives every paragraph that saves without a Word paragraph ID a fresh
      * one and repairs duplicates; see [`EditingDoc::persist_paragraph_ids`].
@@ -767,6 +825,13 @@ export class EditSession {
      * U+FFFC in `text`.
      */
     read_paragraphs_json(request: string): string;
+    /**
+     * Paragraph texts of selected stories in one read:
+     * `{"stories"?:"all"|[kind|id…],"byRoot"?,"view","expectVersion"?}` -> `{"ok":true,
+     * "version","view","truncated","stories":[{"story","ok":true,"paragraphs"}|{"story",
+     * "ok":false,"failure"}]}`. Listed entries keep their order; a kind expands in id order.
+     */
+    read_stories_json(request: string): string;
     /**
      * Reconciles and publishes the `[owner, paraId]` pairs a save captured,
      * an owner being a session key or a source occurrence's
@@ -805,6 +870,7 @@ export class EditSession {
      * Release display pages; an empty result means the request was superseded.
      */
     release_display_pages_frame(pages: Uint32Array, expected_frame_epoch: number): Uint8Array;
+    repeat_content_control_at(story: string, index: number, remove: boolean): boolean;
     /**
      * Replaces `[start, end)` with `text` in one transaction. The inserted
      * text adopts the first replaced unit's formatting; in suggesting mode
@@ -828,6 +894,8 @@ export class EditSession {
      * Characters the last [`EditSession::apply_delete`] removed.
      */
     resident_deleted_units(): number;
+    resident_geometry_json(root: string, request: string): string;
+    resident_section_revision(): string;
     /**
      * Where a comment's sticky anchors currently sit:
      * `[{"story","start","end"}, …]`, one entry per anchored range, in
@@ -876,7 +944,12 @@ export class EditSession {
      * Author and date stamps for the requested revision ids.
      */
     revision_stamps_json(ids_json: string): string;
+    /**
+     * Resolves what runs inherit under `styles_json`, a package's style definitions or `null`.
+     */
+    run_inheritance(styles_json: string): RunInheritance;
     search_text(query: string, case_sensitive: boolean, limit?: number | null): string;
+    section_margins_json(): string;
     /**
      * [`EditSession::open_docx`] with seeding always on.
      */
@@ -982,6 +1055,7 @@ export class EditSession {
      * position holds no embed.
      */
     set_content_control_value_at(story: string, para_id: string, offset: number, value_json: string): void;
+    set_content_control_value_index(story: string, index: number, json: string): void;
     /**
      * Apply admitted paragraph-local text batches directly. Off by default.
      */
@@ -996,6 +1070,11 @@ export class EditSession {
      * until [`Self::build_display_pages_frame`] builds them.
      */
     set_display_window(start: number, end: number): void;
+    set_document_property(key: string, json: string): boolean;
+    /**
+     * Declares header/footer alias groups before host-side seeding.
+     */
+    set_header_footer_aliases(json: string): void;
     /**
      * Sets or clears the hyperlink attribute over `[start, end)`.
      * `hyperlink_json` is `{"href", "tooltip"?, "rId"?}` or `null` to unlink.
@@ -1055,11 +1134,13 @@ export class EditSession {
      * identity such as `paraId`.
      */
     set_paragraph_attrs(story: string, start_para: string, start_offset: number, end_para: string, end_offset: number, attrs_json: string, author_name?: string | null, author_date?: string | null): void;
+    set_part_metadata(json: string, remove_json: string): boolean;
     /**
      * Marks whether the session's document is part of a package, as a
      * replica of a preview is: its layouts render NUMPAGES empty.
      */
     set_partial_document(partial: boolean): void;
+    set_section_margins(section: string, json: string): boolean;
     /**
      * Stores this peer's anchor and head as sticky positions, replacing any
      * previous selection. Both endpoints must lie in `story`. The positions
@@ -1208,6 +1289,7 @@ export class EditSession {
      * Current undo grouping policy.
      */
     undo_capture_mode(): string;
+    update_comment_metadata_json(comment_id: string, patch_json: string): void;
     /**
      * Runs every check of [`EditSession::apply_edits_json`], staging included,
      * without changing anything: `{"ok":true,"baseVersion","wouldApply","previews"}`.
@@ -1250,6 +1332,22 @@ export class RetainedLayoutMeta {
     readonly page_count: number;
     readonly partial: boolean;
     readonly provisional: boolean;
+}
+
+/**
+ * What runs inherit under one package's styles; see [`EditSession::run_inheritance`].
+ */
+export class RunInheritance {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * The attributes, as a JSON object, that seeding merges into the marks of a run of
+     * `run_style` in a paragraph of `paragraph_style` before the run's direct formatting.
+     */
+    attributes(paragraph_style?: string | null, run_style?: string | null, table_run_json?: string | null): string;
+    paragraph_formatting(paragraph_style: string | null | undefined, table_formatting_json: string): string;
+    table_attributes(table_json: string): string;
 }
 
 /**
@@ -1420,6 +1518,16 @@ export function range_rects_by_handle(handle: number, from: number, to: number):
 export function range_rects_json(display_list: string, from: number, to: number): string;
 
 /**
+ * @internal
+ */
+export function range_rects_on_pages_by_handle(handle: number, from: number, to: number, first_page: number, last_page: number): string;
+
+/**
+ * @internal
+ */
+export function range_rects_on_pages_json(display_list: string, from: number, to: number, first_page: number, last_page: number): string;
+
+/**
  * wasm wrapper over [`session::range_rects_region_by_handle`]: region-aware
  * range rects against a stored display list. `region` is
  * `"body" | "header" | "footer" | "footnote" | "endnote"`; `part_id` scopes
@@ -1532,6 +1640,12 @@ export function wasm_peak_bytes(): number;
  */
 export function write_docx_s13_wasm(request_json: string, original_docx: Uint8Array): Uint8Array;
 
+/**
+ * [`write_docx_s13_wasm`], framing save diagnostics ahead of the package
+ * bytes: `u64 LE warnings_len || warnings_json || docx_bytes`.
+ */
+export function write_docx_s13_wasm_with_warnings(request_json: string, original_docx: Uint8Array): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -1540,6 +1654,7 @@ export interface InitOutput {
     readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbg_editsession_free: (a: number, b: number) => void;
     readonly __wbg_retainedlayoutmeta_free: (a: number, b: number) => void;
+    readonly __wbg_runinheritance_free: (a: number, b: number) => void;
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
@@ -1569,12 +1684,14 @@ export interface InitOutput {
     readonly editsession_begin_opening: (a: number, b: number, c: number) => void;
     readonly editsession_begin_region_layout: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_begin_shared_reads: (a: number) => void;
+    readonly editsession_bootstrap_peer: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
     readonly editsession_build_display_list_frame: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly editsession_build_display_list_json: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_build_display_pages_frame: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly editsession_can_redo: (a: number) => number;
     readonly editsession_can_undo: (a: number) => number;
     readonly editsession_cell_selection: (a: number) => [number, number, number, number];
+    readonly editsession_clear_cell_selection: (a: number) => [number, number];
     readonly editsession_clear_content_control_value: (a: number, b: number, c: number) => [number, number];
     readonly editsession_clear_formatting: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number];
     readonly editsession_clear_measure_fonts: (a: number) => void;
@@ -1583,7 +1700,9 @@ export interface InitOutput {
     readonly editsession_client_id: (a: number) => number;
     readonly editsession_comment_text_target_json: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly editsession_compare_docx_json: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
+    readonly editsession_content_control_targets_json: (a: number) => [number, number, number, number];
     readonly editsession_create_story: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number, number];
+    readonly editsession_decode_font: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_delete_column: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_delete_range: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
     readonly editsession_delete_row: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
@@ -1591,11 +1710,17 @@ export interface InitOutput {
     readonly editsession_delete_table: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_direct_batches_applied: (a: number) => number;
     readonly editsession_display_hit_test_regions_json: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly editsession_display_range_rects_batch: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly editsession_display_range_rects_json: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly editsession_display_range_rects_on_pages_json: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly editsession_display_range_rects_region_json: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly editsession_display_vertical_move_json: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly editsession_document_properties_json: (a: number) => [number, number];
     readonly editsession_drain_update_event: (a: number) => [number, number];
+    readonly editsession_echo_glyph_set_json: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly editsession_edit_text_resident: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number, number];
     readonly editsession_encode_diff: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly editsession_encode_peer_metadata: (a: number) => [number, number, number, number];
     readonly editsession_encode_state: (a: number) => [number, number];
     readonly editsession_encode_state_vector: (a: number) => [number, number];
     readonly editsession_encode_sticky_position: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
@@ -1613,6 +1738,7 @@ export interface InitOutput {
     readonly editsession_format_text_target_json: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly editsession_geometry_position_outline_json: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_has_story: (a: number, b: number, c: number) => number;
+    readonly editsession_header_footer_aliases_json: (a: number) => [number, number];
     readonly editsession_headings_json: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_history_stories: (a: number) => [number, number];
     readonly editsession_insert_column: (a: number, b: number, c: number, d: number) => [number, number, number, number];
@@ -1624,6 +1750,8 @@ export interface InitOutput {
     readonly editsession_insert_text: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
     readonly editsession_insert_watermark: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
     readonly editsession_layout_document_json: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly editsession_layout_document_with_regions_after_edit: (a: number, b: number, c: number) => [number, number];
+    readonly editsession_layout_document_with_regions_exact_prefix_retained: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly editsession_layout_document_with_regions_json: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_layout_document_with_regions_prefix_retained_json: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly editsession_layout_document_with_regions_retained: (a: number, b: number, c: number) => [number, number];
@@ -1633,6 +1761,7 @@ export interface InitOutput {
     readonly editsession_list_comments: (a: number) => [number, number, number, number];
     readonly editsession_list_content_controls_json: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_list_revisions: (a: number) => [number, number, number, number];
+    readonly editsession_list_stories_json: (a: number) => [number, number, number, number];
     readonly editsession_load: (a: number, b: number, c: number) => [number, number];
     readonly editsession_load_json: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_load_media_sources: (a: number, b: number, c: number) => [number, number];
@@ -1657,19 +1786,24 @@ export interface InitOutput {
     readonly editsession_paragraph_save_plan: (a: number) => [number, number, number, number];
     readonly editsession_paragraph_spans: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_paragraphs: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly editsession_part_metadata_json: (a: number) => [number, number];
     readonly editsession_persist_paragraph_ids: (a: number) => [number, number, number, number];
     readonly editsession_proposal_revision_ranges_json: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_read_paragraphs_json: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly editsession_read_stories_json: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_record_saved_paragraph_ids: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_redo: (a: number) => number;
     readonly editsession_register_measure_font: (a: number, b: number, c: number) => [number, number, number];
     readonly editsession_register_substitute_measure_font: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly editsession_reject_change: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_release_display_pages_frame: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly editsession_repeat_content_control_at: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly editsession_replace_range: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number) => [number, number, number, number];
     readonly editsession_reset_frame_base: (a: number) => void;
     readonly editsession_resident_caret_snapshot_json: (a: number) => [number, number, number, number];
     readonly editsession_resident_deleted_units: (a: number) => number;
+    readonly editsession_resident_geometry_json: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly editsession_resident_section_revision: (a: number) => [number, number];
     readonly editsession_resolve_comment: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_resolve_encoded_selection: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly editsession_resolve_paragraph_anchor: (a: number, b: number, c: number) => [number, number, number, number];
@@ -1679,7 +1813,9 @@ export interface InitOutput {
     readonly editsession_retained_kernel_inputs_json: (a: number) => [number, number, number, number];
     readonly editsession_retained_layout_json: (a: number) => [number, number, number, number];
     readonly editsession_revision_stamps_json: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly editsession_run_inheritance: (a: number, b: number, c: number) => [number, number, number];
     readonly editsession_search_text: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly editsession_section_margins_json: (a: number) => [number, number];
     readonly editsession_seed_from_docx: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly editsession_seed_opaque_sequences: (a: number, b: number, c: number) => [number, number];
     readonly editsession_select_story: (a: number, b: number, c: number) => void;
@@ -1694,9 +1830,12 @@ export interface InitOutput {
     readonly editsession_set_comment_ranges: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly editsession_set_content_control_value: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly editsession_set_content_control_value_at: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
+    readonly editsession_set_content_control_value_index: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
     readonly editsession_set_direct_batches: (a: number, b: number) => void;
     readonly editsession_set_display_retain_built_pages: (a: number, b: number) => void;
     readonly editsession_set_display_window: (a: number, b: number, c: number) => void;
+    readonly editsession_set_document_property: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
+    readonly editsession_set_header_footer_aliases: (a: number, b: number, c: number) => [number, number];
     readonly editsession_set_hyperlink: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number];
     readonly editsession_set_image_geometry: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly editsession_set_image_geometry_at: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
@@ -1704,7 +1843,9 @@ export interface InitOutput {
     readonly editsession_set_media_tokens: (a: number, b: number) => void;
     readonly editsession_set_paragraph_attr: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
     readonly editsession_set_paragraph_attrs: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number) => [number, number];
+    readonly editsession_set_part_metadata: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly editsession_set_partial_document: (a: number, b: number) => void;
+    readonly editsession_set_section_margins: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly editsession_set_selection: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number];
     readonly editsession_set_table_width: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly editsession_set_undo_capture_mode: (a: number, b: number, c: number) => [number, number];
@@ -1727,6 +1868,7 @@ export interface InitOutput {
     readonly editsession_track_undo: (a: number) => void;
     readonly editsession_undo: (a: number) => number;
     readonly editsession_undo_capture_mode: (a: number) => [number, number];
+    readonly editsession_update_comment_metadata_json: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly editsession_validate_edits_json: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_version: (a: number) => [number, number];
     readonly editsession_written_paragraph_ids: (a: number, b: number, c: number) => [number, number, number, number];
@@ -1756,6 +1898,8 @@ export interface InitOutput {
     readonly parse_relationships_xml: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly range_rects_by_handle: (a: number, b: number, c: number) => [number, number, number, number];
     readonly range_rects_json: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly range_rects_on_pages_by_handle: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly range_rects_on_pages_json: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly range_rects_region_by_handle: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly range_rects_region_json: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
     readonly register_measure_font: (a: number, b: number) => [number, number, number];
@@ -1769,6 +1913,9 @@ export interface InitOutput {
     readonly retainedlayoutmeta_page_sizes: (a: number) => [number, number];
     readonly retainedlayoutmeta_partial: (a: number) => number;
     readonly retainedlayoutmeta_provisional: (a: number) => number;
+    readonly runinheritance_attributes: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
+    readonly runinheritance_paragraph_formatting: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly runinheritance_table_attributes: (a: number, b: number, c: number) => [number, number, number, number];
     readonly serialize_docx_s10: (a: number, b: number) => [number, number, number, number];
     readonly serialize_docx_s11: (a: number, b: number) => [number, number, number, number];
     readonly serialize_docx_s12: (a: number, b: number) => [number, number, number, number];
@@ -1781,6 +1928,7 @@ export interface InitOutput {
     readonly wasm_live_bytes: () => number;
     readonly wasm_peak_bytes: () => number;
     readonly write_docx_s13_wasm: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly write_docx_s13_wasm_with_warnings: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;

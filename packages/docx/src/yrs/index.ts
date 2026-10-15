@@ -16,7 +16,7 @@
 
 import type { RetainedLayoutMeta } from './layoutMeta';
 import type { ResidentEngineWorkerFontSync } from './residentEngineWorkerProtocol';
-import type { Document } from '../types/document';
+import type { Document, ParagraphFormatting, Table, TextFormatting } from '../types/document';
 import type { CompatibilityFlags } from '../docx/settingsParser';
 import type {
   DocxParagraphAnchor,
@@ -39,10 +39,13 @@ import type {
   DocxFindTextResult,
   DocxReadParagraphsRequest,
   DocxReadParagraphsResult,
+  DocxReadStoriesRequest,
+  DocxReadStoriesResult,
   DocxTextTarget,
   DocxValidationResult,
 } from './edits';
 import type { DocxParagraphHeading } from './readTypes';
+import type { DocxListStoriesResult } from './stories';
 import {
   type DocxProposalRegistryState,
   type DocxProposalRequest,
@@ -72,6 +75,32 @@ import type {
 import { preparedDigests, randomClientId, wrapSession } from './yrsSessionFacade';
 export { decodeDocxHostJson } from './yrsSessionFacade';
 
+/** @internal */
+export type {
+  DocxCommandEchoContext,
+  DocxCommandKind,
+  DocxCommandFrame,
+  DocxCommandPageIdentity,
+  DocxCommandPayloads,
+  DocxCommandSelection,
+  DocxEditState,
+  DocxEchoGlyphLine,
+  DocxEchoGlyphSet,
+  DocxEchoRect,
+  DocxEchoTransform,
+  DocxNavigationIntent,
+  DocxSelectionPointIntent,
+  DocxWorkerEditSession,
+  ResidentCommandConnection,
+  ResidentCommandInitReply,
+} from './residentCommandProtocol';
+/** @internal */
+export type {
+  ResidentEngineWorkerHostModule,
+  ResidentEngineWorkerRequest,
+  ResidentEngineWorkerResponse,
+} from './residentEngineWorkerProtocol';
+
 export * from './layoutMeta';
 export * from './edits';
 export * from './contentControls';
@@ -82,8 +111,12 @@ export * from './structuredExport';
 export * from './pagedExport';
 export * from './inputPositionMap';
 export * from './storyPlainText';
+export * from './stories';
 export type { DocxResolvedPointPosition } from './pointPosition';
-export type { ResidentDocumentRead } from './residentEngineWorkerProtocol';
+export type { ResidentRangeHighlights } from './residentRangeHighlights';
+export type { ResidentDocumentRead, ResidentDocumentReadValues } from './residentEngineWorkerProtocol';
+export type { DocxCommentPatch, ResidentReviewSnapshot } from './residentReview';
+export type { ResidentToolbarMetadata } from './residentToolbarMetadata';
 export type {
   DocxDisplayRange,
   DocxDisplaySelectionInfo,
@@ -112,6 +145,8 @@ export {
   type ResidentProposalReply,
   type ResidentEngineOffscreenPage,
 } from './residentEngineWorkerClient';
+export type { ResidentSourceOpenRequest, ResidentSourcePreviewOptions } from './residentSource';
+export type { ResidentFontFace, ResidentFontEnvironment, ResidentFontEnvironmentEvent, ResidentFontEnvironmentSnapshot } from './residentFontEnvironment';
 export { preloadDocxEngine } from './preloadDocxEngine';
 export {
   residentCaretSnapshotForFrame,
@@ -125,6 +160,12 @@ export {
   type WasmModuleMemory,
 } from '../wasm/loadWasmAsset';
 export { documentToYrs } from './documentToYrs';
+export {
+  OPAQUE_SEED_BUDGET_BYTES,
+  OpaqueSeedBudgetError,
+  assertOpaqueSeedBudget,
+  normalizeSeedError,
+} from './documentToYrs';
 export { ownProjectedParagraphs, yrsToDocument } from './yrsToDocument';
 export * from './paragraphIdentity';
 export {
@@ -149,7 +190,8 @@ export {
   type DocxSavedParagraph,
   type DocxSessionSave,
 } from './saveYrsDocx';
-export { sessionSourcePackage } from './sessionInternals';
+export { headerFooterDisplayRIds, headerFooterStory, sessionSourcePackage } from './sessionInternals';
+export { PeerMetadataError, peerMetadataTags } from './peerMetadata';
 export {
   DirtyProjectionStories,
   dirtyProjectionStory,
@@ -918,6 +960,30 @@ export interface YrsWorkerDocumentMirror {
   proposals: DocxProposalRegistryState;
 }
 
+/** What runs inherit under one package's styles. @internal */
+export interface YrsRunInheritance {
+  /**
+   * The attributes seeding merges into the marks of a run of `runStyle` in a
+   * paragraph of `paragraphStyle` before the run's direct formatting.
+   */
+  attributes(paragraphStyle: string | null, runStyle: string | null, tableRun?: TextFormatting): Record<string, unknown>;
+  paragraphFormatting(
+    paragraphStyle: string | null,
+    tableFormatting: ParagraphFormatting | undefined
+  ): ParagraphFormatting | undefined;
+  tableAttributes(table: Table): YrsTableInheritance;
+  dispose(): void;
+}
+
+export interface YrsTableInheritance {
+  attributes: Record<string, unknown>;
+  rows: Array<Array<{
+    attributes: Record<string, unknown>;
+    paragraphFormatting: ParagraphFormatting | null;
+    runFormatting: TextFormatting | null;
+  }>>;
+}
+
 export interface YrsSession extends CollaborationReplica {
   /** The yrs client id this replica writes with. */
   readonly clientId: number;
@@ -1025,6 +1091,13 @@ export interface YrsSession extends CollaborationReplica {
     goalX: number
   ): string;
   displayRangeRectsJson(from: number, to: number): string;
+  /** @internal */
+  displayRangeRectsOnPagesJson?(
+    from: number,
+    to: number,
+    firstPage: number,
+    lastPage: number
+  ): string;
   displayRangeRectsRegionJson(
     region: 'body' | 'header' | 'footer',
     rId: string,
@@ -1038,6 +1111,14 @@ export interface YrsSession extends CollaborationReplica {
 
   /** Hydrates from an encoded yrs v1 update (typically a peer's {@link encodeState} output). */
   loadState(update: Uint8Array): void;
+  encodePeerMetadata(): Uint8Array;
+  bootstrapPeer(
+    state: Uint8Array,
+    metadata: Uint8Array,
+    source: Uint8Array | undefined,
+    host: YrsDocxHost,
+    options?: YrsOpeningOptions
+  ): YrsDocxHost;
   /** Parses a DOCX, seeds its stories, and returns thin host metadata; see {@link openDocx}. */
   seedFromDocx(bytes: Uint8Array, options?: YrsOpeningOptions): YrsDocxHost;
   /**
@@ -1386,6 +1467,8 @@ export interface YrsSession extends CollaborationReplica {
    * order and upper case. Reads only. @internal
    */
   writtenParagraphIds(bytes: Uint8Array): Record<string, string[]>;
+  /** Resolves what runs inherit under a package's `styles`. Reads only. @internal */
+  runInheritance(styles: Document['package']['styles']): YrsRunInheritance;
 
   // -- version-checked host edits --
 
@@ -1396,6 +1479,13 @@ export interface YrsSession extends CollaborationReplica {
   version(): string;
   /** Paragraph texts in one view, with the version they were read at. */
   readParagraphs(request: DocxReadParagraphsRequest): DocxReadParagraphsResult;
+  /**
+   * Paragraph texts of the selected stories in one read. A story that cannot be read reports
+   * why, and the read stops at its limits with `truncated`.
+   */
+  readStories(request: DocxReadStoriesRequest): DocxReadStoriesResult;
+  /** Every story with its kind, container and, for a header or footer, its part and uses. */
+  listStories(): DocxListStoriesResult;
   /** Exact, case-sensitive, paragraph-local search; overlapping matches count separately. */
   findText(request: DocxFindTextRequest): DocxFindTextResult;
   /** Resolves and checks an edit batch without changing anything or reserving ids. */
@@ -1422,23 +1512,27 @@ export interface YrsSession extends CollaborationReplica {
    * the round applies as one batch outside undo history, or nothing changes. A retried id with
    * the same edit is a no-op; the same id with another edit refuses. Opening another document
    * forgets every proposal.
+   * On an editor peer this registry is peer-local, invisible to worker rounds and ref API results.
    */
   proposeChanges(request: DocxProposalRequest): DocxProposalResult;
   /**
    * Sets how proposals render. Decisions change neither the document, its version nor undo
    * history; each call that changes one increments `previewVersion`.
+   * On an editor peer this registry is peer-local, invisible to worker rounds and ref API results.
    */
   setProposalStates(request: DocxProposalStateRequest): DocxProposalResult;
   /**
    * Withdraws proposals, settling each as its decision previews it: accepted ones apply for good,
    * rejected and undecided ones are removed. The settlement is one change against `expectVersion`
    * outside undo history, so a later round resolves against the text the preview showed.
+   * On an editor peer this registry is peer-local, invisible to worker rounds and ref API results.
    */
   withdrawProposals(request: DocxProposalWithdrawRequest): DocxProposalResult;
   /** The proposals in the order they were made. */
   getProposals(): DocxProposalSnapshot;
   /** @internal */
   mirrorWorkerDocument(mirror: YrsWorkerDocumentMirror | null): void;
+  createWorkerProposalRegistry(state: DocxProposalRegistryState): import('./proposals').DocxProposalRegistry;
   /** @internal */
   workerDocumentMirrored(): boolean;
   /** Listens for new proposals, decisions and a forgotten registry. Returns the unsubscribe. */
@@ -1521,9 +1615,9 @@ export interface CreateYrsSessionOptions {
 }
 
 /**
- * Creates a yrs editing replica. The first call dynamically imports and
- * initializes the embedded docx-edit wasm (~440KB base64) — callers must
- * load it lazily so non-editor consumers avoid the wasm startup cost.
+ * Creates a yrs editing replica. The first call dynamically imports the edit
+ * loader and preloads the external docx-edit wasm asset — callers must load
+ * it lazily so non-editor consumers avoid the wasm startup cost.
  */
 export async function createYrsSession(options?: CreateYrsSessionOptions): Promise<YrsSession> {
   const clientId = options?.clientId ?? randomClientId();
@@ -1531,3 +1625,4 @@ export async function createYrsSession(options?: CreateYrsSessionOptions): Promi
   await wasm.preloadEditWasm();
   return wrapSession(wasm.createEditSession(clientId), clientId);
 }
+export type { ResidentEngineWorkerSourceOpened } from './residentSourceWorkerClient';

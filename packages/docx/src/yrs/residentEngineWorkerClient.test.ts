@@ -17,6 +17,7 @@ import type {
   ResidentEngineWorkerRequest,
   ResidentEngineWorkerResponse,
 } from './residentEngineWorkerProtocol';
+import type { DocxCommandFrame, ResidentCommandInitReply } from './residentCommandProtocol';
 
 class FakeWorker implements ResidentEngineWorkerPort {
   static instances: FakeWorker[] = [];
@@ -142,6 +143,239 @@ function setup() {
   const client = new ResidentEngineWorkerClient(worker);
   return { worker, client };
 }
+
+function stagedFrame(revision: number, closed: string[]): DocxCommandFrame {
+  const bitmap = { close() { closed.push('page'); } } as ImageBitmap;
+  const background = { close() { closed.push('background'); } } as ImageBitmap;
+  return { revision, coversThroughSeq: 0, payload: {
+    frame: new ArrayBuffer(0), layoutRevision: 1, caret: { frameEpoch: revision, caretRect: null },
+    stagedPresentation: { frameEpoch: revision, pages: [{ page: { pageId: '1', pageIndex: 0 },
+      frameEpoch: revision, bitmap, backgrounds: [
+        { id: 'page', rect: { x: 0, y: 0, width: 1, height: 1 }, bitmap },
+        { id: 'background', rect: { x: 0, y: 0, width: 1, height: 1 }, bitmap: background },
+      ] }] },
+  } };
+}
+
+test.each(['session', 'incarnation', 'epoch', 'fenced', 'replaced'] as const)(
+  'delayed command frames from a %s generation do not change client state', async (kind) => {
+    const { worker, client } = setup();
+    const identity = { session: 'delayed-frame', incarnation: 1, epoch: 7 };
+    const initial: ResidentCommandInitReply = {
+      ...identity, version: 0, throughSeq: 0, outcomes: [], selection: null,
+      editState: {
+        readOnly: false, toolbar: null, effectiveFormatting: null, storedMarks: null,
+        canUndo: false, canRedo: false, hyperlink: null, tableContext: null,
+      },
+      frame: {
+        coversThroughSeq: 0, revision: 1,
+        payload: { frame: new ArrayBuffer(0), caret: { frameEpoch: 1, caretRect: null }, layoutRevision: 1 },
+      },
+    };
+    const frames: DocxCommandFrame[] = [];
+    client.onFrame((frame) => { frames.push(frame); });
+    try {
+      const initialized = client.commandInit({
+        ...identity, readOnly: false, fonts: [], layoutInput: '', layoutWithRegions: false,
+        layoutRevision: 1, extras: '{}',
+      });
+      worker.reply({ id: worker.lastId(), ok: true, commandInitial: initial });
+      await initialized;
+      const built = client.buildPages([1], 1);
+      const settled = built.then(() => undefined, (error: unknown) => error);
+      const id = worker.lastId();
+      let replacement: ReturnType<typeof client.bootstrap> | undefined;
+      if (kind === 'fenced' || kind === 'replaced') {
+        replacement = client.bootstrap(snapshot, '{}');
+        expect(await settled).toMatchObject({ code: 'disposed' });
+        if (kind === 'replaced') {
+          worker.reply({ ...frameReply(worker.lastId()), caret: { frameEpoch: 2, caretRect: null },
+            layoutRevision: 2, commandInitial: { ...initial, epoch: 8,
+              frame: { ...initial.frame, revision: 2, payload: { ...initial.frame.payload,
+                caret: { frameEpoch: 2, caretRect: null }, layoutRevision: 2 } } } });
+          await replacement;
+        }
+      }
+      const before = {
+        frame: client.answeredFrame(), layout: client.layoutRevision(), memory: client.memory(),
+        vector: client.remoteStateVector(), ready: client.isReady(), sequence: client.stateSequence(),
+      };
+      const closed: string[] = [];
+      const staged = stagedFrame(99, closed);
+      const frame: DocxCommandFrame = {
+        ...staged,
+        coversThroughSeq: 0, revision: 99, baseRevision: 1,
+        payload: { ...staged.payload, frame: new ArrayBuffer(8), layoutRevision: 99 },
+      };
+      await Promise.resolve();
+      worker.reply({ ...frameReply(id), ...frame.payload, selection,
+        memory: [{ label: 'rejected', bufferBytes: 1, liveBytes: 1, peakBytes: 1, failedAllocationBytes: 0 }],
+        stateVector: new Uint8Array([99]).buffer,
+        commandFrame: { ...identity,
+          ...(kind === 'session' ? { session: 'other' } : {}),
+          ...(kind === 'incarnation' ? { incarnation: 2 } : {}),
+          ...(kind === 'epoch' ? { epoch: 6 } : {}), frame },
+      });
+      expect(await settled).toMatchObject({ code: 'disposed' });
+      expect(frames).toEqual([]);
+      expect(closed).toEqual(['page', 'background']);
+      expect({
+        frame: client.answeredFrame(), layout: client.layoutRevision(), memory: client.memory(),
+        vector: client.remoteStateVector(), ready: client.isReady(), sequence: client.stateSequence(),
+      }).toEqual(before);
+      expect(client.hasFailed()).toBe(false);
+      if (kind === 'fenced') {
+        worker.reply({ ...frameReply(worker.lastId()), commandInitial: { ...initial, epoch: 8 } });
+        await replacement;
+      }
+    } finally {
+      client.destroy();
+    }
+  }
+);
+
+test.each(['malformed-frame', 'malformed-initial', 'malformed-ack', 'orphan-initial', 'orphan-ack',
+  'unobserved-frame', 'terminal-frame', 'superseded-initial'] as const)(
+  'd2c_client_discards_staged_bitmaps_on_%s', async (kind) => {
+    const { worker, client } = setup();
+    const identity = { session: 'discard', incarnation: 1, epoch: 7 };
+    const init = { ...identity, readOnly: false, fonts: [], layoutInput: '', layoutWithRegions: false,
+      layoutRevision: 1, extras: '{}' };
+    const initial: ResidentCommandInitReply = {
+      ...identity, version: 0, throughSeq: 0, outcomes: [], selection: null,
+      editState: { readOnly: false, toolbar: null, effectiveFormatting: null, storedMarks: null,
+        canUndo: false, canRedo: false, hyperlink: null, tableContext: null },
+      frame: { revision: 1, coversThroughSeq: 0, payload: {
+        frame: new ArrayBuffer(0), layoutRevision: 1, caret: { frameEpoch: 1, caretRect: null },
+      } },
+    };
+    const closed: string[] = [];
+    const frame = stagedFrame(kind === 'malformed-frame' ? NaN : 2, closed);
+    try {
+      const opened = client.commandInit(init);
+      worker.reply({ id: worker.lastId(), ok: true, commandInitial: initial });
+      await opened;
+      if (kind === 'superseded-initial') {
+        const pending = client.commandInit(init);
+        const settled = pending.then(() => undefined, (error: unknown) => error);
+        worker.reply({ id: worker.lastId(), ok: true, commandInitial: { ...initial, frame } });
+        const replacement = client.bootstrap(snapshot, '{}');
+        worker.reply({ ...frameReply(worker.lastId()), commandInitial: { ...initial, epoch: 8 } });
+        expect(await settled).toMatchObject({ code: 'disposed' });
+        await replacement;
+      } else if (kind === 'malformed-initial' || kind === 'malformed-ack' || kind === 'malformed-frame') {
+        const pending = kind === 'malformed-initial' ? client.commandInit(init)
+          : kind === 'malformed-ack' ? client.requestFullFrame() : client.buildPages([0], 1);
+        const settled = pending.then(() => undefined, (error: unknown) => error);
+        worker.reply({ id: worker.lastId(), ok: true,
+          ...(kind === 'malformed-frame' ? { commandFrame: { ...identity, frame } }
+            : kind === 'malformed-initial' ? { commandInitial: { ...initial, version: NaN, frame } }
+            : { commandAck: { ...initial, version: NaN, frame } }),
+        });
+        expect(await settled).toBeInstanceOf(Error);
+      } else {
+        if (kind === 'terminal-frame') client.destroy();
+        worker.reply({ id: 999, ok: true,
+          ...(kind === 'orphan-initial' ? { commandInitial: { ...initial, frame } }
+            : kind === 'orphan-ack' ? { commandAck: { ...initial, frame } }
+            : { commandFrame: { ...identity, frame } }),
+        });
+      }
+      expect(closed).toEqual(['page', 'background']);
+    } finally {
+      client.destroy();
+    }
+  }
+);
+
+test.each(['initial', 'ack', 'frame'] as const)('d2c_client_retains_delivered_%s_bitmaps', async (kind) => {
+  const { worker, client } = setup();
+  const identity = { session: 'retained', incarnation: 1, epoch: 7 };
+  const closed: string[] = [];
+  const initial: ResidentCommandInitReply = { ...identity, version: 0, throughSeq: 0, outcomes: [],
+    selection: null, editState: { readOnly: false, toolbar: null, effectiveFormatting: null,
+      storedMarks: null, canUndo: false, canRedo: false, hyperlink: null, tableContext: null },
+    frame: stagedFrame(1, kind === 'initial' ? closed : []),
+  };
+  try {
+    const initialized = client.commandInit({ ...identity, readOnly: false, fonts: [], layoutInput: '',
+      layoutWithRegions: false, layoutRevision: 1, extras: '{}' });
+    worker.reply({ id: worker.lastId(), ok: true, commandInitial: initial });
+    expect(await initialized).toBe(initial);
+    if (kind === 'ack') {
+      const pending = client.requestFullFrame();
+      const frame = stagedFrame(2, closed);
+      worker.reply({ id: worker.lastId(), ok: true, commandAck: { ...initial, frame } });
+      expect((await pending).frame).toBe(frame);
+    }
+    if (kind === 'frame') {
+      const frames: DocxCommandFrame[] = [];
+      client.onFrame((frame) => { frames.push(frame); });
+      const frame = stagedFrame(2, closed);
+      worker.reply({ id: 999, ok: true, commandFrame: { ...identity, frame } });
+      expect(frames).toEqual([frame]);
+    }
+    expect(closed).toEqual([]);
+  } finally {
+    client.destroy();
+  }
+});
+
+async function peerResponse<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = realSetTimeout(() => reject(new Error('No peer snapshot response')), 1000);
+      }),
+    ]);
+  } finally {
+    realClearTimeout(timer);
+  }
+}
+
+test.each(['snapshot', 'handover'] as const)('the client carries peer metadata in a single %s request', async (kind) => {
+  const { worker, client } = setup();
+  const pending = kind === 'snapshot' ? client.encodeVersionedState(true) : client.handOver(true);
+  expect(worker.requestAt(0)).toEqual({ id: worker.lastId(), type: 'encodeState', peerMetadata: true });
+  const state = new Uint8Array([7]).buffer;
+  const metadata = new Uint8Array([8]).buffer;
+  const proposals = { previewVersion: 0, entries: [] };
+  worker.reply({ id: worker.lastId(), ok: true, state, peerMetadata: metadata, version: 'v7', proposals });
+  expect(await peerResponse(pending)).toEqual({
+    state: new Uint8Array(state), metadata: new Uint8Array(metadata), metadataReason: undefined,
+    version: 'v7', ...(kind === 'handover' ? { proposals } : {}),
+  });
+  expect(client.hasFailed()).toBe(false);
+});
+
+test.each([undefined, 'unopened: No peer source'])('a legacy or rejecting worker returns state with metadata absent (%s)', async (reason) => {
+  const { worker, client } = setup();
+  const pending = client.encodeVersionedState(true);
+  worker.reply({
+    id: worker.lastId(), ok: true, state: new Uint8Array([7]).buffer,
+    version: 'v7', peerMetadataReason: reason,
+  });
+  expect(await peerResponse(pending)).toEqual({
+    state: new Uint8Array([7]), version: 'v7', metadata: undefined,
+    metadataReason: reason ?? 'missing-capability: Worker omitted peer metadata',
+  });
+  expect(client.hasFailed()).toBe(false);
+});
+
+test.each(['state', 'versioned', 'handover'] as const)('state-only %s callers retain their request and return shape', async (kind) => {
+  const { worker, client } = setup();
+  const pending = kind === 'state' ? client.encodeState()
+    : kind === 'versioned' ? client.encodeVersionedState() : client.handOver();
+  expect(worker.requestAt(0)).toEqual({ id: worker.lastId(), type: 'encodeState' });
+  const state = new Uint8Array([7]).buffer;
+  const proposals = { previewVersion: 0, entries: [] };
+  worker.reply({ id: worker.lastId(), ok: true, state, version: 'v7', proposals });
+  expect(await peerResponse<unknown>(pending)).toEqual(kind === 'state' ? new Uint8Array(state) : {
+    state: new Uint8Array(state), version: 'v7', ...(kind === 'handover' ? { proposals } : {}),
+  });
+});
 
 test('save posts comments and optional host metadata and returns the saved buffer and its updates', async () => {
   const { worker, client } = setup();
@@ -866,6 +1100,65 @@ describe('watchdog', () => {
     expect(worker.terminated).toBe(false);
   });
 
+  test('a superseded command frame restarts the silence budget for a pending save', async () => {
+    const { worker, client } = setup();
+    function advanceTimers(ms: number): void {
+      for (const [id, timer] of [...timers]) {
+        timer.ms -= ms;
+        if (timer.ms <= 0) {
+          timers.delete(id);
+          timer.callback();
+        }
+      }
+    }
+    const identity = { session: 'watchdog-frame', incarnation: 1, epoch: 7 };
+    const initial: ResidentCommandInitReply = {
+      ...identity, version: 0, throughSeq: 0, outcomes: [], selection: null,
+      editState: {
+        readOnly: false, toolbar: null, effectiveFormatting: null, storedMarks: null,
+        canUndo: false, canRedo: false, hyperlink: null, tableContext: null,
+      },
+      frame: {
+        coversThroughSeq: 0, revision: 1,
+        payload: { frame: new ArrayBuffer(0), caret: { frameEpoch: 1, caretRect: null }, layoutRevision: 1 },
+      },
+    };
+    try {
+      const initialized = client.commandInit({
+        ...identity, readOnly: false, fonts: [], layoutInput: '', layoutWithRegions: false,
+        layoutRevision: 1, extras: '{}',
+      });
+      worker.reply({ id: worker.lastId(), ok: true, commandInitial: initial });
+      await initialized;
+      const built = client.buildPages([1], 1).then(() => undefined, (error: unknown) => error);
+      const id = worker.lastId();
+      let saveSettled = false;
+      const saved = client.save({ comments: [] }).then(
+        () => { saveSettled = true; return undefined; },
+        (error: unknown) => { saveSettled = true; return error; }
+      );
+      advanceTimers(RESIDENT_WORKER_SILENCE_MS - 1);
+      worker.reply({ id, ok: true, commandFrame: { ...identity, epoch: 6, frame: initial.frame } });
+      expect(await built).toMatchObject({ code: 'disposed' });
+      expect(armedBudgets()).toEqual([RESIDENT_WORKER_SILENCE_MS]);
+      advanceTimers(1);
+      await Promise.resolve();
+      expect(saveSettled).toBe(false);
+      expect(client.hasFailed()).toBe(false);
+      expect(worker.terminated).toBe(false);
+      advanceTimers(RESIDENT_WORKER_SILENCE_MS - 2);
+      await Promise.resolve();
+      expect(saveSettled).toBe(false);
+      expect(client.hasFailed()).toBe(false);
+      advanceTimers(1);
+      expect(await saved).toMatchObject({ code: 'silence' });
+      expect(worker.terminated).toBe(true);
+      expect(timers.size).toBe(0);
+    } finally {
+      client.destroy();
+    }
+  });
+
   test('a reply slower than a keystroke budget keeps the worker', async () => {
     const { worker, client } = setup();
     const bootstrap = client.bootstrap(snapshot, '');
@@ -1007,6 +1300,39 @@ describe('worker failure', () => {
 });
 
 describe('resident worker opening', () => {
+  test('d0_pending_opened_bootstrap_keeps_reply_mode_during_command_init', async () => {
+    const { worker, client } = setup();
+    try {
+      const opened = client.open(new Uint8Array([1]));
+      worker.reply({ id: worker.lastId(), ok: true, hostJson: '{}', stateVector: new Uint8Array([1]).buffer });
+      await opened;
+      const bootstrapped = client.bootstrap(snapshot, '{}', { opened: true });
+      const bootstrapId = worker.lastId();
+      const initialized = client.commandInit({
+        session: 'concurrent-init', incarnation: 1, epoch: 0, readOnly: false,
+        fonts: [], layoutInput: '', layoutWithRegions: false, layoutRevision: 1, extras: '{}',
+      });
+      const initId = worker.lastId();
+      worker.reply(frameReply(bootstrapId));
+      worker.reply({ id: initId, ok: true, commandInitial: {
+        session: 'concurrent-init', incarnation: 1, epoch: 0, version: 0, throughSeq: 0, outcomes: [],
+        selection: null,
+        editState: {
+          readOnly: false, toolbar: null, effectiveFormatting: null, storedMarks: null,
+          canUndo: false, canRedo: false, hyperlink: null, tableContext: null,
+        },
+        frame: {
+          coversThroughSeq: 0, revision: 1,
+          payload: { frame: new ArrayBuffer(0), caret: { frameEpoch: 1, caretRect: null }, layoutRevision: 1 },
+        },
+      } });
+      await expect(bootstrapped).resolves.toMatchObject({ layoutRevision: 1 });
+      await expect(initialized).resolves.toMatchObject({ session: 'concurrent-init', epoch: 0 });
+    } finally {
+      client.destroy();
+    }
+  }, 15_000);
+
   test.each([undefined, 256])('sends an optional preview paragraph budget %s', async (paragraphBudget) => {
     const { worker, client } = setup();
     const opened = client.openPreview(new Uint8Array([1, 2]), 200, { paragraphBudget });
@@ -1044,6 +1370,22 @@ describe('resident worker opening', () => {
     expect(worker.transfers[0]).toEqual([request.bytes]);
     await expect(client.open(new Uint8Array([4]))).rejects.toThrow('already holds a document');
     expect(worker.posted).toHaveLength(1);
+  });
+
+  test.each([undefined, '', 'worker-version'])('versioned state encoding accepts version %s without proposals', async (version) => {
+    const { worker, client } = setup();
+    const state = client.encodeVersionedState();
+    expect(worker.posted).toHaveLength(1);
+    expect(worker.posted[0]).toMatchObject({ type: 'encodeState' });
+    worker.reply({ id: worker.lastId(), ok: true, state: Uint8Array.of(4, 5).buffer, version });
+    expect(await state).toEqual({ state: Uint8Array.of(4, 5), version });
+  });
+
+  test('versioned state encoding requires the worker state', async () => {
+    const { worker, client } = setup();
+    const state = client.encodeVersionedState();
+    worker.reply({ id: worker.lastId(), ok: true, version: 'worker-version' });
+    await expect(state).rejects.toThrow('Resident engine worker omitted its state');
   });
 
   test('open, font requirements, and state handover report memory before an opened bootstrap', async () => {

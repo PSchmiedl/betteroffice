@@ -771,14 +771,22 @@ fn note_item(content: &NoteContent) -> NoteLayoutItemContract {
             content
                 .blocks
                 .iter()
-                .filter_map(|block| serde_json::to_value(block).ok())
+                .filter_map(|block| {
+                    serde_json::to_string(&block)
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s))
+                        .ok()
+                })
                 .collect(),
         ),
         measures: Some(
             content
                 .measures
                 .iter()
-                .filter_map(|measure| serde_json::to_value(measure).ok())
+                .filter_map(|measure| {
+                    serde_json::to_string(&measure)
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s))
+                        .ok()
+                })
                 .collect(),
         ),
         height: Some(content.height),
@@ -945,6 +953,7 @@ mod tests {
             number,
             fragments,
             float_bands: Vec::new(),
+            opening_fragment_geometry: None,
             body_margins: None,
             body_anchor_margins: None,
             margins: PageMargins {
